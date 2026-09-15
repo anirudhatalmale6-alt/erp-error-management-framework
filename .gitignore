@@ -1,0 +1,21 @@
+# Node
+node_modules/
+.angular/
+dist/
+*.tsbuildinfo
+
+# .NET
+bin/
+obj/
+*.user
+
+# Demo store (regenerated on first run)
+demo-error-store.db
+demo-error-store.db-shm
+demo-error-store.db-wal
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

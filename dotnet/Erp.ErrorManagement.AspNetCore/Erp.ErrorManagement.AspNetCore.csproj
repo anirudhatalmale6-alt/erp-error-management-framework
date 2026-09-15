@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The .NET 8 half of "integration with newer applications/modules using
+    .NET 8 and Entity Framework Core".  Shares Core with the Web API 2
+    package, so both stacks fingerprint, redact and persist identically and a
+    fault reported by a new module lands on the same erp_err row as the same
+    fault reported by the legacy API.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>Erp.ErrorManagement.AspNetCore</AssemblyName>
+    <RootNamespace>Erp.ErrorManagement.AspNetCore</RootNamespace>
+    <PackageId>Erp.ErrorManagement.AspNetCore</PackageId>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="..\Erp.ErrorManagement.Core\Erp.ErrorManagement.Core.csproj" />
+  </ItemGroup>
+
+</Project>

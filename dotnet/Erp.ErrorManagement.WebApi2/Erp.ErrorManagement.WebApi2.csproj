@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Targets .NET Framework 4.7.2 to match the existing ERP API exactly.
+
+    Microsoft.NETFramework.ReferenceAssemblies is what lets this project be
+    built and CI-verified on a non-Windows build agent; on a developer's Windows
+    machine it is a no-op.  It changes nothing about the output assembly.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <AssemblyName>Erp.ErrorManagement.WebApi2</AssemblyName>
+    <RootNamespace>Erp.ErrorManagement.WebApi2</RootNamespace>
+    <PackageId>Erp.ErrorManagement.WebApi2</PackageId>
+    <Version>1.0.0</Version>
+    <Description>Web API 2 / .NET Framework 4.7.2 integration for the ERP Error Management Framework.</Description>
+    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.AspNet.WebApi.Core" Version="5.2.9" />
+    <PackageReference Include="Microsoft.AspNet.WebApi.Client" Version="5.2.9" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Erp.ErrorManagement.Core\Erp.ErrorManagement.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Web" />
+    <Reference Include="System.Configuration" />
+  </ItemGroup>
+
+</Project>

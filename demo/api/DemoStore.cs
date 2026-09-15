@@ -1,0 +1,1114 @@
+using System.Data;
+using System.Text.Json;
+using Erp.ErrorManagement;
+using Microsoft.Data.Sqlite;
+
+/// <summary>
+/// SQLite mirror of the SQL Server schema and procedures in db/.
+///
+/// Every behaviour the brief cares about is implemented here with the SAME
+/// semantics as the T-SQL, so the demo genuinely demonstrates the design rather
+/// than a simplified version of it: fingerprint upsert with severity escalation,
+/// attach-to-open-ticket deduplication, auto-ticket thresholds, workflow
+/// transition validation, gapless audit history, minutes-in-status, paused
+/// statuses excluded from active processing time, and SLA breach flags.
+///
+/// It is NOT the production store.  See the banner in Program.cs.
+/// </summary>
+public class DemoStore
+{
+    private readonly string _connectionString;
+    private readonly object _writeLock = new();
+
+    public DemoStore(string connectionString) => _connectionString = connectionString;
+
+    private SqliteConnection Open()
+    {
+        var c = new SqliteConnection(_connectionString);
+        c.Open();
+        using var pragma = c.CreateCommand();
+        pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;";
+        pragma.ExecuteNonQuery();
+        return c;
+    }
+
+    public void Initialise()
+    {
+        using var c = Open();
+        Exec(c, """
+            CREATE TABLE IF NOT EXISTS Fingerprint (
+              FingerprintId INTEGER PRIMARY KEY AUTOINCREMENT,
+              FingerprintHash TEXT NOT NULL UNIQUE,
+              SignatureText TEXT, Layer TEXT, Category TEXT, Severity TEXT,
+              ExceptionType TEXT, NormalizedMessage TEXT,
+              ErpModule TEXT, Screen TEXT, Component TEXT, ApiEndpoint TEXT, SqlObjectName TEXT,
+              FirstSeenUtc TEXT, LastSeenUtc TEXT,
+              OccurrenceCount INTEGER NOT NULL DEFAULT 0,
+              DistinctUserCount INTEGER NOT NULL DEFAULT 0,
+              TriageState TEXT NOT NULL DEFAULT 'new',
+              OpenTicketId INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS Occurrence (
+              OccurrenceId INTEGER PRIMARY KEY AUTOINCREMENT,
+              ErrorReference TEXT NOT NULL UNIQUE,
+              FingerprintId INTEGER NOT NULL,
+              OccurredUtc TEXT NOT NULL,
+              Layer TEXT, Category TEXT, Severity TEXT,
+              ExceptionType TEXT, Message TEXT,
+              ErpModule TEXT, Screen TEXT, RouteUrl TEXT, Component TEXT,
+              ActionName TEXT, FormName TEXT, LovName TEXT,
+              ApiController TEXT, ApiAction TEXT, ApiEndpoint TEXT,
+              HttpMethod TEXT, HttpStatusCode INTEGER,
+              SqlErrorNumber INTEGER, SqlObjectName TEXT, SqlLineNumber INTEGER,
+              SqlServerName TEXT, SqlDatabaseName TEXT, SqlSchemaName TEXT,
+              UserName TEXT, UserDisplayName TEXT,
+              CorrelationId TEXT, RequestId TEXT,
+              Environment TEXT, AppVersion TEXT,
+              BrowserName TEXT, BrowserVersion TEXT, OsName TEXT,
+              StackTrace TEXT, InnerExceptionChain TEXT,
+              RequestPayloadJson TEXT, ValidationErrorsJson TEXT, BreadcrumbsJson TEXT,
+              TicketId INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS Ticket (
+              TicketId INTEGER PRIMARY KEY AUTOINCREMENT,
+              TicketNumber TEXT NOT NULL UNIQUE,
+              OccurrenceId INTEGER, FingerprintId INTEGER NOT NULL,
+              Status TEXT NOT NULL, Severity TEXT, Queue TEXT,
+              Title TEXT, UserDescription TEXT,
+              ReportedByUserName TEXT, AssignedToUserName TEXT, CreatedVia TEXT,
+              ErpModule TEXT, Environment TEXT,
+              CreatedUtc TEXT, FirstResponseUtc TEXT, AssignedUtc TEXT,
+              ResolvedUtc TEXT, ClosedUtc TEXT, LastStatusChangeUtc TEXT,
+              TotalElapsedMinutes INTEGER, ActiveProcessingMinutes INTEGER,
+              SlaFirstResponseMinutes INTEGER, SlaResolutionMinutes INTEGER,
+              SlaFirstResponseBreached INTEGER NOT NULL DEFAULT 0,
+              SlaResolutionBreached INTEGER NOT NULL DEFAULT 0,
+              ReopenCount INTEGER NOT NULL DEFAULT 0,
+              LinkedOccurrenceCount INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS TicketHistory (
+              HistoryId INTEGER PRIMARY KEY AUTOINCREMENT,
+              TicketId INTEGER NOT NULL, SequenceNo INTEGER NOT NULL,
+              FromStatus TEXT, ToStatus TEXT NOT NULL,
+              ChangedByUserName TEXT, ChangedUtc TEXT NOT NULL,
+              MinutesInFromStatus INTEGER, Comments TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS TicketLink (
+              TicketId INTEGER NOT NULL, OccurrenceId INTEGER NOT NULL,
+              LinkReason TEXT, LinkedUtc TEXT,
+              PRIMARY KEY (TicketId, OccurrenceId)
+            );
+
+            CREATE TABLE IF NOT EXISTS Counter (Name TEXT PRIMARY KEY, Value INTEGER NOT NULL);
+            """);
+    }
+
+    public void Reset()
+    {
+        lock (_writeLock)
+        {
+            using var c = Open();
+            Exec(c, "DELETE FROM TicketLink; DELETE FROM TicketHistory; DELETE FROM Ticket; " +
+                    "DELETE FROM Occurrence; DELETE FROM Fingerprint; DELETE FROM Counter;");
+        }
+    }
+
+    /* ==================================================================== */
+    /*  Reference data - the rows that live in erp_err.* config tables      */
+    /* ==================================================================== */
+
+    // Mirrors erp_err.TicketStatus.  IsPaused time is excluded from active
+    // processing minutes; IsTerminal blocks further transitions.
+    private static readonly Dictionary<string, (string Display, bool IsOpen, bool IsTerminal, bool IsPaused, int Rank)> Statuses
+        = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["new"] = ("New", true, false, false, 1),
+            ["assigned"] = ("Assigned", true, false, false, 2),
+            ["in_progress"] = ("In Progress", true, false, false, 3),
+            ["waiting_info"] = ("Waiting for Information", true, false, true, 4),
+            ["resolved"] = ("Resolved", true, false, false, 5),
+            ["closed"] = ("Closed", false, true, false, 6),
+            ["cancelled"] = ("Cancelled", false, true, false, 7),
+            ["reopened"] = ("Reopened", true, false, false, 8),
+        };
+
+    // Mirrors erp_err.TicketStatusTransition.  (from, to) -> requires comment.
+    private static readonly Dictionary<(string, string), bool> Transitions = new()
+    {
+        [("new", "assigned")] = false, [("new", "in_progress")] = false, [("new", "cancelled")] = true,
+        [("assigned", "in_progress")] = false, [("assigned", "waiting_info")] = true,
+        [("assigned", "new")] = true, [("assigned", "cancelled")] = true,
+        [("in_progress", "waiting_info")] = true, [("in_progress", "resolved")] = true,
+        [("in_progress", "assigned")] = true, [("in_progress", "cancelled")] = true,
+        [("waiting_info", "in_progress")] = false, [("waiting_info", "resolved")] = true,
+        [("waiting_info", "cancelled")] = true,
+        [("resolved", "closed")] = false, [("resolved", "reopened")] = true,
+        [("closed", "reopened")] = true,
+        [("reopened", "assigned")] = false, [("reopened", "in_progress")] = false,
+        [("reopened", "resolved")] = true,
+    };
+
+    // Mirrors erp_err.SlaPolicy.
+    private static readonly Dictionary<string, (int FirstResponse, int Resolution)> Sla = new()
+    {
+        ["critical"] = (15, 240), ["high"] = (60, 480), ["medium"] = (240, 2880),
+        ["low"] = (480, 10080), ["info"] = (1440, 43200),
+    };
+
+    private static readonly string[] SeverityRank = { "critical", "high", "medium", "low", "info" };
+    private static int Rank(string severity) => Array.IndexOf(SeverityRank, severity ?? "medium") is var i && i >= 0 ? i : 2;
+
+    /* ==================================================================== */
+    /*  usp_Error_Capture                                                   */
+    /* ==================================================================== */
+
+    public ErrorCaptureResult? Capture(ErrorEnvelope envelope)
+    {
+        if (envelope?.FingerprintHash is null || envelope.FingerprintHash.Length != 64)
+            return null;
+
+        lock (_writeLock)
+        {
+            using var c = Open();
+            using var tx = c.BeginTransaction();
+
+            var now = DateTime.UtcNow;
+            var occurredUtc = ParseUtc(envelope.OccurredUtc) ?? now;
+            // Clamp a wrong client clock, exactly as the T-SQL does.
+            if (occurredUtc > now.AddMinutes(5) || occurredUtc < now.AddYears(-1)) occurredUtc = now;
+
+            var severity = envelope.Severity ?? "medium";
+
+            // --- fingerprint upsert, with severity escalation only ----------
+            var existing = QueryOne(c, tx,
+                "SELECT FingerprintId, Severity, TriageState, OpenTicketId, LastSeenUtc FROM Fingerprint WHERE FingerprintHash = $h",
+                ("$h", envelope.FingerprintHash));
+
+            long fingerprintId;
+            string triageState;
+            long? openTicketId = null;
+
+            if (existing is null)
+            {
+                fingerprintId = ExecScalarLong(c, tx, """
+                    INSERT INTO Fingerprint (FingerprintHash, SignatureText, Layer, Category, Severity,
+                      ExceptionType, NormalizedMessage, ErpModule, Screen, Component, ApiEndpoint,
+                      SqlObjectName, FirstSeenUtc, LastSeenUtc, OccurrenceCount, DistinctUserCount)
+                    VALUES ($h,$sig,$layer,$cat,$sev,$type,$nmsg,$mod,$scr,$cmp,$ep,$sqlobj,$first,$last,1,0);
+                    SELECT last_insert_rowid();
+                    """,
+                    ("$h", envelope.FingerprintHash), ("$sig", envelope.SignatureText),
+                    ("$layer", envelope.Layer), ("$cat", envelope.Category), ("$sev", severity),
+                    ("$type", envelope.ExceptionType),
+                    ("$nmsg", envelope.NormalizedMessage ?? envelope.Message),
+                    ("$mod", envelope.ErpModule), ("$scr", envelope.Screen),
+                    ("$cmp", envelope.Component), ("$ep", envelope.ApiEndpoint),
+                    ("$sqlobj", envelope.Sql?.ObjectName),
+                    ("$first", Iso(occurredUtc)), ("$last", Iso(occurredUtc)));
+                triageState = "new";
+            }
+            else
+            {
+                fingerprintId = Convert.ToInt64(existing["FingerprintId"]);
+                var storedSeverity = existing["Severity"] as string ?? severity;
+                // Escalate, never de-escalate.
+                var effective = Rank(severity) < Rank(storedSeverity) ? severity : storedSeverity;
+                var lastSeen = ParseUtc(existing["LastSeenUtc"] as string) ?? occurredUtc;
+
+                Exec(c, tx, "UPDATE Fingerprint SET OccurrenceCount = OccurrenceCount + 1, " +
+                            "LastSeenUtc = $last, Severity = $sev WHERE FingerprintId = $id",
+                    ("$last", Iso(occurredUtc > lastSeen ? occurredUtc : lastSeen)),
+                    ("$sev", effective), ("$id", fingerprintId));
+
+                triageState = existing["TriageState"] as string ?? "new";
+                openTicketId = existing["OpenTicketId"] is null
+                    ? null : Convert.ToInt64(existing["OpenTicketId"]);
+                severity = effective;
+            }
+
+            // --- occurrence -------------------------------------------------
+            var reference = NextReference(c, tx, "ERR", now);
+
+            var occurrenceId = ExecScalarLong(c, tx, """
+                INSERT INTO Occurrence (ErrorReference, FingerprintId, OccurredUtc, Layer, Category,
+                  Severity, ExceptionType, Message, ErpModule, Screen, RouteUrl, Component,
+                  ActionName, FormName, LovName, ApiController, ApiAction, ApiEndpoint,
+                  HttpMethod, HttpStatusCode, SqlErrorNumber, SqlObjectName, SqlLineNumber,
+                  SqlServerName, SqlDatabaseName, SqlSchemaName, UserName, UserDisplayName,
+                  CorrelationId, RequestId, Environment, AppVersion,
+                  BrowserName, BrowserVersion, OsName,
+                  StackTrace, InnerExceptionChain, RequestPayloadJson, ValidationErrorsJson, BreadcrumbsJson)
+                VALUES ($ref,$fp,$occ,$layer,$cat,$sev,$type,$msg,$mod,$scr,$route,$cmp,
+                  $act,$form,$lov,$ctrl,$action,$ep,$method,$status,$sqlnum,$sqlobj,$sqlline,
+                  $sqlsrv,$sqldb,$sqlschema,$user,$display,$corr,$req,$env,$ver,
+                  $browser,$bver,$os,$stack,$inner,$payload,$val,$crumbs);
+                SELECT last_insert_rowid();
+                """,
+                ("$ref", reference), ("$fp", fingerprintId), ("$occ", Iso(occurredUtc)),
+                ("$layer", envelope.Layer), ("$cat", envelope.Category), ("$sev", envelope.Severity),
+                ("$type", envelope.ExceptionType), ("$msg", envelope.Message),
+                ("$mod", envelope.ErpModule), ("$scr", envelope.Screen),
+                ("$route", envelope.RouteUrl), ("$cmp", envelope.Component),
+                ("$act", envelope.ActionName), ("$form", envelope.FormName), ("$lov", envelope.LovName),
+                ("$ctrl", envelope.ApiController), ("$action", envelope.ApiAction),
+                ("$ep", envelope.ApiEndpoint), ("$method", envelope.HttpMethod),
+                ("$status", envelope.HttpStatusCode),
+                ("$sqlnum", envelope.Sql?.Number), ("$sqlobj", envelope.Sql?.ObjectName),
+                ("$sqlline", envelope.Sql?.LineNumber), ("$sqlsrv", envelope.Sql?.ServerName),
+                ("$sqldb", envelope.Sql?.DatabaseName), ("$sqlschema", envelope.Sql?.SchemaName),
+                ("$user", envelope.User?.Name), ("$display", envelope.User?.DisplayName),
+                ("$corr", envelope.CorrelationId), ("$req", envelope.RequestId),
+                ("$env", envelope.Environment), ("$ver", envelope.AppVersion),
+                ("$browser", envelope.Client?.BrowserName), ("$bver", envelope.Client?.BrowserVersion),
+                ("$os", envelope.Client?.OsName),
+                ("$stack", envelope.StackTrace), ("$inner", envelope.InnerExceptionChain),
+                ("$payload", Json(envelope.RequestPayload)),
+                ("$val", Json(envelope.ValidationErrors)), ("$crumbs", Json(envelope.Breadcrumbs)));
+
+            // Incremental distinct-user count.
+            if (!string.IsNullOrEmpty(envelope.User?.Name))
+            {
+                var seenBefore = ExecScalarLong(c, tx,
+                    "SELECT COUNT(*) FROM Occurrence WHERE FingerprintId = $fp AND UserName = $u AND OccurrenceId <> $id",
+                    ("$fp", fingerprintId), ("$u", envelope.User.Name), ("$id", occurrenceId));
+                if (seenBefore == 0)
+                    Exec(c, tx, "UPDATE Fingerprint SET DistinctUserCount = DistinctUserCount + 1 WHERE FingerprintId = $fp",
+                        ("$fp", fingerprintId));
+            }
+
+            // --- attach to an already-open ticket for the same problem ------
+            string? autoTicketNumber = null;
+
+            if (openTicketId is long openId && IsTicketOpen(c, tx, openId))
+            {
+                Exec(c, tx, "INSERT OR IGNORE INTO TicketLink (TicketId, OccurrenceId, LinkReason, LinkedUtc) " +
+                            "VALUES ($t,$o,'deduplicated',$at)",
+                    ("$t", openId), ("$o", occurrenceId), ("$at", Iso(now)));
+                Exec(c, tx, "UPDATE Ticket SET LinkedOccurrenceCount = LinkedOccurrenceCount + 1 WHERE TicketId = $t",
+                    ("$t", openId));
+                Exec(c, tx, "UPDATE Occurrence SET TicketId = $t WHERE OccurrenceId = $o",
+                    ("$t", openId), ("$o", occurrenceId));
+                autoTicketNumber = QueryOne(c, tx, "SELECT TicketNumber FROM Ticket WHERE TicketId = $t",
+                    ("$t", openId))?["TicketNumber"] as string;
+            }
+
+            tx.Commit();
+
+            // --- auto-ticket rules, outside the capture transaction ---------
+            // Shipped rule: a CRITICAL problem seen 3+ times in an hour raises
+            // its own ticket without waiting for a user to press Report.
+            if (autoTicketNumber is null && triageState != "muted" && severity == "critical")
+            {
+                var recent = CountRecent(fingerprintId, now.AddMinutes(-60));
+                if (recent >= 3)
+                {
+                    var created = CreateTicket(reference, null, "system", "auto_rule");
+                    autoTicketNumber = created?.TicketNumber;
+                }
+            }
+
+            return new ErrorCaptureResult
+            {
+                ErrorReference = reference,
+                OccurrenceId = occurrenceId,
+                FingerprintId = fingerprintId,
+                ShouldNotifyUser = triageState != "muted",
+                AutoTicketNumber = autoTicketNumber,
+                IsKnownIssue = triageState is "known_issue" or "muted"
+            };
+        }
+    }
+
+    private long CountRecent(long fingerprintId, DateTime since)
+    {
+        using var c = Open();
+        return ExecScalarLong(c, null,
+            "SELECT COUNT(*) FROM Occurrence WHERE FingerprintId = $fp AND OccurredUtc >= $since",
+            ("$fp", fingerprintId), ("$since", Iso(since)));
+    }
+
+    /* ==================================================================== */
+    /*  usp_Ticket_Create                                                   */
+    /* ==================================================================== */
+
+    public TicketCreateResult? CreateTicket(string errorReference, string? description,
+        string reportedBy, string createdVia)
+    {
+        lock (_writeLock)
+        {
+            using var c = Open();
+            using var tx = c.BeginTransaction();
+
+            var occ = QueryOne(c, tx, """
+                SELECT OccurrenceId, FingerprintId, Severity, ErpModule, Environment, Message, Screen
+                FROM Occurrence WHERE ErrorReference = $ref
+                """, ("$ref", errorReference));
+            if (occ is null) return null;
+
+            var occurrenceId = Convert.ToInt64(occ["OccurrenceId"]);
+            var fingerprintId = Convert.ToInt64(occ["FingerprintId"]);
+            var severity = occ["Severity"] as string ?? "medium";
+            var now = DateTime.UtcNow;
+
+            // Already an open ticket for this problem?  Attach, do not duplicate.
+            var fp = QueryOne(c, tx, "SELECT OpenTicketId FROM Fingerprint WHERE FingerprintId = $fp",
+                ("$fp", fingerprintId));
+            var openTicketId = fp?["OpenTicketId"] is null ? (long?)null
+                : Convert.ToInt64(fp!["OpenTicketId"]);
+
+            if (openTicketId is long existingId && IsTicketOpen(c, tx, existingId))
+            {
+                Exec(c, tx, "INSERT OR IGNORE INTO TicketLink (TicketId, OccurrenceId, LinkReason, LinkedUtc) " +
+                            "VALUES ($t,$o,'deduplicated',$at)",
+                    ("$t", existingId), ("$o", occurrenceId), ("$at", Iso(now)));
+                Exec(c, tx, "UPDATE Ticket SET LinkedOccurrenceCount = LinkedOccurrenceCount + 1 WHERE TicketId = $t",
+                    ("$t", existingId));
+                Exec(c, tx, "UPDATE Occurrence SET TicketId = $t WHERE OccurrenceId = $o",
+                    ("$t", existingId), ("$o", occurrenceId));
+
+                var number = QueryOne(c, tx, "SELECT TicketNumber FROM Ticket WHERE TicketId = $t",
+                    ("$t", existingId))?["TicketNumber"] as string;
+                tx.Commit();
+
+                return new TicketCreateResult
+                {
+                    TicketNumber = number!, TicketId = existingId, WasDeduplicated = true
+                };
+            }
+
+            var ticketNumber = NextReference(c, tx, "TKT", now);
+            var sla = Sla.TryGetValue(severity, out var s) ? s : Sla["medium"];
+
+            var title = Truncate(
+                $"{occ["ErpModule"] ?? "ERP"} / {occ["Screen"] ?? "(unknown screen)"} - {occ["Message"]}", 200);
+
+            var ticketId = ExecScalarLong(c, tx, """
+                INSERT INTO Ticket (TicketNumber, OccurrenceId, FingerprintId, Status, Severity, Queue,
+                  Title, UserDescription, ReportedByUserName, CreatedVia, ErpModule, Environment,
+                  CreatedUtc, LastStatusChangeUtc, SlaFirstResponseMinutes, SlaResolutionMinutes,
+                  LinkedOccurrenceCount)
+                VALUES ($num,$occ,$fp,'new',$sev,$queue,$title,$desc,$by,$via,$mod,$env,$now,$now,$fr,$res,1);
+                SELECT last_insert_rowid();
+                """,
+                ("$num", ticketNumber), ("$occ", occurrenceId), ("$fp", fingerprintId),
+                ("$sev", severity), ("$queue", severity == "critical" ? "application" : "general"),
+                ("$title", title), ("$desc", description), ("$by", reportedBy), ("$via", createdVia),
+                ("$mod", occ["ErpModule"]), ("$env", occ["Environment"]),
+                ("$now", Iso(now)), ("$fr", sla.FirstResponse), ("$res", sla.Resolution));
+
+            Exec(c, tx, """
+                INSERT INTO TicketHistory (TicketId, SequenceNo, FromStatus, ToStatus,
+                  ChangedByUserName, ChangedUtc, MinutesInFromStatus, Comments)
+                VALUES ($t, 1, NULL, 'new', $by, $now, NULL, $c)
+                """,
+                ("$t", ticketId), ("$by", reportedBy), ("$now", Iso(now)),
+                ("$c", createdVia == "auto_rule"
+                    ? "Ticket raised automatically by an error-management rule."
+                    : "Ticket raised by the user from the error dialog."));
+
+            Exec(c, tx, "INSERT OR IGNORE INTO TicketLink (TicketId, OccurrenceId, LinkReason, LinkedUtc) " +
+                        "VALUES ($t,$o,'primary',$at)",
+                ("$t", ticketId), ("$o", occurrenceId), ("$at", Iso(now)));
+
+            Exec(c, tx, "UPDATE Occurrence SET TicketId = $t WHERE OccurrenceId = $o",
+                ("$t", ticketId), ("$o", occurrenceId));
+
+            Exec(c, tx, "UPDATE Fingerprint SET OpenTicketId = $t, " +
+                        "TriageState = CASE WHEN TriageState = 'new' THEN 'acknowledged' ELSE TriageState END " +
+                        "WHERE FingerprintId = $fp",
+                ("$t", ticketId), ("$fp", fingerprintId));
+
+            tx.Commit();
+
+            return new TicketCreateResult
+            {
+                TicketNumber = ticketNumber, TicketId = ticketId, WasDeduplicated = false
+            };
+        }
+    }
+
+    /* ==================================================================== */
+    /*  usp_Ticket_ChangeStatus                                             */
+    /* ==================================================================== */
+
+    public object ChangeStatus(string ticketNumber, string toStatus, string changedBy,
+        string? comments, string? assignTo)
+    {
+        lock (_writeLock)
+        {
+            using var c = Open();
+            using var tx = c.BeginTransaction();
+
+            var t = QueryOne(c, tx, """
+                SELECT TicketId, Status, CreatedUtc, LastStatusChangeUtc, FirstResponseUtc,
+                       AssignedUtc, FingerprintId, ReportedByUserName, AssignedToUserName,
+                       SlaFirstResponseMinutes, SlaResolutionMinutes, SlaFirstResponseBreached,
+                       SlaResolutionBreached, ReopenCount
+                FROM Ticket WHERE TicketNumber = $n
+                """, ("$n", ticketNumber));
+
+            if (t is null) throw new InvalidOperationException($"Ticket {ticketNumber} does not exist.");
+
+            var ticketId = Convert.ToInt64(t["TicketId"]);
+            var fromStatus = (string)t["Status"]!;
+
+            if (string.Equals(fromStatus, toStatus, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Ticket is already in that status.");
+
+            if (!Statuses.TryGetValue(toStatus, out var to))
+                throw new InvalidOperationException($"Unknown status '{toStatus}'.");
+
+            if (!Transitions.TryGetValue((fromStatus.ToLowerInvariant(), toStatus.ToLowerInvariant()),
+                    out var requiresComment))
+                throw new InvalidOperationException(
+                    $"Transition \"{Statuses[fromStatus].Display}\" -> \"{to.Display}\" " +
+                    "is not permitted by the configured workflow.");
+
+            if (requiresComment && string.IsNullOrWhiteSpace(comments))
+                throw new InvalidOperationException("This status change requires a comment.");
+
+            var now = DateTime.UtcNow;
+            var createdUtc = ParseUtc(t["CreatedUtc"] as string) ?? now;
+            var lastChange = ParseUtc(t["LastStatusChangeUtc"] as string) ?? createdUtc;
+            var minutesInFrom = (int)Math.Round((now - lastChange).TotalMinutes);
+
+            var seq = ExecScalarLong(c, tx,
+                "SELECT COALESCE(MAX(SequenceNo),0) + 1 FROM TicketHistory WHERE TicketId = $t",
+                ("$t", ticketId));
+
+            Exec(c, tx, """
+                INSERT INTO TicketHistory (TicketId, SequenceNo, FromStatus, ToStatus,
+                  ChangedByUserName, ChangedUtc, MinutesInFromStatus, Comments)
+                VALUES ($t,$seq,$from,$to,$by,$now,$mins,$c)
+                """,
+                ("$t", ticketId), ("$seq", seq), ("$from", fromStatus), ("$to", toStatus),
+                ("$by", changedBy), ("$now", Iso(now)), ("$mins", minutesInFrom), ("$c", comments));
+
+            // Paused minutes, banked across every previous pause plus this one.
+            var pausedMinutes = 0L;
+            foreach (var row in Query(c, tx,
+                "SELECT FromStatus, MinutesInFromStatus FROM TicketHistory WHERE TicketId = $t AND MinutesInFromStatus IS NOT NULL",
+                ("$t", ticketId)))
+            {
+                var fs = row["FromStatus"] as string;
+                if (fs is not null && Statuses.TryGetValue(fs, out var st) && st.IsPaused)
+                    pausedMinutes += Convert.ToInt64(row["MinutesInFromStatus"]);
+            }
+
+            var totalElapsed = (int)Math.Round((now - createdUtc).TotalMinutes);
+            var activeMinutes = (int)(totalElapsed - pausedMinutes);
+
+            var firstResponseUtc = t["FirstResponseUtc"] as string;
+            // First response = the first time someone other than the reporter acts.
+            if (firstResponseUtc is null &&
+                !string.Equals(changedBy, t["ReportedByUserName"] as string, StringComparison.OrdinalIgnoreCase))
+                firstResponseUtc = Iso(now);
+
+            var assignedUtc = t["AssignedUtc"] as string
+                ?? (toStatus.Equals("assigned", StringComparison.OrdinalIgnoreCase) ? Iso(now) : null);
+
+            var resolvedUtc = toStatus.Equals("resolved", StringComparison.OrdinalIgnoreCase) ? Iso(now)
+                : toStatus.Equals("reopened", StringComparison.OrdinalIgnoreCase) ? null
+                : QueryOne(c, tx, "SELECT ResolvedUtc FROM Ticket WHERE TicketId=$t", ("$t", ticketId))?["ResolvedUtc"] as string;
+
+            var closedUtc = to.IsTerminal ? Iso(now)
+                : toStatus.Equals("reopened", StringComparison.OrdinalIgnoreCase) ? null
+                : QueryOne(c, tx, "SELECT ClosedUtc FROM Ticket WHERE TicketId=$t", ("$t", ticketId))?["ClosedUtc"] as string;
+
+            var slaFr = t["SlaFirstResponseMinutes"] is null ? (int?)null : Convert.ToInt32(t["SlaFirstResponseMinutes"]);
+            var slaRes = t["SlaResolutionMinutes"] is null ? (int?)null : Convert.ToInt32(t["SlaResolutionMinutes"]);
+
+            var frBreached = Convert.ToInt64(t["SlaFirstResponseBreached"]) == 1;
+            if (!frBreached && slaFr is int frTarget && firstResponseUtc is not null)
+                frBreached = (ParseUtc(firstResponseUtc)!.Value - createdUtc).TotalMinutes > frTarget;
+
+            var resBreached = Convert.ToInt64(t["SlaResolutionBreached"]) == 1;
+            if (!resBreached && slaRes is int resTarget && resolvedUtc is not null)
+                resBreached = activeMinutes > resTarget;
+
+            var reopenCount = Convert.ToInt64(t["ReopenCount"]) +
+                              (toStatus.Equals("reopened", StringComparison.OrdinalIgnoreCase) ? 1 : 0);
+
+            Exec(c, tx, """
+                UPDATE Ticket SET Status=$to, LastStatusChangeUtc=$now,
+                  FirstResponseUtc=$fr, AssignedUtc=$assigned, ResolvedUtc=$resolved, ClosedUtc=$closed,
+                  AssignedToUserName=COALESCE($assignTo, AssignedToUserName),
+                  TotalElapsedMinutes=$total, ActiveProcessingMinutes=$active,
+                  SlaFirstResponseBreached=$frb, SlaResolutionBreached=$resb, ReopenCount=$reopen
+                WHERE TicketId=$t
+                """,
+                ("$to", toStatus), ("$now", Iso(now)), ("$fr", firstResponseUtc),
+                ("$assigned", assignedUtc), ("$resolved", resolvedUtc), ("$closed", closedUtc),
+                ("$assignTo", assignTo), ("$total", totalElapsed), ("$active", activeMinutes),
+                ("$frb", frBreached ? 1 : 0), ("$resb", resBreached ? 1 : 0),
+                ("$reopen", reopenCount), ("$t", ticketId));
+
+            var fingerprintId = Convert.ToInt64(t["FingerprintId"]);
+            if (to.IsTerminal)
+                Exec(c, tx, "UPDATE Fingerprint SET OpenTicketId = NULL, " +
+                            "TriageState = CASE WHEN TriageState IN ('new','acknowledged') THEN 'resolved' ELSE TriageState END " +
+                            "WHERE FingerprintId = $fp AND OpenTicketId = $t",
+                    ("$fp", fingerprintId), ("$t", ticketId));
+            else if (toStatus.Equals("reopened", StringComparison.OrdinalIgnoreCase))
+                Exec(c, tx, "UPDATE Fingerprint SET OpenTicketId = $t, TriageState='acknowledged' WHERE FingerprintId = $fp",
+                    ("$fp", fingerprintId), ("$t", ticketId));
+
+            tx.Commit();
+
+            return new
+            {
+                ticketNumber, fromStatus, toStatus, sequenceNo = seq,
+                minutesInPreviousStatus = minutesInFrom,
+                totalElapsedMinutes = totalElapsed, activeProcessingMinutes = activeMinutes
+            };
+        }
+    }
+
+    /* ==================================================================== */
+    /*  Reads                                                               */
+    /* ==================================================================== */
+
+    public object SearchTickets(string? status, bool? onlyOpen)
+    {
+        using var c = Open();
+        var rows = Query(c, null, """
+            SELECT t.*, (SELECT COUNT(*) FROM TicketLink l WHERE l.TicketId = t.TicketId) AS LinkedCount,
+                   o.ErrorReference
+            FROM Ticket t LEFT JOIN Occurrence o ON o.OccurrenceId = t.OccurrenceId
+            ORDER BY t.CreatedUtc DESC
+            """);
+
+        var items = rows
+            .Where(r => status is null || string.Equals(r["Status"] as string, status, StringComparison.OrdinalIgnoreCase))
+            .Where(r => onlyOpen != true || Statuses[(string)r["Status"]!].IsOpen)
+            .Select(r =>
+            {
+                var st = Statuses[(string)r["Status"]!];
+                var created = ParseUtc(r["CreatedUtc"] as string) ?? DateTime.UtcNow;
+                var lastChange = ParseUtc(r["LastStatusChangeUtc"] as string) ?? created;
+                // For an open ticket the stored elapsed value is stale by
+                // definition - recompute live, exactly as usp_Ticket_Search does.
+                var elapsed = st.IsTerminal
+                    ? Convert.ToInt32(r["TotalElapsedMinutes"] ?? 0)
+                    : (int)Math.Round((DateTime.UtcNow - created).TotalMinutes);
+
+                return new
+                {
+                    ticketNumber = r["TicketNumber"],
+                    title = r["Title"],
+                    statusCode = r["Status"],
+                    statusName = st.Display,
+                    isOpen = st.IsOpen,
+                    isTerminal = st.IsTerminal,
+                    severityCode = r["Severity"],
+                    queue = r["Queue"],
+                    createdVia = r["CreatedVia"],
+                    reportedBy = r["ReportedByUserName"],
+                    assignedTo = r["AssignedToUserName"],
+                    erpModule = r["ErpModule"],
+                    createdUtc = r["CreatedUtc"],
+                    firstResponseUtc = r["FirstResponseUtc"],
+                    resolvedUtc = r["ResolvedUtc"],
+                    closedUtc = r["ClosedUtc"],
+                    totalElapsedMinutes = elapsed,
+                    activeProcessingMinutes = r["ActiveProcessingMinutes"] is null ? (int?)null : Convert.ToInt32(r["ActiveProcessingMinutes"]),
+                    slaFirstResponseTargetMinutes = r["SlaFirstResponseMinutes"],
+                    slaResolutionTargetMinutes = r["SlaResolutionMinutes"],
+                    slaFirstResponseBreached = Convert.ToInt64(r["SlaFirstResponseBreached"]) == 1,
+                    slaResolutionBreached = Convert.ToInt64(r["SlaResolutionBreached"]) == 1,
+                    reopenCount = r["ReopenCount"],
+                    linkedOccurrenceCount = r["LinkedCount"],
+                    primaryErrorReference = r["ErrorReference"],
+                    allowedTransitions = Transitions.Keys
+                        .Where(k => k.Item1 == ((string)r["Status"]!).ToLowerInvariant())
+                        .Select(k => new { to = k.Item2, display = Statuses[k.Item2].Display,
+                                           requiresComment = Transitions[k] })
+                        .ToList()
+                };
+            }).ToList();
+
+        return new { items, total = items.Count };
+    }
+
+    public object? GetTicket(string ticketNumber)
+    {
+        using var c = Open();
+        var t = QueryOne(c, null, """
+            SELECT t.*, o.ErrorReference FROM Ticket t
+            LEFT JOIN Occurrence o ON o.OccurrenceId = t.OccurrenceId
+            WHERE t.TicketNumber = $n
+            """, ("$n", ticketNumber));
+        if (t is null) return null;
+
+        var ticketId = Convert.ToInt64(t["TicketId"]);
+
+        var history = Query(c, null,
+            "SELECT * FROM TicketHistory WHERE TicketId = $t ORDER BY SequenceNo", ("$t", ticketId))
+            .Select(h => new
+            {
+                sequenceNo = h["SequenceNo"],
+                fromStatus = h["FromStatus"],
+                fromStatusName = h["FromStatus"] is null ? null : Statuses[(string)h["FromStatus"]!].Display,
+                toStatus = h["ToStatus"],
+                toStatusName = Statuses[(string)h["ToStatus"]!].Display,
+                changedBy = h["ChangedByUserName"],
+                changedUtc = h["ChangedUtc"],
+                minutesInFromStatus = h["MinutesInFromStatus"],
+                comments = h["Comments"]
+            }).ToList();
+
+        // "Time spent in each status" - derived from the audit rows, which is
+        // why MinutesInFromStatus is written as it happens rather than
+        // reconstructed at report time.
+        var timeInStatus = Query(c, null,
+            "SELECT FromStatus, SUM(MinutesInFromStatus) AS Mins, COUNT(*) AS Times " +
+            "FROM TicketHistory WHERE TicketId = $t AND MinutesInFromStatus IS NOT NULL GROUP BY FromStatus",
+            ("$t", ticketId))
+            .Where(r => r["FromStatus"] is not null)
+            .Select(r => new
+            {
+                statusCode = r["FromStatus"],
+                statusName = Statuses[(string)r["FromStatus"]!].Display,
+                minutesInStatus = r["Mins"],
+                timesEntered = r["Times"],
+                countsTowardActiveTime = !Statuses[(string)r["FromStatus"]!].IsPaused
+            }).ToList();
+
+        var linked = Query(c, null, """
+            SELECT o.ErrorReference, o.OccurredUtc, o.UserName, o.Screen, o.Component, o.Message, l.LinkReason
+            FROM TicketLink l JOIN Occurrence o ON o.OccurrenceId = l.OccurrenceId
+            WHERE l.TicketId = $t ORDER BY o.OccurredUtc DESC LIMIT 200
+            """, ("$t", ticketId))
+            .Select(r => new
+            {
+                errorReference = r["ErrorReference"], occurredUtc = r["OccurredUtc"],
+                userName = r["UserName"], screen = r["Screen"], component = r["Component"],
+                message = r["Message"], linkReason = r["LinkReason"]
+            }).ToList();
+
+        var st = Statuses[(string)t["Status"]!];
+
+        var created = ParseUtc(t["CreatedUtc"] as string) ?? DateTime.UtcNow;
+        var lastChange = ParseUtc(t["LastStatusChangeUtc"] as string) ?? created;
+        var pausedMinutes = timeInStatus.Where(x => !x.countsTowardActiveTime)
+                                        .Sum(x => Convert.ToInt64(x.minutesInStatus));
+        var liveElapsed = st.IsTerminal && t["TotalElapsedMinutes"] is not null
+            ? Convert.ToInt32(t["TotalElapsedMinutes"])
+            : (int)Math.Round((DateTime.UtcNow - created).TotalMinutes);
+        var liveActive = st.IsTerminal && t["ActiveProcessingMinutes"] is not null
+            ? Convert.ToInt32(t["ActiveProcessingMinutes"])
+            : (int)(liveElapsed - pausedMinutes
+                    - (st.IsPaused ? (long)Math.Round((DateTime.UtcNow - lastChange).TotalMinutes) : 0));
+
+        return new
+        {
+            ticketNumber = t["TicketNumber"], title = t["Title"],
+            userDescription = t["UserDescription"],
+            statusCode = t["Status"], statusName = st.Display, isOpen = st.IsOpen,
+            severityCode = t["Severity"], queue = t["Queue"], createdVia = t["CreatedVia"],
+            reportedBy = t["ReportedByUserName"],
+            assignedTo = t["AssignedToUserName"],
+            erpModule = t["ErpModule"], environment = t["Environment"],
+            createdUtc = t["CreatedUtc"],
+            firstResponseUtc = t["FirstResponseUtc"],
+            resolvedUtc = t["ResolvedUtc"],
+            closedUtc = t["ClosedUtc"],
+            // Live for an open ticket - the stored value was last written at
+            // the previous status change, so a freshly created ticket would
+            // report null and the console would show an empty cell.
+            totalElapsedMinutes = liveElapsed,
+            activeProcessingMinutes = liveActive,
+            slaFirstResponseBreached = Convert.ToInt64(t["SlaFirstResponseBreached"]) == 1,
+            slaResolutionBreached = Convert.ToInt64(t["SlaResolutionBreached"]) == 1,
+            linkedOccurrenceCount = t["LinkedOccurrenceCount"],
+            primaryErrorReference = t["ErrorReference"],
+            history, timeInStatus, linkedOccurrences = linked,
+            allowedTransitions = Transitions.Keys
+                .Where(k => k.Item1 == ((string)t["Status"]!).ToLowerInvariant())
+                .Select(k => new { to = k.Item2, display = Statuses[k.Item2].Display,
+                                   requiresComment = Transitions[k] }).ToList()
+        };
+    }
+
+    public object SearchErrors(string? severity, string? layer)
+    {
+        using var c = Open();
+        var rows = Query(c, null, """
+            SELECT o.*, f.FingerprintHash, f.OccurrenceCount, f.DistinctUserCount,
+                   f.FirstSeenUtc, f.LastSeenUtc, f.TriageState, f.SignatureText,
+                   t.TicketNumber, t.Status AS TicketStatus
+            FROM Occurrence o
+            JOIN Fingerprint f ON f.FingerprintId = o.FingerprintId
+            LEFT JOIN Ticket t ON t.TicketId = o.TicketId
+            ORDER BY o.OccurredUtc DESC, o.OccurrenceId DESC LIMIT 300
+            """);
+
+        var items = rows
+            .Where(r => severity is null || string.Equals(r["Severity"] as string, severity, StringComparison.OrdinalIgnoreCase))
+            .Where(r => layer is null || string.Equals(r["Layer"] as string, layer, StringComparison.OrdinalIgnoreCase))
+            .Select(r => new
+            {
+                errorReference = r["ErrorReference"], occurredUtc = r["OccurredUtc"],
+                layer = r["Layer"], category = r["Category"], severity = r["Severity"],
+                exceptionType = r["ExceptionType"], message = r["Message"],
+                erpModule = r["ErpModule"], screen = r["Screen"], component = r["Component"],
+                apiController = r["ApiController"], apiAction = r["ApiAction"],
+                apiEndpoint = r["ApiEndpoint"], httpStatusCode = r["HttpStatusCode"],
+                sqlErrorNumber = r["SqlErrorNumber"], sqlObjectName = r["SqlObjectName"],
+                sqlLineNumber = r["SqlLineNumber"], sqlDatabaseName = r["SqlDatabaseName"],
+                userName = r["UserName"], correlationId = r["CorrelationId"],
+                environment = r["Environment"], browserName = r["BrowserName"],
+                fingerprintHash = ((string?)r["FingerprintHash"])?[..12],
+                fingerprintOccurrenceCount = r["OccurrenceCount"],
+                distinctUserCount = r["DistinctUserCount"],
+                triageState = r["TriageState"],
+                ticketNumber = r["TicketNumber"]
+            }).ToList();
+
+        return new { items, total = items.Count };
+    }
+
+    public object GetErrorDetail(string errorReference)
+    {
+        using var c = Open();
+        var r = QueryOne(c, null, """
+            SELECT o.*, f.FingerprintHash, f.SignatureText, f.OccurrenceCount, f.DistinctUserCount,
+                   f.FirstSeenUtc, f.LastSeenUtc, f.TriageState, t.TicketNumber
+            FROM Occurrence o JOIN Fingerprint f ON f.FingerprintId = o.FingerprintId
+            LEFT JOIN Ticket t ON t.TicketId = o.TicketId
+            WHERE o.ErrorReference = $r
+            """, ("$r", errorReference));
+        if (r is null) return new { };
+
+        return new
+        {
+            errorReference = r["ErrorReference"], occurredUtc = r["OccurredUtc"],
+            layer = r["Layer"], category = r["Category"], severity = r["Severity"],
+            exceptionType = r["ExceptionType"], message = r["Message"],
+            erpModule = r["ErpModule"], screen = r["Screen"], component = r["Component"],
+            routeUrl = r["RouteUrl"], actionName = r["ActionName"],
+            formName = r["FormName"], lovName = r["LovName"],
+            apiController = r["ApiController"], apiAction = r["ApiAction"],
+            apiEndpoint = r["ApiEndpoint"], httpStatusCode = r["HttpStatusCode"],
+            sql = new
+            {
+                number = r["SqlErrorNumber"], objectName = r["SqlObjectName"],
+                lineNumber = r["SqlLineNumber"], serverName = r["SqlServerName"],
+                databaseName = r["SqlDatabaseName"], schemaName = r["SqlSchemaName"]
+            },
+            userName = r["UserName"], correlationId = r["CorrelationId"],
+            environment = r["Environment"], appVersion = r["AppVersion"],
+            browserName = r["BrowserName"], browserVersion = r["BrowserVersion"], osName = r["OsName"],
+            stackTrace = r["StackTrace"], innerExceptionChain = r["InnerExceptionChain"],
+            requestPayload = Parse(r["RequestPayloadJson"] as string),
+            validationErrors = Parse(r["ValidationErrorsJson"] as string),
+            breadcrumbs = Parse(r["BreadcrumbsJson"] as string),
+            fingerprintHash = r["FingerprintHash"], signatureText = r["SignatureText"],
+            occurrenceCount = r["OccurrenceCount"], distinctUserCount = r["DistinctUserCount"],
+            firstSeenUtc = r["FirstSeenUtc"], lastSeenUtc = r["LastSeenUtc"],
+            triageState = r["TriageState"],
+            ticketNumber = r["TicketNumber"]
+        };
+    }
+
+    public object RecurringProblems()
+    {
+        using var c = Open();
+        var items = Query(c, null, """
+            SELECT f.*, t.TicketNumber AS OpenTicketNumber
+            FROM Fingerprint f LEFT JOIN Ticket t ON t.TicketId = f.OpenTicketId
+            ORDER BY f.OccurrenceCount DESC, f.LastSeenUtc DESC LIMIT 100
+            """).Select(r => new
+        {
+            fingerprintHash = ((string)r["FingerprintHash"]!)[..12],
+            signatureText = r["SignatureText"],
+            layer = r["Layer"], category = r["Category"], severity = r["Severity"],
+            exceptionType = r["ExceptionType"], normalizedMessage = r["NormalizedMessage"],
+            erpModule = r["ErpModule"], screen = r["Screen"], component = r["Component"],
+            sqlObjectName = r["SqlObjectName"], apiEndpoint = r["ApiEndpoint"],
+            firstSeenUtc = r["FirstSeenUtc"], lastSeenUtc = r["LastSeenUtc"],
+            occurrenceCount = r["OccurrenceCount"], distinctUserCount = r["DistinctUserCount"],
+            triageState = r["TriageState"],
+            openTicketNumber = r["OpenTicketNumber"]
+        }).ToList();
+
+        return new { items, total = items.Count };
+    }
+
+    public object Dashboard()
+    {
+        using var c = Open();
+        var errors = ExecScalarLong(c, null, "SELECT COUNT(*) FROM Occurrence");
+        var problems = ExecScalarLong(c, null, "SELECT COUNT(*) FROM Fingerprint");
+        var tickets = ExecScalarLong(c, null, "SELECT COUNT(*) FROM Ticket");
+        var openTickets = Query(c, null, "SELECT Status FROM Ticket")
+            .Count(r => Statuses[(string)r["Status"]!].IsOpen);
+
+        var byLayer = Query(c, null,
+            "SELECT Layer, COUNT(*) AS n FROM Occurrence GROUP BY Layer ORDER BY n DESC")
+            .Select(r => new { layer = r["Layer"], count = r["n"] }).ToList();
+
+        var bySeverity = Query(c, null,
+            "SELECT Severity, COUNT(*) AS n FROM Occurrence GROUP BY Severity")
+            .Select(r => new { severity = r["Severity"], count = r["n"] })
+            .OrderBy(x => Rank((string)x.severity!)).ToList();
+
+        var topModules = Query(c, null,
+            "SELECT COALESCE(ErpModule,'(unknown)') AS m, COUNT(*) AS n FROM Occurrence GROUP BY m ORDER BY n DESC LIMIT 5")
+            .Select(r => new { erpModule = r["m"], count = r["n"] }).ToList();
+
+        return new
+        {
+            errorsCaptured = errors,
+            distinctProblems = problems,
+            deduplicationRatio = problems == 0 ? 0 : Math.Round((double)errors / problems, 1),
+            ticketsCreated = tickets,
+            openTickets,
+            byLayer, bySeverity, topModules
+        };
+    }
+
+    public object CorrelationTrail(string correlationId)
+    {
+        using var c = Open();
+        // Deepest layer first: the cause, then the symptom.
+        var order = new Dictionary<string, int>
+        {
+            ["database"] = 0, ["data"] = 1, ["business"] = 2,
+            ["webapi"] = 3, ["http"] = 4, ["angular"] = 5
+        };
+
+        var items = Query(c, null,
+            "SELECT * FROM Occurrence WHERE CorrelationId = $c ORDER BY OccurredUtc",
+            ("$c", correlationId))
+            .Select(r => new
+            {
+                errorReference = r["ErrorReference"], occurredUtc = r["OccurredUtc"],
+                layer = r["Layer"], category = r["Category"], severity = r["Severity"],
+                exceptionType = r["ExceptionType"], message = r["Message"],
+                component = r["Component"], screen = r["Screen"],
+                apiController = r["ApiController"], apiAction = r["ApiAction"],
+                httpStatusCode = r["HttpStatusCode"],
+                sqlErrorNumber = r["SqlErrorNumber"], sqlObjectName = r["SqlObjectName"],
+                sqlLineNumber = r["SqlLineNumber"]
+            })
+            .OrderBy(x => order.TryGetValue((string)x.layer! ?? "", out var o) ? o : 9)
+            .ToList();
+
+        return new { correlationId, items, total = items.Count };
+    }
+
+    /* ==================================================================== */
+    /*  Server-side envelope construction, for the failing demo endpoints   */
+    /* ==================================================================== */
+
+    public ErrorEnvelope BuildServerEnvelope(HttpContext ctx, string layer, string category,
+        string severity, string exceptionType, string message, string stack,
+        string? controller = null, string? action = null, SqlErrorInfo? sql = null)
+    {
+        var correlationId = ctx.Request.Headers["X-Correlation-Id"].FirstOrDefault()
+                            ?? Guid.NewGuid().ToString();
+        var module = ctx.Request.Headers["X-Erp-Module"].FirstOrDefault();
+        var screen = ctx.Request.Headers["X-Erp-Screen"].FirstOrDefault();
+
+        // Uses the SAME Fingerprint.Compute the production packages use.
+        var fp = Fingerprint.Compute(new Fingerprint.Input
+        {
+            Layer = layer, Category = category, ExceptionType = exceptionType,
+            Message = message, StackTrace = stack,
+            ApiController = controller, ApiAction = action,
+            ErpModule = module, Screen = screen,
+            SqlErrorNumber = sql?.Number, SqlObjectName = sql?.ObjectName
+        });
+
+        return new ErrorEnvelope
+        {
+            FingerprintHash = fp.Hash, SignatureText = fp.Signature,
+            Layer = layer, Category = category, Severity = severity,
+            ExceptionType = exceptionType,
+            Message = Redactor.ScrubText(message, 2000),
+            NormalizedMessage = fp.NormalizedMessage,
+            OccurredUtc = DateTime.UtcNow.ToString("o"),
+            ErpModule = module, Screen = screen,
+            ApiApplication = "ERP.Api", ApiController = controller, ApiAction = action,
+            ApiEndpoint = ctx.Request.Path.Value, HttpMethod = ctx.Request.Method,
+            Sql = sql,
+            User = new UserContext { Name = "fatima.saeed", DisplayName = "Fatima Saeed" },
+            CorrelationId = correlationId,
+            RequestId = ctx.Request.Headers["X-Request-Id"].FirstOrDefault(),
+            Environment = "Demo", AppVersion = "2026.3.1",
+            StackTrace = Redactor.ScrubText(stack, 20000)
+        };
+    }
+
+    /// <summary>Pre-populate a plausible history so the admin views are not empty.</summary>
+    public void Seed()
+    {
+        var users = new[] { "fatima.saeed", "omar.khan", "lisa.chen", "raj.patel" };
+        var rnd = new Random(20260915);
+
+        // One recurring LOV fault across four users - the case the
+        // recurring-problems report exists to surface.
+        for (var i = 0; i < 14; i++)
+        {
+            var fp = Fingerprint.Compute(new Fingerprint.Input
+            {
+                Layer = ErrorLayers.Database, Category = ErrorCategories.SqlProcedure,
+                ExceptionType = "System.Data.SqlClient.SqlException",
+                Message = $"Invalid column name 'IsActiveFlag'. (request {Guid.NewGuid()})",
+                StackTrace = "   at Erp.Common.LovRepository.Load(String lovCode) in C:\\build\\src\\LovRepository.cs:line 41",
+                SqlErrorNumber = 207, SqlObjectName = "usp_GetCostCentreLov"
+            });
+
+            Capture(new ErrorEnvelope
+            {
+                FingerprintHash = fp.Hash, SignatureText = fp.Signature,
+                Layer = ErrorLayers.Database, Category = ErrorCategories.SqlProcedure,
+                Severity = "medium",
+                ExceptionType = "System.Data.SqlClient.SqlException",
+                Message = "Invalid column name 'IsActiveFlag'.",
+                NormalizedMessage = fp.NormalizedMessage,
+                OccurredUtc = DateTime.UtcNow.AddMinutes(-rnd.Next(10, 2800)).ToString("o"),
+                ErpModule = "FI", Screen = "Cost Centre Lookup", LovName = "COST_CENTRE",
+                ApiController = "Lov", ApiAction = "Get", ApiEndpoint = "/api/lov/cost-centre",
+                Sql = new SqlErrorInfo
+                {
+                    Number = 207, Severity = 16, State = 1, ObjectName = "usp_GetCostCentreLov",
+                    LineNumber = 12, ServerName = "ERP-SQL01", DatabaseName = "ERP_PROD", SchemaName = "common"
+                },
+                User = new UserContext { Name = users[i % users.Length] },
+                CorrelationId = Guid.NewGuid().ToString(),
+                Environment = "Demo", AppVersion = "2026.3.1",
+                StackTrace = "   at Erp.Common.LovRepository.Load(String lovCode) in C:\\build\\src\\LovRepository.cs:line 41"
+            });
+        }
+
+        // A handful of one-off faults across other layers, so the dashboard
+        // breakdown is not a single bar.
+        var oneOffs = new (string Layer, string Category, string Severity, string Type, string Msg, string Module, string Screen)[]
+        {
+            (ErrorLayers.Angular, "angular_runtime", "high", "TypeError",
+                "Cannot read properties of undefined (reading 'netAmount')", "SD", "Sales Order Entry"),
+            (ErrorLayers.Angular, "chunk_load", "high", "ChunkLoadError",
+                "Loading chunk 482 failed.", "HR", "Leave Request"),
+            (ErrorLayers.Http, "http_server", "critical", "HttpErrorResponse",
+                "500 Internal Server Error on /api/purchase-orders", "MM", "Purchase Order"),
+            (ErrorLayers.WebApi, "api_unhandled", "critical", "System.NullReferenceException",
+                "Object reference not set to an instance of an object.", "MM", "Purchase Order"),
+            (ErrorLayers.Business, "business_rule", "low", "Erp.Core.CreditLimitBusinessException",
+                "Customer credit limit exceeded by 12,400.00", "SD", "Sales Order Entry"),
+            (ErrorLayers.Angular, "validation", "low", "Error",
+                "Validation failed on PurchaseOrderHeader (3 field(s))", "MM", "Purchase Order"),
+        };
+
+        foreach (var o in oneOffs)
+        {
+            var fp = Fingerprint.Compute(new Fingerprint.Input
+            {
+                Layer = o.Layer, Category = o.Category, ExceptionType = o.Type,
+                Message = o.Msg, ErpModule = o.Module, Screen = o.Screen
+            });
+            Capture(new ErrorEnvelope
+            {
+                FingerprintHash = fp.Hash, SignatureText = fp.Signature,
+                Layer = o.Layer, Category = o.Category, Severity = o.Severity,
+                ExceptionType = o.Type, Message = o.Msg, NormalizedMessage = fp.NormalizedMessage,
+                OccurredUtc = DateTime.UtcNow.AddMinutes(-rnd.Next(5, 4000)).ToString("o"),
+                ErpModule = o.Module, Screen = o.Screen,
+                User = new UserContext { Name = users[rnd.Next(users.Length)] },
+                CorrelationId = Guid.NewGuid().ToString(),
+                Environment = "Demo", AppVersion = "2026.3.1",
+                Client = new ClientInfo { BrowserName = "Chrome", BrowserVersion = "141", OsName = "Windows 10/11" }
+            });
+        }
+    }
+
+    /* ==================================================================== */
+    /*  Plumbing                                                            */
+    /* ==================================================================== */
+
+    private bool IsTicketOpen(SqliteConnection c, SqliteTransaction? tx, long ticketId)
+    {
+        var row = QueryOne(c, tx, "SELECT Status FROM Ticket WHERE TicketId = $t", ("$t", ticketId));
+        return row is not null && Statuses.TryGetValue((string)row["Status"]!, out var s) && !s.IsTerminal;
+    }
+
+    private string NextReference(SqliteConnection c, SqliteTransaction? tx, string prefix, DateTime now)
+    {
+        Exec(c, tx, "INSERT INTO Counter (Name, Value) VALUES ($n, 0) ON CONFLICT(Name) DO NOTHING",
+            ("$n", prefix));
+        Exec(c, tx, "UPDATE Counter SET Value = Value + 1 WHERE Name = $n", ("$n", prefix));
+        var value = ExecScalarLong(c, tx, "SELECT Value FROM Counter WHERE Name = $n", ("$n", prefix));
+        return $"{prefix}-{now:yyyy}-{value:D8}";
+    }
+
+    private static string Iso(DateTime utc) => utc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
+
+    private static DateTime? ParseUtc(string? value)
+        => DateTime.TryParse(value, null, System.Globalization.DateTimeStyles.AdjustToUniversal
+            | System.Globalization.DateTimeStyles.AssumeUniversal, out var d) ? d : null;
+
+    private static string? Json(object? value)
+        => value is null ? null : JsonSerializer.Serialize(value);
+
+    private static object? Parse(string? json)
+    {
+        if (string.IsNullOrEmpty(json)) return null;
+        try { return JsonSerializer.Deserialize<JsonElement>(json); } catch { return null; }
+    }
+
+    private static string Truncate(string s, int max) => s.Length <= max ? s : s[..max];
+
+    private static void Exec(SqliteConnection c, string sql) => Exec(c, null, sql);
+
+    private static void Exec(SqliteConnection c, SqliteTransaction? tx, string sql,
+        params (string Name, object? Value)[] parameters)
+    {
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = sql;
+        if (tx is not null) cmd.Transaction = tx;
+        foreach (var (n, v) in parameters) cmd.Parameters.AddWithValue(n, v ?? DBNull.Value);
+        cmd.ExecuteNonQuery();
+    }
+
+    private static long ExecScalarLong(SqliteConnection c, SqliteTransaction? tx, string sql,
+        params (string Name, object? Value)[] parameters)
+    {
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = sql;
+        if (tx is not null) cmd.Transaction = tx;
+        foreach (var (n, v) in parameters) cmd.Parameters.AddWithValue(n, v ?? DBNull.Value);
+        var result = cmd.ExecuteScalar();
+        return result is null or DBNull ? 0 : Convert.ToInt64(result);
+    }
+
+    private static List<Dictionary<string, object?>> Query(SqliteConnection c, SqliteTransaction? tx,
+        string sql, params (string Name, object? Value)[] parameters)
+    {
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = sql;
+        if (tx is not null) cmd.Transaction = tx;
+        foreach (var (n, v) in parameters) cmd.Parameters.AddWithValue(n, v ?? DBNull.Value);
+
+        var rows = new List<Dictionary<string, object?>>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var row = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            for (var i = 0; i < reader.FieldCount; i++)
+                // null, NOT DBNull.Value: System.Text.Json serialises DBNull
+                // as an empty object, which reaches the UI as "[object Object]".
+                row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+            rows.Add(row);
+        }
+        return rows;
+    }
+
+    private static Dictionary<string, object?>? QueryOne(SqliteConnection c, SqliteTransaction? tx,
+        string sql, params (string Name, object? Value)[] parameters)
+        => Query(c, tx, sql, parameters).FirstOrDefault();
+}

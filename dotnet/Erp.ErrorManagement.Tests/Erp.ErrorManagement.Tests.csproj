@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Erp.ErrorManagement.Tests</AssemblyName>
+    <RootNamespace>Erp.ErrorManagement.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      ScriptDom is the SAME T-SQL parser SSMS, sqlpackage and the SQL Server
+      Data Tools build use.  Running every script in db/ through it verifies
+      the syntax against a real SQL Server grammar rather than by eye.
+    -->
+    <PackageReference Include="Microsoft.SqlServer.TransactSql.ScriptDom" Version="161.8905.0" />
+    <ProjectReference Include="..\Erp.ErrorManagement.Core\Erp.ErrorManagement.Core.csproj" />
+  </ItemGroup>
+
+</Project>

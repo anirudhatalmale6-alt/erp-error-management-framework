@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    netstandard2.0 is the deliberate choice here.  It is the only target that is
+    consumable by BOTH the existing .NET Framework 4.7.2 Web API 2 application
+    and the newer .NET 8 / EF Core modules, which means the fingerprinting,
+    redaction and envelope contract exist exactly once in the codebase rather
+    than being maintained in parallel and drifting.
+  -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>Erp.ErrorManagement.Core</AssemblyName>
+    <RootNamespace>Erp.ErrorManagement</RootNamespace>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <PackageId>Erp.ErrorManagement.Core</PackageId>
+    <Version>1.0.0</Version>
+    <Description>Shared contracts, fingerprinting and redaction for the ERP Error Management Framework.</Description>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="System.Data.SqlClient" Version="4.8.6" />
+  </ItemGroup>
+
+</Project>
