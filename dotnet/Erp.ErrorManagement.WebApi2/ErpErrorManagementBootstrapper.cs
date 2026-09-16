@@ -40,6 +40,13 @@ namespace Erp.ErrorManagement.WebApi2
             var store = new SqlErrorStore(options);
             var capture = new ErrorCaptureService(store, options);
 
+            // Guards the unauthenticated capture endpoint. Constructed once and
+            // shared: a per-request instance would have an empty bucket every
+            // time, which is the same as no limit at all.
+            var throttle = new AnonymousCaptureThrottle(
+                options.AnonymousCaptureRatePerMinute,
+                options.AnonymousCaptureBurst);
+
             // 1. Ambient context + correlation, before routing.
             config.MessageHandlers.Add(new ErpErrorCorrelationHandler(options.DefaultErpModule));
 
@@ -59,7 +66,7 @@ namespace Erp.ErrorManagement.WebApi2
             //    keeps resolving every other controller exactly as before.
             var existing = config.Services.GetHttpControllerActivator();
             config.Services.Replace(typeof(IHttpControllerActivator),
-                new ErpControllerActivator(existing, capture, store));
+                new ErpControllerActivator(existing, capture, store, throttle));
 
             return config;
         }
@@ -110,13 +117,15 @@ namespace Erp.ErrorManagement.WebApi2
         private readonly IHttpControllerActivator _inner;
         private readonly ErrorCaptureService _capture;
         private readonly IErrorStore _store;
+        private readonly AnonymousCaptureThrottle _throttle;
 
         public ErpControllerActivator(IHttpControllerActivator inner,
-            ErrorCaptureService capture, IErrorStore store)
+            ErrorCaptureService capture, IErrorStore store, AnonymousCaptureThrottle throttle)
         {
             _inner = inner;
             _capture = capture;
             _store = store;
+            _throttle = throttle;
         }
 
         public System.Web.Http.Controllers.IHttpController Create(
@@ -125,7 +134,7 @@ namespace Erp.ErrorManagement.WebApi2
             Type controllerType)
         {
             if (controllerType == typeof(ErrorManagementController))
-                return new ErrorManagementController(_capture, _store);
+                return new ErrorManagementController(_capture, _store, _throttle);
 
             if (_inner != null)
                 return _inner.Create(request, controllerDescriptor, controllerType);

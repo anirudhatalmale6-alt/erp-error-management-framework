@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using Newtonsoft.Json;
 
@@ -121,6 +122,80 @@ namespace Erp.ErrorManagement
         [JsonProperty("shouldNotifyUser")]  public bool ShouldNotifyUser { get; set; }
         [JsonProperty("autoTicketNumber")]  public string AutoTicketNumber { get; set; }
         [JsonProperty("isKnownIssue")]      public bool IsKnownIssue { get; set; }
+
+        /// <summary>
+        /// Whether this caller may turn the error into a ticket.
+        ///
+        /// Set by the API, not the database: it depends on whether the request
+        /// was authenticated, which the store knows nothing about. The dialog
+        /// hides its "Report issue" button when this is false, because offering
+        /// a button that is going to be refused is worse than not offering one.
+        /// </summary>
+        [JsonProperty("canCreateTicket")]   public bool CanCreateTicket { get; set; } = true;
+    }
+
+    /// <summary>One row in the end user's "My Tickets" list.</summary>
+    public class UserTicketSummary
+    {
+        [JsonProperty("ticketNumber")] public string TicketNumber { get; set; }
+        [JsonProperty("title")]        public string Title { get; set; }
+        [JsonProperty("statusCode")]   public string StatusCode { get; set; }
+        [JsonProperty("statusName")]   public string StatusName { get; set; }
+        [JsonProperty("isOpen")]       public bool IsOpen { get; set; }
+        [JsonProperty("severityName")] public string SeverityName { get; set; }
+        [JsonProperty("createdUtc")]   public DateTime? CreatedUtc { get; set; }
+        [JsonProperty("resolvedUtc")]  public DateTime? ResolvedUtc { get; set; }
+        [JsonProperty("closedUtc")]    public DateTime? ClosedUtc { get; set; }
+        [JsonProperty("erpModule")]    public string ErpModule { get; set; }
+        [JsonProperty("latestUpdate")] public string LatestUpdate { get; set; }
+        /// <summary>True when support is waiting on the user to reply.</summary>
+        [JsonProperty("awaitingYourReply")] public bool AwaitingYourReply { get; set; }
+    }
+
+    /// <summary>
+    /// The end user's view of one of their own tickets.
+    ///
+    /// Note what is absent: no stack trace, no SQL object, no exception type, no
+    /// assignee, no fingerprint, no internal notes. Those are removed by the
+    /// stored procedure, not by the UI - filtering in the UI would still have
+    /// sent them to the browser.
+    /// </summary>
+    public class UserTicketDetail
+    {
+        [JsonProperty("ticketNumber")]   public string TicketNumber { get; set; }
+        [JsonProperty("title")]          public string Title { get; set; }
+        [JsonProperty("statusCode")]     public string StatusCode { get; set; }
+        [JsonProperty("statusName")]     public string StatusName { get; set; }
+        [JsonProperty("isOpen")]         public bool IsOpen { get; set; }
+        [JsonProperty("severityName")]   public string SeverityName { get; set; }
+        [JsonProperty("erpModule")]      public string ErpModule { get; set; }
+        [JsonProperty("createdUtc")]     public DateTime? CreatedUtc { get; set; }
+        [JsonProperty("firstResponseUtc")] public DateTime? FirstResponseUtc { get; set; }
+        [JsonProperty("resolvedUtc")]    public DateTime? ResolvedUtc { get; set; }
+        [JsonProperty("closedUtc")]      public DateTime? ClosedUtc { get; set; }
+        [JsonProperty("errorReference")] public string ErrorReference { get; set; }
+        [JsonProperty("yourDescription")] public string YourDescription { get; set; }
+        [JsonProperty("resolutionNotes")] public string ResolutionNotes { get; set; }
+        [JsonProperty("awaitingYourReply")] public bool AwaitingYourReply { get; set; }
+        [JsonProperty("canComment")]     public bool CanComment { get; set; }
+        [JsonProperty("history")]        public List<UserTicketHistoryEntry> History { get; set; }
+        [JsonProperty("comments")]       public List<UserTicketComment> Comments { get; set; }
+    }
+
+    public class UserTicketHistoryEntry
+    {
+        [JsonProperty("sequenceNo")] public int SequenceNo { get; set; }
+        [JsonProperty("statusName")] public string StatusName { get; set; }
+        [JsonProperty("changedUtc")] public DateTime ChangedUtc { get; set; }
+        [JsonProperty("comments")]   public string Comments { get; set; }
+    }
+
+    public class UserTicketComment
+    {
+        [JsonProperty("authorRole")] public string AuthorRole { get; set; }
+        [JsonProperty("authorName")] public string AuthorName { get; set; }
+        [JsonProperty("commentText")] public string CommentText { get; set; }
+        [JsonProperty("createdUtc")] public DateTime CreatedUtc { get; set; }
     }
 
     public class TicketCreateResult

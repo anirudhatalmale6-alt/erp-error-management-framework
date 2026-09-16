@@ -144,6 +144,35 @@ namespace Erp.ErrorManagement
                     return result;
             }
 
+            // EF's own concurrency and validation exceptions, again by name.
+            // These survive Unwrap() when they have no inner exception, which is
+            // exactly the case for an optimistic-concurrency conflict: there is
+            // no SqlException underneath, the row simply was not there to update.
+            var efName = ex.GetType().Name;
+            if (efName == "DbUpdateConcurrencyException" || efName == "OptimisticConcurrencyException")
+            {
+                result.Layer = ErrorLayers.Data;
+                result.Category = ErrorCategories.Concurrency;
+                result.Severity = ErrorSeverities.Medium;
+                result.HttpStatusCode = 409;
+                return result;
+            }
+
+            if (efName == "DbEntityValidationException")
+            {
+                // EF6 model validation failing server-side is a business/model
+                // problem, not an outage.  Note the MESSAGE of this exception is
+                // famously useless ("Validation failed for one or more
+                // entities") - the detail lives in EntityValidationErrors, which
+                // Core cannot read without referencing EF.  The host can surface
+                // it through BeforeSend if it wants it.
+                result.Layer = ErrorLayers.Business;
+                result.Category = ErrorCategories.BusinessRule;
+                result.Severity = ErrorSeverities.Medium;
+                result.HttpStatusCode = 400;
+                return result;
+            }
+
             // The host application's own business exception base type, if it
             // has one, is recognised by convention rather than by reference -
             // Core must not take a dependency on the ERP's assemblies.
@@ -272,13 +301,53 @@ namespace Erp.ErrorManagement
             if (exception is System.Reflection.TargetInvocationException tie && tie.InnerException != null)
                 return Unwrap(tie.InnerException, depth + 1);
 
-            if (exception.GetType().Name == "EntityCommandExecutionException" && exception.InnerException != null)
-                return Unwrap(exception.InnerException, depth + 1);
-
-            if (exception.GetType().Name == "DbUpdateException" && exception.InnerException != null)
+            // ORM wrappers, matched BY NAME rather than by type.
+            //
+            // Core is netstandard2.0 and must not reference EntityFramework,
+            // EntityFramework.Core or System.Data.Entity - it has to load in a
+            // .NET Framework 4.7.2 app using EF6/EDMX *and* a .NET 8 app using
+            // EF Core, and referencing either would break the other.  Matching
+            // on the type name keeps it decoupled and costs nothing: these
+            // names have been stable across every EF version that exists.
+            //
+            // Each of these hides the SqlException that actually matters:
+            //   EF6 / EDMX ObjectContext .... UpdateException, EntityException,
+            //                                 EntityCommandExecutionException,
+            //                                 EntitySqlException
+            //   EF6 DbContext ............... DbUpdateException,
+            //                                 DbEntityValidationException
+            //   EF Core ..................... DbUpdateException,
+            //                                 DbUpdateConcurrencyException
+            var wrapperName = exception.GetType().Name;
+            if (exception.InnerException != null && IsOrmWrapper(wrapperName))
                 return Unwrap(exception.InnerException, depth + 1);
 
             return exception;
+        }
+
+        private static readonly HashSet<string> OrmWrapperNames = new HashSet<string>(StringComparer.Ordinal)
+        {
+            // EF6 / EDMX (System.Data.Entity.Core)
+            "UpdateException",
+            "EntityException",
+            "EntityCommandExecutionException",
+            "EntityCommandCompilationException",
+            "EntitySqlException",
+            "OptimisticConcurrencyException",
+            "ProviderIncompatibleException",
+            // EF6 DbContext
+            "DbUpdateException",
+            "DbUpdateConcurrencyException",
+            "DbEntityValidationException",
+            // EF Core
+            "RetryLimitExceededException",
+            // Dapper / generic ADO wrappers some in-house SP executors use
+            "DataException"
+        };
+
+        private static bool IsOrmWrapper(string typeName)
+        {
+            return OrmWrapperNames.Contains(typeName);
         }
 
         /// <summary>Find the first exception of type T anywhere in the chain (including aggregates).</summary>

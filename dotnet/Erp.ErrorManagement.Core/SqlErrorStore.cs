@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Data;
 using System.Data.SqlClient;
 using System.Threading;
@@ -10,8 +11,25 @@ namespace Erp.ErrorManagement
     public interface IErrorStore
     {
         Task<ErrorCaptureResult> CaptureAsync(ErrorEnvelope envelope, string source, CancellationToken ct = default);
+
         Task<TicketCreateResult> CreateTicketAsync(string errorReference, string userDescription,
             string reportedByUserId, string reportedByUserName, CancellationToken ct = default);
+
+        /// <summary>The caller's own tickets. Scoped in SQL, never by a client parameter.</summary>
+        Task<List<UserTicketSummary>> ListTicketsForUserAsync(string userId, string userName,
+            bool onlyOpen, int pageNumber, int pageSize, CancellationToken ct = default);
+
+        /// <summary>
+        /// One of the caller's own tickets in end-user form, or null if it does
+        /// not exist OR does not belong to them - the two are deliberately
+        /// indistinguishable to the caller.
+        /// </summary>
+        Task<UserTicketDetail> GetTicketForUserAsync(string ticketNumber, string userId,
+            string userName, CancellationToken ct = default);
+
+        /// <summary>The end user replying on their own ticket. False if not theirs.</summary>
+        Task<bool> AddUserCommentAsync(string ticketNumber, string userId, string userName,
+            string commentText, CancellationToken ct = default);
     }
 
     /// <summary>
@@ -175,6 +193,183 @@ namespace Erp.ErrorManagement
             }
         }
 
+        public async Task<List<UserTicketSummary>> ListTicketsForUserAsync(
+            string userId, string userName, bool onlyOpen, int pageNumber, int pageSize,
+            CancellationToken ct = default)
+        {
+            var result = new List<UserTicketSummary>();
+            if (userId == null && userName == null) return result;
+
+            try
+            {
+                using (var connection = new SqlConnection(_options.ConnectionString))
+                using (var command = new SqlCommand("erp_err.usp_Ticket_ListForUser", connection))
+                {
+                    command.CommandType = CommandType.StoredProcedure;
+                    command.CommandTimeout = _options.CommandTimeoutSeconds;
+                    command.Parameters.Add("@UserId", SqlDbType.NVarChar, 128).Value = (object)userId ?? DBNull.Value;
+                    command.Parameters.Add("@UserName", SqlDbType.NVarChar, 200).Value = (object)userName ?? DBNull.Value;
+                    command.Parameters.Add("@OnlyOpen", SqlDbType.Bit).Value = onlyOpen;
+                    command.Parameters.Add("@PageNumber", SqlDbType.Int).Value = pageNumber;
+                    command.Parameters.Add("@PageSize", SqlDbType.Int).Value = pageSize;
+
+                    await connection.OpenAsync(ct).ConfigureAwait(false);
+                    using (var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false))
+                    {
+                        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+                        {
+                            result.Add(new UserTicketSummary
+                            {
+                                TicketNumber = GetNullableString(reader, "TicketNumber"),
+                                Title = GetNullableString(reader, "Title"),
+                                StatusCode = GetNullableString(reader, "StatusCode"),
+                                StatusName = GetNullableString(reader, "StatusName"),
+                                IsOpen = GetBool(reader, "IsOpen"),
+                                SeverityName = GetNullableString(reader, "SeverityName"),
+                                CreatedUtc = GetNullableDate(reader, "CreatedUtc"),
+                                ResolvedUtc = GetNullableDate(reader, "ResolvedUtc"),
+                                ClosedUtc = GetNullableDate(reader, "ClosedUtc"),
+                                ErpModule = GetNullableString(reader, "ErpModule"),
+                                LatestUpdate = GetNullableString(reader, "LatestUpdate"),
+                                AwaitingYourReply = GetBool(reader, "AwaitingYourReply")
+                            });
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // A failure to LIST tickets is a read-path failure. It must not
+                // throw into the ERP either - an empty list and a logged
+                // fallback is the correct degradation for a support panel.
+                SafeFallback("Failed to list tickets for user", ex);
+            }
+
+            return result;
+        }
+
+        public async Task<UserTicketDetail> GetTicketForUserAsync(
+            string ticketNumber, string userId, string userName, CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(ticketNumber)) return null;
+
+            try
+            {
+                using (var connection = new SqlConnection(_options.ConnectionString))
+                using (var command = new SqlCommand("erp_err.usp_Ticket_GetForUser", connection))
+                {
+                    command.CommandType = CommandType.StoredProcedure;
+                    command.CommandTimeout = _options.CommandTimeoutSeconds;
+                    command.Parameters.Add("@TicketNumber", SqlDbType.VarChar, 24).Value = ticketNumber;
+                    command.Parameters.Add("@UserId", SqlDbType.NVarChar, 128).Value = (object)userId ?? DBNull.Value;
+                    command.Parameters.Add("@UserName", SqlDbType.NVarChar, 200).Value = (object)userName ?? DBNull.Value;
+
+                    await connection.OpenAsync(ct).ConfigureAwait(false);
+                    using (var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false))
+                    {
+                        // Result set 1: the header. No row means "not yours, or
+                        // not there" - the procedure does the ownership check so
+                        // that no caller can ever skip it.
+                        if (!await reader.ReadAsync(ct).ConfigureAwait(false)) return null;
+
+                        var detail = new UserTicketDetail
+                        {
+                            TicketNumber = GetNullableString(reader, "TicketNumber"),
+                            Title = GetNullableString(reader, "Title"),
+                            StatusCode = GetNullableString(reader, "StatusCode"),
+                            StatusName = GetNullableString(reader, "StatusName"),
+                            IsOpen = GetBool(reader, "IsOpen"),
+                            SeverityName = GetNullableString(reader, "SeverityName"),
+                            ErpModule = GetNullableString(reader, "ErpModule"),
+                            CreatedUtc = GetNullableDate(reader, "CreatedUtc"),
+                            FirstResponseUtc = GetNullableDate(reader, "FirstResponseUtc"),
+                            ResolvedUtc = GetNullableDate(reader, "ResolvedUtc"),
+                            ClosedUtc = GetNullableDate(reader, "ClosedUtc"),
+                            ErrorReference = GetNullableString(reader, "ErrorReference"),
+                            YourDescription = GetNullableString(reader, "YourDescription"),
+                            ResolutionNotes = GetNullableString(reader, "ResolutionNotes"),
+                            AwaitingYourReply = GetBool(reader, "AwaitingYourReply"),
+                            CanComment = GetBool(reader, "CanComment"),
+                            History = new List<UserTicketHistoryEntry>(),
+                            Comments = new List<UserTicketComment>()
+                        };
+
+                        // Result set 2: customer-visible status history.
+                        if (await reader.NextResultAsync(ct).ConfigureAwait(false))
+                        {
+                            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+                            {
+                                detail.History.Add(new UserTicketHistoryEntry
+                                {
+                                    SequenceNo = (int)(GetNullableLong(reader, "SequenceNo") ?? 0),
+                                    StatusName = GetNullableString(reader, "StatusName"),
+                                    ChangedUtc = GetNullableDate(reader, "ChangedUtc") ?? default(DateTime),
+                                    Comments = GetNullableString(reader, "Comments")
+                                });
+                            }
+                        }
+
+                        // Result set 3: customer-visible comments.
+                        if (await reader.NextResultAsync(ct).ConfigureAwait(false))
+                        {
+                            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+                            {
+                                detail.Comments.Add(new UserTicketComment
+                                {
+                                    AuthorRole = GetNullableString(reader, "AuthorRole"),
+                                    AuthorName = GetNullableString(reader, "AuthorName"),
+                                    CommentText = GetNullableString(reader, "CommentText"),
+                                    CreatedUtc = GetNullableDate(reader, "CreatedUtc") ?? default(DateTime)
+                                });
+                            }
+                        }
+
+                        return detail;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                SafeFallback("Failed to read ticket for user", ex);
+                return null;
+            }
+        }
+
+        public async Task<bool> AddUserCommentAsync(
+            string ticketNumber, string userId, string userName, string commentText,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(ticketNumber) || string.IsNullOrWhiteSpace(commentText))
+                return false;
+
+            try
+            {
+                using (var connection = new SqlConnection(_options.ConnectionString))
+                using (var command = new SqlCommand("erp_err.usp_Ticket_AddUserComment", connection))
+                {
+                    command.CommandType = CommandType.StoredProcedure;
+                    command.CommandTimeout = _options.CommandTimeoutSeconds;
+                    command.Parameters.Add("@TicketNumber", SqlDbType.VarChar, 24).Value = ticketNumber;
+                    command.Parameters.Add("@UserId", SqlDbType.NVarChar, 128).Value = (object)userId ?? DBNull.Value;
+                    command.Parameters.Add("@UserName", SqlDbType.NVarChar, 200).Value = (object)userName ?? DBNull.Value;
+                    // Scrubbed: the user is typing free text into a field that
+                    // support will read and that may be exported. They will
+                    // paste a token in here eventually.
+                    command.Parameters.Add("@CommentText", SqlDbType.NVarChar, -1).Value =
+                        Redactor.ScrubText(commentText, 4000);
+
+                    await connection.OpenAsync(ct).ConfigureAwait(false);
+                    var scalar = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
+                    return scalar != null && scalar != DBNull.Value && Convert.ToInt32(scalar) > 0;
+                }
+            }
+            catch (Exception ex)
+            {
+                SafeFallback("Failed to add user comment", ex);
+                return false;
+            }
+        }
+
         private void SafeFallback(string message, Exception ex)
         {
             try
@@ -199,6 +394,12 @@ namespace Erp.ErrorManagement
         {
             var i = r.GetOrdinal(name);
             return r.IsDBNull(i) ? (long?)null : Convert.ToInt64(r.GetValue(i));
+        }
+
+        private static DateTime? GetNullableDate(IDataRecord r, string name)
+        {
+            var i = r.GetOrdinal(name);
+            return r.IsDBNull(i) ? (DateTime?)null : Convert.ToDateTime(r.GetValue(i));
         }
 
         private static bool GetBool(IDataRecord r, string name)

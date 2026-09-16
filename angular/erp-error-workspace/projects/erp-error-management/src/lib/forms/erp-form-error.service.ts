@@ -3,6 +3,12 @@ import { AbstractControl, FormArray, FormGroup } from '@angular/forms';
 import { ErpErrorReporterService } from '../capture/erp-error-reporter.service';
 import { ErpErrorContextService } from '../core/erp-error-context.service';
 import { ErpValidationErrorItem } from '../models/error-envelope';
+import {
+  erpReportBusinessRule,
+  erpReportHandled,
+  erpObserveAsync,
+} from '../capture/handled-failures';
+import { ErpReportOptions } from '../capture/erp-error-reporter.service';
 
 /**
  * Form, LOV and submit-action capture.
@@ -96,6 +102,74 @@ export class ErpFormErrorService {
   report(error: unknown, options?: { component?: string; actionName?: string }): void {
     void this.reporter.report(error, options);
   }
+
+  /**
+   * Report a failure the calling code has ALREADY handled, without changing
+   * what that code does. One line inside an existing catch block:
+   *
+   *   catch (e) {
+   *     this.erpErrors.reportHandled(e, { actionName: 'recalculateTotals' });
+   *     this.toast('Could not recalculate');   // unchanged
+   *     return previousTotals;                 // unchanged
+   *   }
+   *
+   * Silent by default - the calling code has already told the user something,
+   * and a second dialog on top of its own toast would make the experience
+   * worse rather than better.
+   */
+  reportHandled(error: unknown, options?: ErpReportOptions): void {
+    erpReportHandled(this.reporter, error, options);
+  }
+
+  /**
+   * Report a failure signalled by a RETURN VALUE rather than an exception -
+   * the `{ success: false, errorCode: 'CREDIT_LIMIT' }` shape.
+   */
+  reportFailureResult(
+    result: unknown,
+    options?: ErpReportOptions & { description?: string },
+  ): void {
+    const description = options?.description ?? 'Operation returned a failure result';
+    erpReportHandled(this.reporter, new Error(description), {
+      category: 'submit_action',
+      customData: { result: summariseResult(result) },
+      ...options,
+    });
+  }
+
+  /** Report a business rule the ERP itself refused - severity low, never shown. */
+  reportBusinessRule(
+    ruleName: string,
+    detail?: { code?: string | number | null; message?: string | null; actionName?: string | null },
+  ): void {
+    erpReportBusinessRule(this.reporter, ruleName, detail);
+  }
+
+  /**
+   * Wrap an async call so a rejection is reported and then re-thrown unchanged.
+   * The caller's own error handling still runs exactly as before.
+   */
+  observeAsync<T>(work: () => Promise<T>, options?: ErpReportOptions): Promise<T> {
+    return erpObserveAsync(work, this.reporter, options);
+  }
+}
+
+/**
+ * Keep only the discriminator fields of a result object.
+ *
+ * The result itself may carry the whole saved document - customer names,
+ * amounts, addresses. Persisting that wholesale would defeat the redaction
+ * policy, so only the fields that say WHY it failed are kept.
+ */
+function summariseResult(result: unknown): Record<string, unknown> | null {
+  if (result === null || result === undefined || typeof result !== 'object') return null;
+  const r = result as Record<string, unknown>;
+  const keep = ['success', 'ok', 'isSuccess', 'failed', 'errorCode', 'reasonCode', 'statusCode'];
+  const out: Record<string, unknown> = {};
+  for (const k of keep) {
+    if (r[k] !== undefined) out[k] = r[k];
+  }
+  return Object.keys(out).length ? out : null;
 }
 
 /**

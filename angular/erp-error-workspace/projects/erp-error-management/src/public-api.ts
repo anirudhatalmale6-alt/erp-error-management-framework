@@ -12,6 +12,8 @@ export * from './lib/config/erp-error-config';
 /* ---- capture ---- */
 export * from './lib/capture/erp-global-error-handler';
 export * from './lib/capture/erp-http-error.interceptor';
+export * from './lib/capture/erp-legacy-http-error.interceptor';
+export * from './lib/capture/handled-failures';
 export * from './lib/capture/erp-error-reporter.service';
 
 /* ---- context and classification ---- */

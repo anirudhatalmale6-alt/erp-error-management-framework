@@ -125,6 +125,24 @@
           }
         }
       }
+    },
+    "legacy-ngmodule-check": {
+      "projectType": "application",
+      "root": "projects/legacy-ngmodule-check",
+      "sourceRoot": "projects/legacy-ngmodule-check/src",
+      "prefix": "legacy",
+      "architect": {
+        "build": {
+          "builder": "@angular/build:application",
+          "options": {
+            "outputPath": "dist/legacy-ngmodule-check",
+            "index": "projects/legacy-ngmodule-check/src/index.html",
+            "browser": "projects/legacy-ngmodule-check/src/main.ts",
+            "tsConfig": "projects/legacy-ngmodule-check/tsconfig.app.json",
+            "aot": true
+          }
+        }
+      }
     }
   }
 }

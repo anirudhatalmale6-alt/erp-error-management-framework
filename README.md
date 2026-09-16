@@ -37,8 +37,14 @@ config.UseErpErrorManagement(new ErrorCaptureOptions {
 });
 ```
 
-**SQL Server** — run `db/001` … `db/006` once. Everything lives in its own
-`erp_err` schema; no existing object is read, altered or dropped.
+**SQL Server** — run `db/001` … `db/007` once. Everything lives in its own
+`erp_err` schema; no existing object is read, altered or dropped. (`008` and
+`009` are optional add-ons — see `docs/ARCHITECTURE.md` §5.3.)
+
+**Legacy NgModule apps** — the same `provideErpErrorManagement(...)` goes in
+`AppModule.providers`, plus `ErpLegacyHttpErrorInterceptor` via
+`HTTP_INTERCEPTORS` for apps still on `HttpClientModule`. Both styles are
+supported side by side.
 
 That is the whole integration surface for existing code. Module and screen names
 come from route data (one line per route), not from components.
@@ -55,16 +61,20 @@ db/                     SQL Server schema, procedures, seed data, retention job
   004_programmability.sql       usp_Error_Capture and every other procedure
   005_retention_and_archive.sql archive tables + the nightly batched retention job
   006_security.sql              least-privilege grants (EXECUTE only for the app)
+  007_end_user_ticket_access.sql "My Tickets" - ownership enforced in SQL
+  008_optional_...              OPTIONAL: Extended Events for swallowed errors
+  009_optional_...              OPTIONAL: one-line capture from a CATCH block
 
 angular/erp-error-workspace/
   projects/erp-error-management/   the reusable Angular library
-  projects/demo/                   a demo ERP screen + support console
+  projects/demo/                   demo ERP screen + support console + My Tickets
+  projects/legacy-ngmodule-check/  a real NgModule app, to prove that path builds
 
 dotnet/
   Erp.ErrorManagement.Core/        netstandard2.0 — shared by BOTH stacks
   Erp.ErrorManagement.WebApi2/     net472 — Web API 2 integration
   Erp.ErrorManagement.AspNetCore/  net8.0 — for future modules
-  Erp.ErrorManagement.Tests/       41 verification checks (see below)
+  Erp.ErrorManagement.Tests/       77 verification checks (see below)
 
 demo/api/               runnable demo API (SQLite — a harness, not the product)
 docs/ARCHITECTURE.md    the technical design
@@ -80,7 +90,7 @@ tools/                  cross-language fingerprint verification
 dotnet run --project dotnet/Erp.ErrorManagement.Tests
 ```
 
-41 checks, covering:
+77 checks, covering:
 
 * every T-SQL script parsing against the **real SQL Server 2016 grammar**
   (Microsoft's `ScriptDom` — the parser SSMS and sqlpackage use);
@@ -89,7 +99,11 @@ dotnet run --project dotnet/Erp.ErrorManagement.Tests
   on one row;
 * SHA-256 matching `node:crypto` for every input length 0–200;
 * redaction keeping what it should and dropping what it should;
-* exception classification, including the deadlock → 503 mapping.
+* exception classification, including the deadlock → 503 mapping;
+* unwrapping of every EF6/EDMX and EF Core exception wrapper;
+* the anonymous-capture rate limiter;
+* ownership enforcement on the end-user ticket procedures, asserted against
+  comment-stripped SQL.
 
 Each group includes a **positive control** — a check that deliberately expects
 the negative result — because a suite that cannot fail proves nothing.
@@ -168,8 +182,7 @@ still works.
 
 ## Status
 
-The framework is complete and verified as described above. Three things are
-still open and are listed in `docs/ARCHITECTURE.md` §12 — chiefly that the
-T-SQL has been **parsed** against the real grammar but not **executed**, because
-I have no SQL Server instance. Run `db/001…006` against a development database
-before production.
+The framework is complete and verified as described above. Open items are listed in
+`docs/ARCHITECTURE.md` §12 — chiefly that the T-SQL has been **parsed** against
+the real grammar but not **executed**, because I have no SQL Server instance.
+Run `db/001…007` against a development database before production.

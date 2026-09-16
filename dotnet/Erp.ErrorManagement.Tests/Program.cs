@@ -40,6 +40,9 @@ namespace Erp.ErrorManagement.Tests
             RunFingerprintParityChecks(repoRoot);
             RunRedactionChecks();
             RunClassifierChecks();
+            RunOrmUnwrapChecks();
+            RunThrottleChecks();
+            RunEndUserSqlChecks(Path.Combine(repoRoot, "db"));
 
             Console.WriteLine();
             Console.WriteLine(_failures == 0
@@ -316,6 +319,244 @@ namespace Erp.ErrorManagement.Tests
             var value = block.Substring(statusIdx + 23).TrimStart();
             var digits = new string(value.TakeWhile(char.IsDigit).ToArray());
             return int.TryParse(digits, out var parsed) ? parsed : -1;
+        }
+
+        /* ============================================ ORM unwrapping ==== */
+
+        /// <summary>
+        /// The ERP has three execution paths to the database: EF6 EDMX, a custom
+        /// ADO.NET SP executor, and EF Core. Each wraps a SqlException
+        /// differently, and a wrapper that is not unwrapped means the captured
+        /// exception type is "DbUpdateException" for every database fault in the
+        /// system - which fingerprints them all together and makes the whole
+        /// store useless for the database layer.
+        ///
+        /// Stand-ins are used because Core deliberately does not reference EF6
+        /// or EF Core, so the real types are not available here - and that is
+        /// exactly why the production code matches on the type NAME. Naming the
+        /// stand-ins identically is therefore a faithful test of the mechanism.
+        /// </summary>
+        private class UpdateException : Exception
+        {
+            public UpdateException(string m, Exception inner) : base(m, inner) { }
+        }
+
+        private class DbUpdateException : Exception
+        {
+            public DbUpdateException(string m, Exception inner) : base(m, inner) { }
+        }
+
+        private class EntityCommandExecutionException : Exception
+        {
+            public EntityCommandExecutionException(string m, Exception inner) : base(m, inner) { }
+        }
+
+        private class DbUpdateConcurrencyException : Exception
+        {
+            public DbUpdateConcurrencyException(string m) : base(m) { }
+        }
+
+        private class DbEntityValidationException : Exception
+        {
+            public DbEntityValidationException(string m) : base(m) { }
+        }
+
+        private class NotAWrapperException : Exception
+        {
+            public NotAWrapperException(string m, Exception inner) : base(m, inner) { }
+        }
+
+        private static void RunOrmUnwrapChecks()
+        {
+            Console.WriteLine("\n=== ORM wrapper unwrapping (EF6 EDMX / EF Core / custom SP executor) ===");
+
+            var root = new InvalidOperationException("the real cause");
+
+            Check("EF6 EDMX UpdateException is unwrapped",
+                ExceptionClassifier.Unwrap(new UpdateException("wrapper", root)).Message, "the real cause");
+            Check("EF6 DbUpdateException is unwrapped",
+                ExceptionClassifier.Unwrap(new DbUpdateException("wrapper", root)).Message, "the real cause");
+            Check("EDMX EntityCommandExecutionException is unwrapped",
+                ExceptionClassifier.Unwrap(new EntityCommandExecutionException("wrapper", root)).Message,
+                "the real cause");
+
+            // Nested two deep, which is what an EDMX SaveChanges over a failing
+            // proc actually produces.
+            Check("nested EDMX wrappers unwrap all the way down",
+                ExceptionClassifier.Unwrap(
+                    new DbUpdateException("outer", new UpdateException("inner", root))).Message,
+                "the real cause");
+
+            // POSITIVE CONTROL: an exception that merely HAS an inner exception
+            // must NOT be unwrapped, or the classifier would discard the
+            // application's own exception type on every wrapped business error.
+            Check("positive control: a non-wrapper exception is NOT unwrapped",
+                ExceptionClassifier.Unwrap(new NotAWrapperException("keep me", root)).Message, "keep me");
+
+            // Concurrency and validation survive Unwrap (no inner exception) and
+            // must still classify correctly rather than falling through to
+            // "unhandled .NET exception / critical".
+            var conc = ExceptionClassifier.Classify(new DbUpdateConcurrencyException("row vanished"));
+            Check("DbUpdateConcurrencyException -> concurrency", conc.Category, ErrorCategories.Concurrency);
+            Check("DbUpdateConcurrencyException -> 409", conc.HttpStatusCode, 409);
+
+            var val = ExceptionClassifier.Classify(new DbEntityValidationException("Validation failed"));
+            Check("DbEntityValidationException -> business_rule", val.Category, ErrorCategories.BusinessRule);
+            Check("DbEntityValidationException -> 400, not 500", val.HttpStatusCode, 400);
+            Check("positive control: it is NOT treated as critical",
+                val.Severity == ErrorSeverities.Critical, false);
+        }
+
+        /* ============================================ throttle ========== */
+
+        private static void RunThrottleChecks()
+        {
+            Console.WriteLine("\n=== Anonymous capture throttle ===");
+
+            // burst 5, 60/min. The first 5 go through; the 6th does not.
+            var throttle = new AnonymousCaptureThrottle(envelopesPerMinute: 60, burst: 5);
+
+            Check("first request within burst is granted", throttle.TryAcquire("10.0.0.1", 1), 1);
+            Check("remaining burst is granted", throttle.TryAcquire("10.0.0.1", 4), 4);
+            Check("burst exhausted -> 0 granted", throttle.TryAcquire("10.0.0.1", 1), 0);
+
+            // A different client is unaffected - the limit is per client, not
+            // global, or one noisy IP would silence capture for everyone.
+            Check("a different client IP has its own bucket", throttle.TryAcquire("10.0.0.2", 5), 5);
+
+            // PARTIAL grant: a batch of 10 against 5 remaining tokens must
+            // accept 5, not reject all 10. Rejecting the batch would throw away
+            // evidence the framework had already received.
+            var partial = new AnonymousCaptureThrottle(envelopesPerMinute: 60, burst: 5);
+            Check("a batch larger than the bucket is PARTIALLY granted",
+                partial.TryAcquire("10.0.0.3", 10), 5);
+
+            Check("zero-count request grants nothing", throttle.TryAcquire("10.0.0.1", 0), 0);
+            Check("null/blank client key does not throw", throttle.TryAcquire(null, 1) >= 0, true);
+
+            // POSITIVE CONTROL: the limiter must be capable of granting, or
+            // "0 granted" above would prove nothing.
+            var fresh = new AnonymousCaptureThrottle(envelopesPerMinute: 600, burst: 50);
+            Check("positive control: a fresh generous bucket DOES grant", fresh.TryAcquire("10.0.0.9", 50), 50);
+        }
+
+        /* ==================================== end-user SQL guarantees === */
+
+        /// <summary>
+        /// The end-user ticket procedures carry a security property that cannot
+        /// be checked by parsing alone: every read path must be gated by the
+        /// ownership function. These are structural assertions over the script -
+        /// crude, but they fail loudly if someone later adds an end-user read
+        /// path and forgets the check, which is the mistake worth catching.
+        /// </summary>
+        private static void RunEndUserSqlChecks(string dbFolder)
+        {
+            Console.WriteLine("\n=== End-user ticket access: ownership enforced in SQL ===");
+
+            var path = Path.Combine(dbFolder, "007_end_user_ticket_access.sql");
+            if (!File.Exists(path)) { Fail("007_end_user_ticket_access.sql not found"); return; }
+
+            // Comments are STRIPPED before asserting anything.
+            //
+            // The first version of this check matched raw text and "failed"
+            // because the script contains a comment listing the fields it
+            // deliberately does not select. An assertion that cannot tell a
+            // comment from a statement is worse than no assertion: it fires on
+            // documentation and would stay silent on a real leak buried in a
+            // commented block.
+            var sql = StripSqlComments(File.ReadAllText(path));
+
+            Check("ownership predicate exists", sql.Contains("fn_UserOwnsTicket"), true);
+
+            var ownsFn = Section(sql, "FUNCTION erp_err.fn_UserOwnsTicket");
+            Check("an anonymous caller owns nothing",
+                ownsFn.Contains("@UserId IS NULL AND @UserName IS NULL") && ownsFn.Contains("RETURN 0"),
+                true);
+
+            var getForUser = Section(sql, "PROCEDURE erp_err.usp_Ticket_GetForUser");
+            var addComment = Section(sql, "PROCEDURE erp_err.usp_Ticket_AddUserComment");
+
+            Check("usp_Ticket_GetForUser gates on the ownership check",
+                getForUser.Contains("fn_UserOwnsTicket"), true);
+            Check("usp_Ticket_AddUserComment gates on the ownership check",
+                addComment.Contains("fn_UserOwnsTicket"), true);
+            Check("a closed ticket cannot be commented on",
+                addComment.Contains("IsTerminal"), true);
+
+            // Internal fields must not reach the end user. Asserted as absence
+            // from the executable text, which is now meaningful.
+            foreach (var leak in new[] { "AssignedToUserName", "FingerprintId",
+                                         "SlaFirstResponseBreached", "SlaResolutionBreached",
+                                         "ActiveProcessingMinutes", "TotalElapsedMinutes",
+                                         "ChangedByUserName", "ReopenCount" })
+            {
+                Check($"end-user view does not expose {leak}", getForUser.Contains(leak), false);
+            }
+
+            // POSITIVE CONTROL: the stripper must not have removed everything -
+            // otherwise every "does not expose" check above passes trivially.
+            Check("positive control: the end-user view DOES select its own fields",
+                getForUser.Contains("TicketNumber") && getForUser.Contains("StatusName")
+                    && getForUser.Contains("ResolutionNotes"), true);
+
+            // POSITIVE CONTROL: the stripper must be capable of finding a leak.
+            Check("positive control: the stripper finds a field that IS present",
+                getForUser.Contains("ErrorReference"), true);
+        }
+
+        /// <summary>
+        /// Remove -- line comments and /* block comments */ so an assertion
+        /// about what a script DOES cannot be satisfied or defeated by what the
+        /// script SAYS. Nested block comments are handled because T-SQL allows
+        /// them and this file uses them.
+        /// </summary>
+        private static string StripSqlComments(string sql)
+        {
+            var sb = new System.Text.StringBuilder(sql.Length);
+            var depth = 0;
+            var i = 0;
+
+            while (i < sql.Length)
+            {
+                if (depth == 0 && i + 1 < sql.Length && sql[i] == '-' && sql[i + 1] == '-')
+                {
+                    while (i < sql.Length && sql[i] != '\n') i++;
+                    continue;
+                }
+
+                if (i + 1 < sql.Length && sql[i] == '/' && sql[i + 1] == '*')
+                {
+                    depth++;
+                    i += 2;
+                    continue;
+                }
+
+                if (depth > 0 && i + 1 < sql.Length && sql[i] == '*' && sql[i + 1] == '/')
+                {
+                    depth--;
+                    i += 2;
+                    continue;
+                }
+
+                if (depth == 0) sb.Append(sql[i]);
+                i++;
+            }
+
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// The body of one CREATE OR ALTER object: from its declaration to the
+        /// next one, or to the end of the script.
+        /// </summary>
+        private static string Section(string sql, string declaration)
+        {
+            var start = sql.IndexOf(declaration, StringComparison.Ordinal);
+            if (start < 0) return string.Empty;
+
+            var nextFn = sql.IndexOf("CREATE OR ALTER", start + declaration.Length, StringComparison.Ordinal);
+            var end = nextFn < 0 ? sql.Length : nextFn;
+            return sql.Substring(start, end - start);
         }
 
         private class CreditLimitBusinessException : Exception

@@ -103,6 +103,35 @@ app.MapGet("/api/error-management/tickets", (DemoStore db, string? status, bool?
 app.MapGet("/api/error-management/tickets/{ticketNumber}", (DemoStore db, string ticketNumber)
     => Results.Json(db.GetTicket(ticketNumber), json));
 
+// ---- end-user "My Tickets" -------------------------------------------------
+// The demo stands in for JWT with an X-Demo-User header. In production the
+// identity comes from the validated token and NEVER from a request parameter -
+// that is the whole point, so the demo does not accept one either.
+static string DemoUser(HttpContext ctx)
+    => ctx.Request.Headers["X-Demo-User"].FirstOrDefault() ?? "fatima.saeed";
+
+app.MapGet("/api/error-management/tickets/mine", (HttpContext ctx, DemoStore db, bool onlyOpen = false)
+    => Results.Json(db.ListTicketsForUser(DemoUser(ctx), onlyOpen), json));
+
+app.MapGet("/api/error-management/my-tickets/{ticketNumber}", (HttpContext ctx, DemoStore db, string ticketNumber) =>
+{
+    var detail = db.GetTicketForUser(ticketNumber, DemoUser(ctx));
+    // 404 for "not yours" as well as "not there": a 403 would confirm the
+    // number is real and turn sequential numbers into an enumeration oracle.
+    return detail is null ? Results.NotFound() : Results.Json(detail, json);
+});
+
+app.MapPost("/api/error-management/my-tickets/{ticketNumber}/comments",
+    async (HttpContext ctx, DemoStore db, string ticketNumber) =>
+{
+    var req = await JsonSerializer.DeserializeAsync<CommentRequest>(ctx.Request.Body, json);
+    if (string.IsNullOrWhiteSpace(req?.CommentText))
+        return Results.BadRequest(new { message = "commentText is required" });
+
+    var ok = db.AddUserComment(ticketNumber, DemoUser(ctx), req!.CommentText!);
+    return ok ? Results.Json(new { added = true }, json) : Results.NotFound();
+});
+
 app.MapPost("/api/error-management/tickets/{ticketNumber}/status",
     async (HttpContext ctx, DemoStore db, string ticketNumber) =>
 {
@@ -209,3 +238,4 @@ app.Run();
 
 record TicketRequest(string? ErrorReference, string? UserDescription);
 record StatusChangeRequest(string? ToStatus, string? Comments, string? AssignTo);
+record CommentRequest(string? CommentText);

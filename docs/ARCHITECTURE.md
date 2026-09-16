@@ -1,6 +1,6 @@
 # ERP Error Management Framework — Technical Design
 
-Version 1.0.0 · 15 September 2026
+Version 1.1.0 · 16 September 2026
 
 This document answers the six points the brief explicitly left to the
 freelancer to propose:
@@ -13,6 +13,11 @@ freelancer to propose:
 | 4 | Deduplication / recurring-error approach | §6 |
 | 5 | Data retention and archiving mechanism | §7 |
 | 6 | Deployment approach | §9 |
+
+Answers to the clarification questions of 16 September are in §4.2a (NgModule),
+§4.5 (JWT and public pages), §4.6 (EF6 EDMX / SP executor / EF Core),
+§4.4 (non-throwing failures), §5.3 (swallowed SQL errors) and §13 (ticket
+panels).
 
 Everything described here is implemented in this repository, not just proposed.
 §11 lists what is verified and how, and §12 lists the limitations honestly.
@@ -224,6 +229,134 @@ capturing it.
 key (`header.customerCode` / `required`), plus validator metadata like the
 length limit. That is enough to diagnose and impossible to leak a national ID
 with.
+
+#### Failures that return a value instead of throwing
+
+The harder half of the same question: code that catches internally and returns
+a failure result.
+
+```ts
+try { … } catch (e) { this.toast('Could not save'); return null; }
+const r = await this.api.post(…);  if (!r.success) { return; }
+if (!rows.length) { this.message = 'No cost centres found'; return; }
+```
+
+No global handler can see any of these - nothing propagates. And an HTTP
+interceptor cannot see the middle one either: the transport returned 200, only
+the *operation* failed. There is no way to capture a value-returning failure
+without some signal at the point that decides it is a failure, because that
+decision exists only in the calling code.
+
+What the framework does is make that signal as close to free as possible. Three
+forms, all funnelling into the same reporter as the automatic paths:
+
+| Shape in your code | What you add |
+|---|---|
+| `{ success: false, errorCode: … }` from an HTTP call | `.pipe(erpReportFailedResult({ actionName: 'savePO' }))` |
+| Any stream whose value means failure | `.pipe(erpReportIf(r => !r.ok, r => \`refused: \${r.code}\`))` |
+| A lookup that came back empty | `.pipe(erpReportIfEmpty('COST_CENTRE'))` |
+| An existing `catch` block | `this.erpErrors.reportHandled(e, { actionName: 'recalc' })` |
+| A business rule your code refused | `this.erpErrors.reportBusinessRule('CREDIT_LIMIT', { code })` |
+| An `async` method whose caller handles rejection | `erpObserveAsync(() => this.api.post(…), reporter)` |
+
+None of them alter control flow. The operators are `tap`-based: the value passes
+through untouched and the subscriber behaves exactly as before.
+`reportHandled` does not rethrow. `erpObserveAsync` reports and then rethrows
+the original, unchanged.
+
+**The highest-leverage line available:** if the ERP has a shared API wrapper -
+most in-house codebases do - putting `erpReportFailedResult()` in that one
+wrapper covers every call in the system at once, with no per-screen work at all.
+
+Handled failures default to **silent**. The calling code has already told the
+user something; a framework dialog on top of its own toast would make the
+experience worse, not better.
+
+### 4.5 JWT, and pages that are public
+
+Two requirements that pull in opposite directions: identify logged-in users from
+the JWT, and still capture errors from unauthenticated users.
+
+**Identity.** Read from the principal the ERP's own JWT middleware already
+established. The framework never validates a token itself - a second validator
+would be a second place to get signing keys, clock skew and issuer checks
+wrong, and it could *disagree* with the ERP's, which is worse than not checking.
+`ErrorCaptureOptions.UserProvider` is the authoritative hook; failing that, the
+correlation handler reads the standard claims (`sub`, `NameIdentifier`, `name`,
+`tid`) so the framework is useful with no wiring on day one.
+
+**Public pages.** `POST errors` and `POST errors/beacon` are
+`[AllowAnonymous]`. Identity is attached when a token is present and left empty
+otherwise - an anonymous occurrence is a complete, useful record, just without a
+user. The endpoint table:
+
+| Endpoint | Auth | Why |
+|---|---|---|
+| `POST errors` | anonymous allowed | a public page has no token, and those errors matter |
+| `POST errors/beacon` | anonymous allowed | fires during unload; no chance to negotiate auth |
+| `POST tickets` | authenticated *by default* | a ticket has an owner and notifies people |
+| `GET tickets/mine` | authenticated | scoped to the caller in SQL |
+| `GET tickets/{n}` | authenticated + **ownership** | see §13 |
+
+**The consequence nobody asks about until later:** an anonymous capture endpoint
+means anyone who can reach the ERP can write rows into the error store, at any
+rate. Left open that fills the store with junk, grows `erp_err` until it affects
+the ERP database it shares a disk with, and stays unnoticed for weeks because
+capture failures are deliberately quiet. So anonymous capture is **rate-limited
+per client IP** (token bucket, 60/min burst 20 by default). Authenticated
+capture is deliberately *not* limited: a signed-in user triggering 500 errors is
+a real incident, and throttling it would discard the evidence of the worst thing
+happening that day.
+
+A batch over the limit is **partially** accepted rather than rejected - dropping
+ten envelopes because five tokens remain throws away evidence already received.
+
+Anonymous **ticket** creation is off by default. A ticket carries free text,
+lands in a support queue and notifies people; an open endpoint for that is a
+spam channel aimed at your support team. With it off, an anonymous user still
+sees the dialog and the error reference, which is what they need in order to
+quote it - and the dialog hides its "Report issue" button rather than offering
+one that will be refused (`canCreateTicket` on the capture result).
+
+**One thing I cannot do from inside the package:** `[AllowAnonymous]` only has
+an effect where a global authorize filter is in place. If the ERP protects routes
+some other way - a custom HTTP module, IIS-level rules, an OWIN stage - that
+mechanism must also exempt the two capture routes. It is a one-line allow entry,
+but it does have to be done.
+
+### 4.6 Three different execution paths to the database
+
+The ERP reaches SQL Server three ways, and each wraps a `SqlException`
+differently:
+
+| Path | Wrapper types seen |
+|---|---|
+| EF6 EDMX / `ObjectContext` | `UpdateException`, `EntityException`, `EntityCommandExecutionException`, `EntitySqlException`, `OptimisticConcurrencyException` |
+| Custom ADO.NET SP executor | none - `SqlException` propagates directly |
+| EF Core (Code First) | `DbUpdateException`, `DbUpdateConcurrencyException` |
+
+All are unwrapped, recursively and by **type name** rather than by type. Core is
+`netstandard2.0` and must load inside both a .NET Framework 4.7.2 app using EF6
+and a .NET 8 app using EF Core - referencing either ORM would break the other.
+Matching on the name keeps it decoupled and costs nothing: these names have been
+stable across every EF version that exists.
+
+This matters more than it looks. Without unwrapping, the captured exception type
+is `DbUpdateException` for *every* database fault in the system, they all
+fingerprint together, and the database layer of the error store becomes one
+enormous useless bucket.
+
+`DbUpdateConcurrencyException` and `OptimisticConcurrencyException` classify as
+concurrency → 409, and `DbEntityValidationException` as a business rule → 400,
+rather than falling through to "unhandled exception / critical". Note that EF6's
+validation exception has a famously useless message ("Validation failed for one
+or more entities") - the detail lives in `EntityValidationErrors`, which Core
+cannot read without referencing EF. Surface it through `BeforeSend` if you want
+it.
+
+The **frozen EDMX is not a problem** for this framework: nothing here reads or
+extends your model. The EDMX is a consumer of `SqlConnection`, and the framework
+observes the exception that comes back out.
 
 ---
 
@@ -529,7 +662,7 @@ the `RequiresComment` / `RequiresAssignee` flags on each one.
 
 ## 11. What is verified, and how
 
-`dotnet run --project dotnet/Erp.ErrorManagement.Tests` — 41 checks, all
+`dotnet run --project dotnet/Erp.ErrorManagement.Tests` — 77 checks, all
 passing:
 
 * **All six T-SQL scripts parse** against the real SQL Server 2016 grammar,
@@ -545,6 +678,19 @@ passing:
   Luhn-valid card numbers but not document numbers.
 * **Classification** maps deadlock → 503, optimistic concurrency → 409,
   `*BusinessException` → 400/low, and unwraps nested exception chains.
+* **ORM unwrapping** for every EF6/EDMX and EF Core wrapper, including nested
+  ones — with a positive control proving a *non*-wrapper is left alone.
+* **The anonymous throttle** grants within burst, refuses beyond it, keeps a
+  separate bucket per client, and partially grants an oversized batch.
+* **End-user ticket access**: structural assertions that both end-user read
+  paths are gated by the ownership function, that an anonymous caller owns
+  nothing, and that eight named internal fields are absent from the end-user
+  view. Asserted against comment-stripped SQL — the first version of this check
+  matched raw text and fired on a comment listing the fields it deliberately
+  does *not* select, which is a check worth nothing.
+* **NgModule support** is verified by build, not by assertion:
+  `projects/legacy-ngmodule-check` is a real NgModule app that AOT-compiles
+  against the built library.
 
 Every group includes a **positive control** — a check that deliberately expects
 the negative result — so a suite that cannot fail cannot pass either.
@@ -574,8 +720,77 @@ Stated plainly, because these are the things that matter at review time.
    maps enabled this is the class name; without them it is a stable but opaque
    token. Route-level `screen` is unaffected and is usually the more useful
    field anyway.
-6. **Three questions still open** (asked, not yet answered): how the Angular app
-   identifies the user to the API; whether an existing helpdesk system is the
-   system of record for tickets; and whether the front end uses standalone
-   bootstrapping or `NgModule`. Sensible defaults are implemented for all
-   three and are trivial to change.
+6. **Answered as of 16 September.** JWT with public pages → §4.5. Mixed
+   NgModule + standalone → §4.2a. No external helpdesk, so this framework is
+   the system of record → §13.
+
+7. **Route protection outside Web API's filter pipeline.** If the ERP guards
+   routes with a custom HTTP module or IIS rules rather than a global authorize
+   filter, `[AllowAnonymous]` on the two capture endpoints has no effect and
+   that mechanism must exempt them explicitly. One line, but not something the
+   package can do for you.
+
+8. **The anonymous throttle is per-process and in-memory.** Behind a load
+   balancer the effective limit is per-node × node count. That is the right
+   trade for a guard rail — it must not add a Redis round trip to the path
+   taken when the application is already failing — but it is not a precise
+   meter, and it is not an access control.
+
+9. **`db/008` (Extended Events) is written but I would not install it yet.**
+   §5.3 sets out why, and `db/009` is the cheaper answer to the same problem.
+
+
+---
+
+## 13. Ticket panels
+
+No external helpdesk exists, so this framework is the system of record. Both
+panels are implemented.
+
+### 13.1 Support / admin console
+
+Recurring problems (ranked by occurrences with distinct-user counts), full error
+history across every layer, the ticket queue, the cross-layer correlation trail,
+and per-ticket: the complete audit trail, time in each status, SLA breach flags,
+and every occurrence that deduplicated onto the ticket.
+
+Status changes go through `usp_Ticket_ChangeStatus`, which refuses any
+transition not present in `TicketStatusTransition` and honours its
+`RequiresComment` / `RequiresAssignee` flags. The workflow is data: adding a
+status or rewiring the path is an `INSERT`, not a redeploy.
+
+### 13.2 End-user "My Tickets"
+
+`db/007` plus `GET tickets/mine`, `GET tickets/{n}`, `POST tickets/{n}/comments`.
+
+The user sees their own tickets, current status, the customer-visible history,
+the message thread, and the resolution once there is one. They can **reply**,
+which is what makes `Waiting for Information` a conversation rather than a dead
+end - and a reply automatically moves the ticket back to `In Progress` through
+the normal status-change path, so the audit row and the paused-minutes
+accounting are written exactly as they are for a support-driven change. If the
+configured workflow forbids that transition, the comment still stands and the
+move is skipped: the workflow is the authority, not the convenience.
+
+Three properties worth stating because they are easy to get wrong:
+
+**Ownership is enforced in SQL**, in `usp_Ticket_GetForUser` and
+`usp_Ticket_AddUserComment`, via `fn_UserOwnsTicket`. Not in the API route and
+not in the component - so no future caller can forget it. Verified in the demo:
+the owner gets 200 on their ticket, a different user gets 404 on the same
+number.
+
+**"Not yours" and "does not exist" are indistinguishable.** Returning 403 for
+one and 404 for the other confirms which numbers are real, and ticket numbers
+are sequential. Both return nothing.
+
+**Redaction happens in the procedure, not the template.** The end-user view
+never selects `AssignedToUserName`, `FingerprintId`, the SLA breach flags, the
+elapsed metrics, `ReopenCount` or `ChangedByUserName`. Filtering those in the UI
+would still have sent them to the browser, where anyone can read them in the
+network tab. The test suite asserts their absence from the SQL.
+
+The resolution note is withheld until the ticket is actually resolved - a
+half-written note read as a promise is worse than no note - and a closed ticket
+is read-only, because a conversation nobody is watching is worse than a closed
+door.

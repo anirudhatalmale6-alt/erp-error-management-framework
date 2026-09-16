@@ -13,38 +13,96 @@ namespace Erp.ErrorManagement.WebApi2
     /// <summary>
     /// The endpoints the Angular library talks to.
     ///
-    /// Drop this file into the existing Web API 2 project (or reference this
-    /// assembly and let attribute routing find it) and the browser side has
-    /// somewhere to post to.  No other controller changes.
+    /// Authentication model, which is worth stating precisely because the ERP
+    /// has both protected and public pages:
+    ///
+    ///   POST errors          [AllowAnonymous] - capture must work on a public
+    ///                        page, where the browser has no token. Identity is
+    ///                        read from the JWT WHEN PRESENT and left empty
+    ///                        otherwise. Rate-limited per IP when anonymous.
+    ///   POST errors/beacon   [AllowAnonymous] - fired during page unload; there
+    ///                        is no opportunity to negotiate auth.
+    ///   POST tickets         Authenticated by default. A ticket has an owner,
+    ///                        lands in a support queue and notifies people;
+    ///                        an open endpoint for that is a spam channel.
+    ///                        Opt in with AllowAnonymousTicketCreation.
+    ///   GET  tickets/mine    Authenticated, always. Scoped to the caller.
+    ///   GET  tickets/{n}     Authenticated, and ownership is enforced.
+    ///
+    /// [AllowAnonymous] only has an effect where a global authorize filter is in
+    /// place. If the ERP protects routes with Web API's global filter or with an
+    /// OWIN stage, these attributes are what exempt capture from it. If it
+    /// protects routes some other way (a custom module, IIS-level rules), that
+    /// mechanism has to exempt these two routes as well - see docs/ARCHITECTURE
+    /// §4.5. That is a one-line allow entry, but it does have to be done, and it
+    /// is the one part of the integration I cannot do from inside the package.
     /// </summary>
     [RoutePrefix("api/error-management")]
     public class ErrorManagementController : ApiController
     {
         private readonly ErrorCaptureService _capture;
         private readonly IErrorStore _store;
+        private readonly ErrorCaptureOptions _options;
+        private readonly AnonymousCaptureThrottle _throttle;
 
-        public ErrorManagementController(ErrorCaptureService capture, IErrorStore store)
+        public ErrorManagementController(
+            ErrorCaptureService capture,
+            IErrorStore store,
+            AnonymousCaptureThrottle throttle)
         {
             _capture = capture ?? throw new ArgumentNullException(nameof(capture));
             _store = store ?? throw new ArgumentNullException(nameof(store));
+            _throttle = throttle ?? throw new ArgumentNullException(nameof(throttle));
+            _options = capture.Options;
         }
+
+        /* ==================================================== capture ==== */
 
         /// <summary>
         /// Batched capture from the browser.  Returns one result per envelope,
         /// IN THE SAME ORDER, because the client matches them positionally.
         /// </summary>
         [HttpPost, Route("errors")]
+        [AllowAnonymous]
         public async Task<IHttpActionResult> CaptureErrors(
             [FromBody] List<ErrorEnvelope> envelopes, CancellationToken cancellationToken)
         {
             if (envelopes == null || envelopes.Count == 0) return Ok(new List<ErrorCaptureResult>());
 
+            var isAuthenticated = IsAuthenticated();
+
+            if (!isAuthenticated && !_options.AllowAnonymousCapture)
+            {
+                // Refuse, but do not 401: a 401 would send the browser's auth
+                // interceptor into a token refresh or a redirect because an
+                // ERROR REPORT was rejected. 204 says "heard you, discarded it"
+                // and keeps the failure inside the framework.
+                return StatusCode(HttpStatusCode.NoContent);
+            }
+
             // Bound the batch: this endpoint is reachable by anything that can
-            // reach the ERP, and an unbounded list here is a free denial of
-            // service against the error store.
+            // reach the ERP, and an unbounded list is a free denial of service
+            // against the error store.
             if (envelopes.Count > 50) envelopes = envelopes.Take(50).ToList();
 
+            if (!isAuthenticated)
+            {
+                var allowed = _throttle.TryAcquire(ThrottleKey(), envelopes.Count);
+                if (allowed <= 0)
+                {
+                    // Every result slot still has to be filled or the client
+                    // would match reference numbers to the wrong envelopes.
+                    return Ok(envelopes.Select(_ => new ErrorCaptureResult
+                    {
+                        ShouldNotifyUser = true,
+                        CanCreateTicket = false
+                    }).ToList());
+                }
+                if (allowed < envelopes.Count) envelopes = envelopes.Take(allowed).ToList();
+            }
+
             var clientIp = GetClientIp();
+            var canCreateTicket = isAuthenticated || _options.AllowAnonymousTicketCreation;
             var results = new List<ErrorCaptureResult>(envelopes.Count);
 
             foreach (var envelope in envelopes)
@@ -55,7 +113,12 @@ namespace Erp.ErrorManagement.WebApi2
 
                 // A null result still occupies its slot, or every subsequent
                 // envelope in the batch would be matched to the wrong reference.
-                results.Add(result ?? new ErrorCaptureResult { ShouldNotifyUser = true });
+                result = result ?? new ErrorCaptureResult { ShouldNotifyUser = true };
+
+                // Tells the dialog whether to offer "Report issue" at all.
+                // Offering a button that will 401 is worse than not offering it.
+                result.CanCreateTicket = canCreateTicket && result.ErrorReference != null;
+                results.Add(result);
             }
 
             return Ok(results);
@@ -71,10 +134,18 @@ namespace Erp.ErrorManagement.WebApi2
         public async Task<IHttpActionResult> CaptureBeacon(
             [FromBody] List<ErrorEnvelope> envelopes, CancellationToken cancellationToken)
         {
-            if (envelopes != null)
+            if (envelopes != null && (IsAuthenticated() || _options.AllowAnonymousCapture))
             {
+                var batch = envelopes.Take(50).ToList();
+
+                if (!IsAuthenticated())
+                {
+                    var allowed = _throttle.TryAcquire(ThrottleKey(), batch.Count);
+                    batch = batch.Take(Math.Max(0, allowed)).ToList();
+                }
+
                 var clientIp = GetClientIp();
-                foreach (var envelope in envelopes.Take(50))
+                foreach (var envelope in batch)
                 {
                     await _capture.CaptureClientEnvelopeAsync(envelope, clientIp, cancellationToken)
                         .ConfigureAwait(false);
@@ -86,6 +157,8 @@ namespace Erp.ErrorManagement.WebApi2
             return StatusCode(HttpStatusCode.NoContent);
         }
 
+        /* ==================================================== tickets ==== */
+
         public class CreateTicketRequest
         {
             public string ErrorReference { get; set; }
@@ -93,11 +166,34 @@ namespace Erp.ErrorManagement.WebApi2
         }
 
         [HttpPost, Route("tickets")]
+        [AllowAnonymous]   // the check below is explicit, so the policy is visible here
         public async Task<IHttpActionResult> CreateTicket(
             [FromBody] CreateTicketRequest request, CancellationToken cancellationToken)
         {
             if (request == null || string.IsNullOrWhiteSpace(request.ErrorReference))
                 return BadRequest("errorReference is required.");
+
+            if (!IsAuthenticated() && !_options.AllowAnonymousTicketCreation)
+            {
+                return Content(HttpStatusCode.Forbidden, new
+                {
+                    message = "Your issue has been recorded. Please quote the reference below " +
+                              "when you contact support.",
+                    errorReference = request.ErrorReference,
+                    canCreateTicket = false
+                });
+            }
+
+            if (!IsAuthenticated())
+            {
+                // Anonymous ticket creation is opt-in, and when it is on it is
+                // still throttled - it is the more expensive of the two writes.
+                if (_throttle.TryAcquire(ThrottleKey(), 1) <= 0)
+                    return Content((HttpStatusCode)429, new
+                    {
+                        message = "Too many reports from this location. Your error was still recorded."
+                    });
+            }
 
             var ctx = ErrorContext.Values;
 
@@ -115,17 +211,138 @@ namespace Erp.ErrorManagement.WebApi2
             return Ok(result);
         }
 
+        /// <summary>
+        /// The end user's own tickets - the "My Tickets" panel.
+        ///
+        /// Scoped server-side to the caller's identity. The client cannot ask
+        /// for someone else's list, because it does not supply a user at all:
+        /// the identity comes from the JWT, never from a parameter.
+        /// </summary>
+        [HttpGet, Route("tickets/mine")]
+        public async Task<IHttpActionResult> GetMyTickets(
+            bool onlyOpen = false, int pageNumber = 1, int pageSize = 25,
+            CancellationToken cancellationToken = default(CancellationToken))
+        {
+            var ctx = ErrorContext.Values;
+            if (!IsAuthenticated() || (ctx?.UserId == null && ctx?.UserName == null))
+                return Ok(new { items = new object[0], total = 0 });
+
+            var items = await _store.ListTicketsForUserAsync(
+                ctx.UserId, ctx.UserName, onlyOpen, pageNumber, pageSize, cancellationToken)
+                .ConfigureAwait(false);
+
+            return Ok(new { items, total = items.Count });
+        }
+
+        /// <summary>
+        /// One of the caller's own tickets, in end-user form: customer-visible
+        /// history and comments only, no diagnostics, no assignee, no
+        /// fingerprint.
+        ///
+        /// The filtering happens in the stored procedure
+        /// (usp_Ticket_GetDetail @ForEndUser = 1), not here and not in the
+        /// template. Filtering in the UI would still have sent the data to the
+        /// browser, where anyone can read it in the network tab.
+        /// </summary>
+        [HttpGet, Route("tickets/{ticketNumber}")]
+        public async Task<IHttpActionResult> GetMyTicket(
+            string ticketNumber, CancellationToken cancellationToken)
+        {
+            var ctx = ErrorContext.Values;
+            if (!IsAuthenticated()) return StatusCode(HttpStatusCode.Unauthorized);
+
+            var detail = await _store.GetTicketForUserAsync(
+                ticketNumber, ctx?.UserId, ctx?.UserName, cancellationToken).ConfigureAwait(false);
+
+            // 404, not 403, when the ticket exists but belongs to someone else.
+            // A 403 confirms the number is real, which turns sequential ticket
+            // numbers into an enumeration oracle.
+            if (detail == null) return NotFound();
+
+            return Ok(detail);
+        }
+
+        public class AddCommentRequest
+        {
+            public string CommentText { get; set; }
+        }
+
+        /// <summary>
+        /// The end user replying on their own ticket.
+        ///
+        /// This is what makes "Waiting for Information" a conversation rather
+        /// than a dead end: support asks a question, the user answers here, and
+        /// the answer is on the ticket rather than in somebody's inbox.
+        /// </summary>
+        [HttpPost, Route("tickets/{ticketNumber}/comments")]
+        public async Task<IHttpActionResult> AddMyComment(
+            string ticketNumber, [FromBody] AddCommentRequest request, CancellationToken cancellationToken)
+        {
+            if (!IsAuthenticated()) return StatusCode(HttpStatusCode.Unauthorized);
+
+            if (request == null || string.IsNullOrWhiteSpace(request.CommentText))
+                return BadRequest("commentText is required.");
+
+            var ctx = ErrorContext.Values;
+
+            var ok = await _store.AddUserCommentAsync(
+                ticketNumber, ctx?.UserId, ctx?.UserName,
+                request.CommentText, cancellationToken).ConfigureAwait(false);
+
+            if (!ok) return NotFound();
+            return Ok(new { added = true });
+        }
+
+        /* =================================================== plumbing ==== */
+
+        /// <summary>
+        /// Is this request authenticated?
+        ///
+        /// Reads the principal the ERP's own JWT middleware established -
+        /// the framework never validates a token itself. Writing a second token
+        /// validator would mean a second place to get signing keys, clock skew
+        /// and issuer checks wrong, and it could disagree with the ERP's, which
+        /// is worse than not checking at all.
+        /// </summary>
+        private bool IsAuthenticated()
+        {
+            try
+            {
+                var principal = User ?? HttpContext.Current?.User ?? Thread.CurrentPrincipal;
+                return principal?.Identity != null && principal.Identity.IsAuthenticated;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private string GetClientIp()
         {
             try
             {
-                var context = HttpContext.Current;
-                return context?.Request?.UserHostAddress;
+                return HttpContext.Current?.Request?.UserHostAddress;
             }
             catch
             {
                 return null;
             }
+        }
+
+        /// <summary>
+        /// Throttle key for an anonymous caller.
+        ///
+        /// The DIRECT remote address, not X-Forwarded-For. A forwarded header is
+        /// attacker-controlled, so keying on it lets one client mint a fresh
+        /// bucket per request and bypass the limit entirely - and fill the
+        /// bucket dictionary while doing it. If the ERP genuinely sits behind a
+        /// reverse proxy, configure the proxy's real-IP module so
+        /// UserHostAddress is already correct, rather than trusting the header
+        /// here.
+        /// </summary>
+        private string ThrottleKey()
+        {
+            return GetClientIp() ?? "(unknown)";
         }
     }
 }

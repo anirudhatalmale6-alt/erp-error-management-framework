@@ -86,7 +86,8 @@ public class DemoStore
               SlaFirstResponseBreached INTEGER NOT NULL DEFAULT 0,
               SlaResolutionBreached INTEGER NOT NULL DEFAULT 0,
               ReopenCount INTEGER NOT NULL DEFAULT 0,
-              LinkedOccurrenceCount INTEGER NOT NULL DEFAULT 1
+              LinkedOccurrenceCount INTEGER NOT NULL DEFAULT 1,
+              ResolutionCode TEXT, ResolutionNotes TEXT
             );
 
             CREATE TABLE IF NOT EXISTS TicketHistory (
@@ -95,6 +96,16 @@ public class DemoStore
               FromStatus TEXT, ToStatus TEXT NOT NULL,
               ChangedByUserName TEXT, ChangedUtc TEXT NOT NULL,
               MinutesInFromStatus INTEGER, Comments TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS TicketComment (
+              CommentId INTEGER PRIMARY KEY AUTOINCREMENT,
+              TicketId INTEGER NOT NULL,
+              AuthorUserId TEXT, AuthorUserName TEXT,
+              AuthorRole TEXT NOT NULL DEFAULT 'support',
+              CommentText TEXT NOT NULL,
+              IsCustomerVisible INTEGER NOT NULL DEFAULT 1,
+              CreatedUtc TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS TicketLink (
@@ -502,7 +513,7 @@ public class DemoStore
             var totalElapsed = (int)Math.Round((now - createdUtc).TotalMinutes);
             var activeMinutes = (int)(totalElapsed - pausedMinutes);
 
-            var firstResponseUtc = t["FirstResponseUtc"] as string;
+            var firstResponseUtc = Val(t, "FirstResponseUtc") as string;
             // First response = the first time someone other than the reporter acts.
             if (firstResponseUtc is null &&
                 !string.Equals(changedBy, t["ReportedByUserName"] as string, StringComparison.OrdinalIgnoreCase))
@@ -538,14 +549,20 @@ public class DemoStore
                   FirstResponseUtc=$fr, AssignedUtc=$assigned, ResolvedUtc=$resolved, ClosedUtc=$closed,
                   AssignedToUserName=COALESCE($assignTo, AssignedToUserName),
                   TotalElapsedMinutes=$total, ActiveProcessingMinutes=$active,
-                  SlaFirstResponseBreached=$frb, SlaResolutionBreached=$resb, ReopenCount=$reopen
+                  SlaFirstResponseBreached=$frb, SlaResolutionBreached=$resb, ReopenCount=$reopen,
+                  ResolutionNotes=COALESCE($resolutionNotes, ResolutionNotes)
                 WHERE TicketId=$t
                 """,
                 ("$to", toStatus), ("$now", Iso(now)), ("$fr", firstResponseUtc),
                 ("$assigned", assignedUtc), ("$resolved", resolvedUtc), ("$closed", closedUtc),
                 ("$assignTo", assignTo), ("$total", totalElapsed), ("$active", activeMinutes),
                 ("$frb", frBreached ? 1 : 0), ("$resb", resBreached ? 1 : 0),
-                ("$reopen", reopenCount), ("$t", ticketId));
+                ("$reopen", reopenCount),
+                // Only on the transition INTO resolved: a note attached to any
+                // other transition is working commentary, not a resolution.
+                ("$resolutionNotes", toStatus.Equals("resolved", StringComparison.OrdinalIgnoreCase)
+                    ? comments : null),
+                ("$t", ticketId));
 
             var fingerprintId = Convert.ToInt64(t["FingerprintId"]);
             if (to.IsTerminal)
@@ -707,16 +724,16 @@ public class DemoStore
         return new
         {
             ticketNumber = t["TicketNumber"], title = t["Title"],
-            userDescription = t["UserDescription"],
+            userDescription = Val(t, "UserDescription"),
             statusCode = t["Status"], statusName = st.Display, isOpen = st.IsOpen,
             severityCode = t["Severity"], queue = t["Queue"], createdVia = t["CreatedVia"],
             reportedBy = t["ReportedByUserName"],
             assignedTo = t["AssignedToUserName"],
-            erpModule = t["ErpModule"], environment = t["Environment"],
+            erpModule = Val(t, "ErpModule"), environment = t["Environment"],
             createdUtc = t["CreatedUtc"],
-            firstResponseUtc = t["FirstResponseUtc"],
-            resolvedUtc = t["ResolvedUtc"],
-            closedUtc = t["ClosedUtc"],
+            firstResponseUtc = Val(t, "FirstResponseUtc"),
+            resolvedUtc = Val(t, "ResolvedUtc"),
+            closedUtc = Val(t, "ClosedUtc"),
             // Live for an open ticket - the stored value was last written at
             // the previous status change, so a freshly created ticket would
             // report null and the console would show an empty cell.
@@ -725,7 +742,7 @@ public class DemoStore
             slaFirstResponseBreached = Convert.ToInt64(t["SlaFirstResponseBreached"]) == 1,
             slaResolutionBreached = Convert.ToInt64(t["SlaResolutionBreached"]) == 1,
             linkedOccurrenceCount = t["LinkedOccurrenceCount"],
-            primaryErrorReference = t["ErrorReference"],
+            primaryErrorReference = Val(t, "ErrorReference"),
             history, timeInStatus, linkedOccurrences = linked,
             allowedTransitions = Transitions.Keys
                 .Where(k => k.Item1 == ((string)t["Status"]!).ToLowerInvariant())
@@ -900,6 +917,190 @@ public class DemoStore
             .ToList();
 
         return new { correlationId, items, total = items.Count };
+    }
+
+    /* ==================================================================== */
+    /*  End-user ticket access - mirrors db/007                             */
+    /*                                                                      */
+    /*  Ownership is enforced HERE, in the store, exactly as the T-SQL       */
+    /*  enforces it in the procedure - never in the API route and never in   */
+    /*  the template. A "not yours" ticket is indistinguishable from a       */
+    /*  missing one, so sequential ticket numbers cannot be enumerated.      */
+    /* ==================================================================== */
+
+    public object ListTicketsForUser(string userName, bool onlyOpen)
+    {
+        if (string.IsNullOrWhiteSpace(userName)) return new { items = Array.Empty<object>(), total = 0 };
+
+        using var c = Open();
+        var rows = Query(c, null, """
+            SELECT * FROM Ticket
+            WHERE ReportedByUserName = $u
+            ORDER BY CreatedUtc DESC
+            """, ("$u", userName));
+
+        var items = rows
+            .Where(r => !onlyOpen || Statuses[(string)r["Status"]!].IsOpen)
+            .Select(r =>
+            {
+                var st = Statuses[(string)r["Status"]!];
+                return new
+                {
+                    ticketNumber = r["TicketNumber"],
+                    title = r["Title"],
+                    statusCode = r["Status"],
+                    statusName = st.Display,
+                    isOpen = st.IsOpen,
+                    severityName = r["Severity"],
+                    createdUtc = r["CreatedUtc"],
+                    resolvedUtc = r["ResolvedUtc"],
+                    closedUtc = r["ClosedUtc"],
+                    erpModule = r["ErpModule"],
+                    latestUpdate = LatestVisibleUpdate(c, Convert.ToInt64(r["TicketId"])),
+                    awaitingYourReply = st.IsPaused
+                };
+            })
+            // Anything waiting on the user first: it is the only row they can
+            // act on.
+            .OrderByDescending(x => x.awaitingYourReply)
+            .ToList();
+
+        return new { items, total = items.Count };
+    }
+
+    private string? LatestVisibleUpdate(SqliteConnection c, long ticketId)
+    {
+        var rows = Query(c, null, """
+            SELECT Note, At FROM (
+              SELECT Comments AS Note, ChangedUtc AS At FROM TicketHistory
+                WHERE TicketId = $t AND Comments IS NOT NULL
+              UNION ALL
+              SELECT CommentText, CreatedUtc FROM TicketComment
+                WHERE TicketId = $t AND AuthorRole <> 'reporter'
+            ) ORDER BY At DESC LIMIT 1
+            """, ("$t", ticketId));
+        return rows.Count == 0 ? null : rows[0]["Note"] as string;
+    }
+
+    public object? GetTicketForUser(string ticketNumber, string userName)
+    {
+        if (string.IsNullOrWhiteSpace(userName)) return null;
+
+        using var c = Open();
+        var t = QueryOne(c, null, """
+            SELECT t.*, o.ErrorReference FROM Ticket t
+            LEFT JOIN Occurrence o ON o.OccurrenceId = t.OccurrenceId
+            WHERE t.TicketNumber = $n
+            """, ("$n", ticketNumber));
+
+        // Not found and not yours return the same thing.
+        if (t is null) return null;
+        if (!string.Equals(t["ReportedByUserName"] as string, userName, StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var ticketId = Convert.ToInt64(t["TicketId"]);
+        var st = Statuses[(string)t["Status"]!];
+
+        var history = Query(c, null,
+            "SELECT * FROM TicketHistory WHERE TicketId = $t ORDER BY SequenceNo", ("$t", ticketId))
+            .Select(h => new
+            {
+                sequenceNo = h["SequenceNo"],
+                statusName = Statuses[(string)h["ToStatus"]!].Display,
+                changedUtc = h["ChangedUtc"],
+                comments = h["Comments"]
+                // ChangedByUserName deliberately omitted: which engineer
+                // touched the ticket is internal.
+            }).ToList();
+
+        var comments = Query(c, null,
+            "SELECT * FROM TicketComment WHERE TicketId = $t ORDER BY CreatedUtc", ("$t", ticketId))
+            .Select(cm => new
+            {
+                authorRole = cm["AuthorRole"],
+                // Support is shown as a team, not as a named individual.
+                authorName = (cm["AuthorRole"] as string) == "reporter"
+                    ? cm["AuthorUserName"] : "Support",
+                commentText = cm["CommentText"],
+                createdUtc = cm["CreatedUtc"]
+            }).ToList();
+
+        return new
+        {
+            ticketNumber = t["TicketNumber"],
+            title = t["Title"],
+            statusCode = t["Status"],
+            statusName = st.Display,
+            isOpen = st.IsOpen,
+            severityName = t["Severity"],
+            erpModule = Val(t, "ErpModule"),
+            createdUtc = t["CreatedUtc"],
+            firstResponseUtc = Val(t, "FirstResponseUtc"),
+            resolvedUtc = Val(t, "ResolvedUtc"),
+            closedUtc = Val(t, "ClosedUtc"),
+            errorReference = Val(t, "ErrorReference"),
+            yourDescription = Val(t, "UserDescription"),
+            // Withheld while still open: a half-written resolution note read as
+            // a promise is worse than no note.
+            resolutionNotes = (st.IsTerminal || Val(t, "ResolvedUtc") is not null)
+                ? Val(t, "ResolutionNotes") : null,
+            awaitingYourReply = st.IsPaused,
+            canComment = !st.IsTerminal,
+            history,
+            comments
+        };
+    }
+
+    public bool AddUserComment(string ticketNumber, string userName, string commentText)
+    {
+        if (string.IsNullOrWhiteSpace(userName) || string.IsNullOrWhiteSpace(commentText)) return false;
+
+        lock (_writeLock)
+        {
+            using var c = Open();
+
+            var t = QueryOne(c, null,
+                "SELECT TicketId, Status, ReportedByUserName FROM Ticket WHERE TicketNumber = $n",
+                ("$n", ticketNumber));
+            if (t is null) return false;
+            if (!string.Equals(t["ReportedByUserName"] as string, userName, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            var status = (string)t["Status"]!;
+            if (Statuses[status].IsTerminal) return false;
+
+            var ticketId = Convert.ToInt64(t["TicketId"]);
+
+            Exec(c, null, """
+                INSERT INTO TicketComment (TicketId, AuthorUserId, AuthorUserName, AuthorRole,
+                                           CommentText, IsCustomerVisible, CreatedUtc)
+                VALUES ($t, NULL, $u, 'reporter', $c, 1, $at)
+                """,
+                ("$t", ticketId), ("$u", userName),
+                // Scrubbed: the user is typing into a field support will read
+                // and that may be exported. They will paste a token eventually.
+                ("$c", Redactor.ScrubText(commentText, 4000)), ("$at", Iso(DateTime.UtcNow)));
+
+            // A reply un-blocks support. Routed through the normal status
+            // change so the transition is validated and the audit row and
+            // paused-minutes accounting are written exactly as usual.
+            if (Statuses[status].IsPaused
+                && Transitions.ContainsKey((status.ToLowerInvariant(), "in_progress")))
+            {
+                try
+                {
+                    ChangeStatus(ticketNumber, "in_progress", userName,
+                        "Reporter replied with the requested information.", null);
+                }
+                catch (InvalidOperationException)
+                {
+                    // The workflow is the authority. If it forbids the move, the
+                    // comment still stands - it is not worth losing the reply.
+                }
+            }
+
+            return true;
+        }
     }
 
     /* ==================================================================== */
@@ -1111,4 +1312,15 @@ public class DemoStore
     private static Dictionary<string, object?>? QueryOne(SqliteConnection c, SqliteTransaction? tx,
         string sql, params (string Name, object? Value)[] parameters)
         => Query(c, tx, sql, parameters).FirstOrDefault();
+
+    /// <summary>
+    /// Column read that returns null for a column the result set does not
+    /// contain, rather than throwing KeyNotFoundException.
+    ///
+    /// Added after a real failure: this mirror read ResolutionNotes, which the
+    /// demo schema did not have, and the KeyNotFoundException surfaced to the
+    /// browser as a 500 on the end-user ticket panel.
+    /// </summary>
+    private static object? Val(Dictionary<string, object?> row, string column)
+        => row.TryGetValue(column, out var v) ? v : null;
 }

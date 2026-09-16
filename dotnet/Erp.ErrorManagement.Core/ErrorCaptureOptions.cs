@@ -76,8 +76,44 @@ namespace Erp.ErrorManagement
         /// <summary>
         /// Resolve the signed-in user.  Left to the host because every ERP
         /// stores identity differently.  Exceptions from this are swallowed.
+        ///
+        /// Return null for an unauthenticated request - that is a normal,
+        /// expected outcome on a public page, not a failure.  The occurrence is
+        /// still captured, with the user fields empty.
         /// </summary>
         public Func<UserContext> UserProvider { get; set; }
+
+        /// <summary>
+        /// Accept capture from unauthenticated callers.
+        ///
+        /// Required when any ERP page is public: an error on a public login or
+        /// self-service page is exactly the kind you most need to see, and the
+        /// browser has no token to send.  Rate-limited per client IP when
+        /// enabled - see AnonymousCaptureThrottle for why that is not optional.
+        /// </summary>
+        public bool AllowAnonymousCapture { get; set; } = true;
+
+        /// <summary>Sustained anonymous envelopes accepted per client IP per minute.</summary>
+        public int AnonymousCaptureRatePerMinute { get; set; } = 60;
+
+        /// <summary>Anonymous burst size per client IP.</summary>
+        public int AnonymousCaptureBurst { get; set; } = 20;
+
+        /// <summary>
+        /// Allow an unauthenticated user to raise a TICKET, not just have the
+        /// error captured.
+        ///
+        /// OFF by default, and that default is a real decision rather than
+        /// caution: a ticket carries free text, lands in a support queue and
+        /// notifies people.  An open ticket-creation endpoint on a public page
+        /// is a spam channel aimed at your support team.
+        ///
+        /// With this off, an anonymous user still sees the dialog and the error
+        /// reference - which is enough for them to quote it to support, and the
+        /// occurrence is already in the store waiting.  The dialog hides its
+        /// "Report issue" button when the API says tickets are unavailable.
+        /// </summary>
+        public bool AllowAnonymousTicketCreation { get; set; } = false;
 
         /// <summary>Last chance to change or drop an envelope.  Return null to discard.</summary>
         public Func<ErrorEnvelope, ErrorEnvelope> BeforeSend { get; set; }
