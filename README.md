@@ -116,27 +116,32 @@ node tools/verify-fingerprint.mjs     # the TypeScript half of the same corpus
 
 ## Run the demo
 
-Two terminals:
+One command. The only prerequisite is the **.NET 8 SDK** — no Node, no
+`npm install`, no second terminal, no database server.
 
 ```bash
-# 1. the demo API (SQLite, no database server required)
 cd demo/api && dotnet run
-curl -X POST http://localhost:5146/api/error-management/demo/seed
-
-# 2. the Angular demo
-cd angular/erp-error-workspace
-npm install
-npx ng build erp-error-management
-npx ng serve demo          # http://localhost:4200
+# then open http://localhost:5146
+curl -X POST http://localhost:5146/api/error-management/demo/seed   # sample history
 ```
 
-The **Purchase Order** screen has a button for each error class in the brief —
+The pre-built Angular bundle is committed under `demo/api/wwwroot` and served by
+the same process that hosts the API. **[`demo/README.md`](demo/README.md) is a
+guided tour** — what to click, in what order, and what each thing proves.
+
+The **Purchase Order** screen has a button for each error class in the brief:
 Angular runtime, unhandled promise, Web API exception, SQL deadlock, stored
 procedure error, timeout, connection failure, form validation, LOV failure. None
 of the handlers behind those buttons catch anything.
 
+Press **SQL Server deadlock three times** — the message carries a different
+process ID each time, so three different strings arrive and collapse to one
+problem. That is the deduplication earning its place.
+
 The **Support console** shows recurring problems, full error history, the ticket
 queue with its audit trail and metrics, and the cross-layer correlation trail.
+**My issues** is the end user's own panel, where they can track and reply to
+their own tickets.
 
 `demo/api` is a **demonstration harness**. It re-implements the stored-procedure
 logic over SQLite so the framework can be seen working on a laptop. Production

@@ -48,6 +48,29 @@ builder.Services.AddSingleton(store);
 var app = builder.Build();
 app.UseCors();
 
+// ---------------------------------------------------------------------------
+//  Serve the built Angular demo from this same process.
+//
+//  The demo used to need two terminals and the Node toolchain. It now needs
+//  neither: the pre-built Angular bundle is committed under demo/wwwroot and
+//  served from here, so the whole thing is `dotnet run` and one URL. Anyone
+//  with the .NET 8 SDK can see it, which is the point of a demo.
+//
+//  This is demo-harness plumbing only. In the real ERP, IIS serves your
+//  Angular app exactly as it does today and the framework adds nothing to that
+//  path - see dotnet/Erp.ErrorManagement.WebApi2.
+// ---------------------------------------------------------------------------
+// wwwroot under the project, which is where ASP.NET expects it - the built
+// Angular bundle is committed there so `dotnet run` serves it directly.
+var webRoot = Path.Combine(builder.Environment.ContentRootPath, "wwwroot");
+var hasUi = File.Exists(Path.Combine(webRoot, "index.html"));
+
+if (hasUi)
+{
+    app.UseDefaultFiles();
+    app.UseStaticFiles();
+}
+
 var json = new JsonSerializerOptions
 {
     PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -233,6 +256,31 @@ app.MapGet("/api/demo/ok", () => Results.Json(new { ok = true, at = DateTime.Utc
 
 app.MapPost("/api/error-management/demo/reset", (DemoStore db) => { db.Reset(); return Results.Ok(new { reset = true }); });
 app.MapPost("/api/error-management/demo/seed", (DemoStore db) => { db.Seed(); return Results.Ok(new { seeded = true }); });
+
+// SPA fallback, registered LAST so it can never shadow an /api route: the
+// Angular router owns /purchase-order, /admin and /my-issues, and a hard
+// refresh on any of them must return index.html rather than 404.
+if (hasUi)
+{
+    app.MapFallback(async ctx =>
+    {
+        if (ctx.Request.Path.StartsWithSegments("/api"))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+            return;
+        }
+        ctx.Response.ContentType = "text/html";
+        await ctx.Response.SendFileAsync(Path.Combine(webRoot, "index.html"));
+    });
+}
+
+Console.WriteLine();
+Console.WriteLine("  ERP Error Management Framework - demo");
+Console.WriteLine(hasUi
+    ? "  Open http://localhost:5146  (the UI is served from this process)"
+    : "  API only - demo/wwwroot not found, so no UI is being served.");
+Console.WriteLine("  Sample data:  POST http://localhost:5146/api/error-management/demo/seed");
+Console.WriteLine();
 
 app.Run();
 
