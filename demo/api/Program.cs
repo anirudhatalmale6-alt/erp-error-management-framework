@@ -71,11 +71,41 @@ if (hasUi)
     app.UseStaticFiles();
 }
 
+// The demo stands in for JWT with a header. In production the identity comes
+// from the validated token and NEVER from a request parameter - which is why
+// the demo does not accept one either.
+static string DemoUser(HttpContext ctx)
+    => ctx.Request.Headers["X-Demo-User"].FirstOrDefault() ?? "fatima.saeed";
+
 var json = new JsonSerializerOptions
 {
     PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
 };
+
+// ---- support console: authorisation gate ----------------------------------
+// EVERY admin endpoint goes through RequireSupport. In production this is the
+// ErpAdminAuthorizationFilter on the Web API 2 controller; here it is the same
+// check inline so the demo enforces it for real rather than describing it.
+//
+// A UI route guard is NOT this. A guard hides a menu item; anyone with a
+// browser console can call these URLs directly, and the error store holds every
+// stack trace and user name in the system.
+static IResult? RequireSupport(HttpContext ctx, DemoStore db, string capability)
+{
+    var user = DemoUser(ctx);
+    if (!db.HasCapability(user, capability))
+    {
+        // 403 with no detail about WHICH capability is missing - telling an
+        // unauthorised caller that maps the permission model out for them.
+        return Results.Json(new
+        {
+            message = "You do not have access to the support console.",
+            user
+        }, statusCode: 403);
+    }
+    return null;
+}
 
 // ---------------------------------------------------------------- capture ---
 app.MapPost("/api/error-management/errors", async (HttpContext ctx, DemoStore db) =>
@@ -120,19 +150,16 @@ app.MapPost("/api/error-management/tickets", async (HttpContext ctx, DemoStore d
         : Results.Json(result, json);
 });
 
-app.MapGet("/api/error-management/tickets", (DemoStore db, string? status, bool? onlyOpen)
-    => Results.Json(db.SearchTickets(status, onlyOpen), json));
+app.MapGet("/api/error-management/tickets", (HttpContext ctx, DemoStore db, string? status, bool? onlyOpen)
+    => RequireSupport(ctx, db, "view") ?? Results.Json(db.SearchTickets(status, onlyOpen), json));
 
-app.MapGet("/api/error-management/tickets/{ticketNumber}", (DemoStore db, string ticketNumber)
-    => Results.Json(db.GetTicket(ticketNumber), json));
+app.MapGet("/api/error-management/tickets/{ticketNumber}", (HttpContext ctx, DemoStore db, string ticketNumber)
+    => RequireSupport(ctx, db, "view") ?? Results.Json(db.GetTicket(ticketNumber), json));
 
 // ---- end-user "My Tickets" -------------------------------------------------
 // The demo stands in for JWT with an X-Demo-User header. In production the
 // identity comes from the validated token and NEVER from a request parameter -
 // that is the whole point, so the demo does not accept one either.
-static string DemoUser(HttpContext ctx)
-    => ctx.Request.Headers["X-Demo-User"].FirstOrDefault() ?? "fatima.saeed";
-
 app.MapGet("/api/error-management/tickets/mine", (HttpContext ctx, DemoStore db, bool onlyOpen = false)
     => Results.Json(db.ListTicketsForUser(DemoUser(ctx), onlyOpen), json));
 
@@ -160,7 +187,10 @@ app.MapPost("/api/error-management/tickets/{ticketNumber}/status",
 {
     var req = await JsonSerializer.DeserializeAsync<StatusChangeRequest>(ctx.Request.Body, json);
     if (req is null) return Results.BadRequest();
-    var user = ctx.Request.Headers["X-Demo-User"].FirstOrDefault() ?? "sam.ops";
+    var denied = RequireSupport(ctx, db, "manage");
+    if (denied is not null) return denied;
+
+    var user = DemoUser(ctx);
     try
     {
         return Results.Json(db.ChangeStatus(ticketNumber, req.ToStatus!, user, req.Comments,
@@ -176,12 +206,12 @@ app.MapPost("/api/error-management/tickets/{ticketNumber}/status",
 // Filtering, sorting and paging are all query parameters handled server-side.
 // The browser never receives more than one page.
 app.MapGet("/api/error-management/admin/errors", (
-        DemoStore db,
+        HttpContext ctx, DemoStore db,
         string? severity, string? layer, string? category, string? erpModule,
         string? userName, string? correlationId, string? searchText,
         string? fromUtc, string? toUtc, bool? onlyUnticketed,
         string? sortBy, int pageNumber = 1, int pageSize = 25)
-    => Results.Json(db.SearchErrors(new ErrorQuery
+    => RequireSupport(ctx, db, "view") ?? Results.Json(db.SearchErrors(new ErrorQuery
     {
         Severity = severity, Layer = layer, Category = category, ErpModule = erpModule,
         UserName = userName, CorrelationId = correlationId, SearchText = searchText,
@@ -190,11 +220,11 @@ app.MapGet("/api/error-management/admin/errors", (
     }), json));
 
 app.MapGet("/api/error-management/admin/problems", (
-        DemoStore db,
+        HttpContext ctx, DemoStore db,
         string? severity, string? layer, string? erpModule, bool? includeMuted,
         string? fromUtc, int minOccurrences = 1,
         string? sortBy = null, int pageNumber = 1, int pageSize = 25)
-    => Results.Json(db.RecurringProblems(new ProblemQuery
+    => RequireSupport(ctx, db, "view") ?? Results.Json(db.RecurringProblems(new ProblemQuery
     {
         Severity = severity, Layer = layer, ErpModule = erpModule,
         IncludeMuted = includeMuted, FromUtc = fromUtc,
@@ -202,14 +232,58 @@ app.MapGet("/api/error-management/admin/problems", (
         SortBy = sortBy, PageNumber = pageNumber, PageSize = pageSize
     }), json));
 
-app.MapGet("/api/error-management/admin/dashboard", (DemoStore db)
-    => Results.Json(db.Dashboard(), json));
+app.MapGet("/api/error-management/admin/dashboard", (HttpContext ctx, DemoStore db)
+    => RequireSupport(ctx, db, "view") ?? Results.Json(db.Dashboard(), json));
 
-app.MapGet("/api/error-management/admin/correlation/{correlationId}", (DemoStore db, string correlationId)
-    => Results.Json(db.CorrelationTrail(correlationId), json));
+app.MapGet("/api/error-management/admin/correlation/{correlationId}", (HttpContext ctx, DemoStore db, string correlationId)
+    => RequireSupport(ctx, db, "diagnostics") ?? Results.Json(db.CorrelationTrail(correlationId), json));
 
-app.MapGet("/api/error-management/admin/error/{errorReference}", (DemoStore db, string errorReference)
-    => Results.Json(db.GetErrorDetail(errorReference), json));
+app.MapGet("/api/error-management/admin/error/{errorReference}", (HttpContext ctx, DemoStore db, string errorReference)
+    => RequireSupport(ctx, db, "diagnostics") ?? Results.Json(db.GetErrorDetail(errorReference), json));
+
+app.MapGet("/api/error-management/admin/whoami", (HttpContext ctx, DemoStore db)
+    => Results.Json(db.WhoAmI(DemoUser(ctx)), json));
+
+app.MapGet("/api/error-management/admin/assignable-users", (HttpContext ctx, DemoStore db)
+    => RequireSupport(ctx, db, "manage") ?? Results.Json(db.ListAssignable(), json));
+
+app.MapPost("/api/error-management/admin/tickets/{ticketNumber}/assign",
+    async (HttpContext ctx, DemoStore db, string ticketNumber) =>
+{
+    var denied = RequireSupport(ctx, db, "manage");
+    if (denied is not null) return denied;
+
+    var req = await JsonSerializer.DeserializeAsync<AssignRequest>(ctx.Request.Body, json);
+
+    // WHO performed it comes from the identity, never from the body - accepting
+    // it from the caller would make the audit trail worth nothing.
+    var result = db.AssignTicket(ticketNumber, req?.AssignToUserName, DemoUser(ctx), req?.Comments);
+
+    return result is null
+        ? Results.Json(new { message = "The ticket could not be assigned. Check that it exists and "
+            + "that the assignee is an active member of the support roster." }, json, statusCode: 400)
+        : Results.Json(result, json);
+});
+
+// ---- end user raising a ticket BY HAND, with no captured error -------------
+app.MapGet("/api/error-management/request-categories", (DemoStore db)
+    => Results.Json(db.RequestCategories(), json));
+
+app.MapPost("/api/error-management/tickets/manual", async (HttpContext ctx, DemoStore db) =>
+{
+    var req = await JsonSerializer.DeserializeAsync<ManualRequest>(ctx.Request.Body, json);
+    if (string.IsNullOrWhiteSpace(req?.Title))
+        return Results.Json(new { message = "A title is required." }, json, statusCode: 400);
+
+    // Ownership comes from the identity, so nobody can raise a ticket in
+    // someone else's name.
+    var result = db.CreateManualTicket(req!.Title!, req.Description, req.RequestCategory,
+        req.ErpModule, req.ReportedScreen, DemoUser(ctx));
+
+    return result is null
+        ? Results.Json(new { message = "The ticket could not be created." }, json, statusCode: 503)
+        : Results.Json(result, json);
+});
 
 // --------------------------------------------- deliberately failing endpoints
 // These exist so the demo UI can prove capture of API-, business- and
@@ -310,3 +384,6 @@ app.Run();
 record TicketRequest(string? ErrorReference, string? UserDescription);
 record StatusChangeRequest(string? ToStatus, string? Comments, string? AssignTo);
 record CommentRequest(string? CommentText);
+record AssignRequest(string? AssignToUserName, string? Comments);
+record ManualRequest(string? Title, string? Description, string? RequestCategory,
+                     string? ErpModule, string? ReportedScreen);

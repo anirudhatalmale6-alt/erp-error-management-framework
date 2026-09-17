@@ -106,7 +106,7 @@ public class DemoStore
             CREATE TABLE IF NOT EXISTS Ticket (
               TicketId INTEGER PRIMARY KEY AUTOINCREMENT,
               TicketNumber TEXT NOT NULL UNIQUE,
-              OccurrenceId INTEGER, FingerprintId INTEGER NOT NULL,
+              OccurrenceId INTEGER, FingerprintId INTEGER,
               Status TEXT NOT NULL, Severity TEXT, Queue TEXT,
               Title TEXT, UserDescription TEXT,
               ReportedByUserName TEXT, AssignedToUserName TEXT, CreatedVia TEXT,
@@ -119,7 +119,9 @@ public class DemoStore
               SlaResolutionBreached INTEGER NOT NULL DEFAULT 0,
               ReopenCount INTEGER NOT NULL DEFAULT 0,
               LinkedOccurrenceCount INTEGER NOT NULL DEFAULT 1,
-              ResolutionCode TEXT, ResolutionNotes TEXT
+              ResolutionCode TEXT, ResolutionNotes TEXT,
+              TicketSource TEXT NOT NULL DEFAULT 'error',
+              RequestCategory TEXT, ReportedScreen TEXT
             );
 
             CREATE TABLE IF NOT EXISTS TicketHistory (
@@ -127,7 +129,10 @@ public class DemoStore
               TicketId INTEGER NOT NULL, SequenceNo INTEGER NOT NULL,
               FromStatus TEXT, ToStatus TEXT NOT NULL,
               ChangedByUserName TEXT, ChangedUtc TEXT NOT NULL,
-              MinutesInFromStatus INTEGER, Comments TEXT
+              MinutesInFromStatus INTEGER, Comments TEXT,
+              AssignedToUserName TEXT, PreviousAssignedToUserName TEXT,
+              ChangeKind TEXT NOT NULL DEFAULT 'status',
+              IsCustomerVisible INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE TABLE IF NOT EXISTS TicketComment (
@@ -144,6 +149,14 @@ public class DemoStore
               TicketId INTEGER NOT NULL, OccurrenceId INTEGER NOT NULL,
               LinkReason TEXT, LinkedUtc TEXT,
               PRIMARY KEY (TicketId, OccurrenceId)
+            );
+
+            CREATE TABLE IF NOT EXISTS SupportUser (
+              UserName TEXT PRIMARY KEY,
+              DisplayName TEXT NOT NULL,
+              RoleCode TEXT NOT NULL,
+              IsAvailable INTEGER NOT NULL DEFAULT 1,
+              IsActive INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE TABLE IF NOT EXISTS Counter (Name TEXT PRIMARY KEY, Value INTEGER NOT NULL);
@@ -194,6 +207,236 @@ public class DemoStore
         [("reopened", "assigned")] = false, [("reopened", "in_progress")] = false,
         [("reopened", "resolved")] = true,
     };
+
+    /// <summary>Mirrors erp_err.SupportRole - capability flags, not a hierarchy.</summary>
+    private static readonly Dictionary<string, (string Name, bool View, bool Diag, bool Manage,
+        bool Assignable, bool Triage, bool Configure)> Roles = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["support_agent"]  = ("Support Agent",  true, true,  true,  true,  false, false),
+        ["support_lead"]   = ("Support Lead",   true, true,  true,  true,  true,  false),
+        ["developer"]      = ("Developer",      true, true,  true,  true,  true,  false),
+        ["support_viewer"] = ("Support Viewer", true, false, false, false, false, false),
+        ["administrator"]  = ("Administrator",  true, true,  true,  true,  true,  true),
+    };
+
+    /// <summary>
+    /// Mirrors erp_err.fn_SupportCapability. FAILS CLOSED - no roster row means
+    /// no capability, and an unknown capability name grants nothing.
+    /// </summary>
+    public object WhoAmI(string userName)
+    {
+        using var c = Open();
+        var row = QueryOne(c, null,
+            "SELECT * FROM SupportUser WHERE UserName = $u AND IsActive = 1", ("$u", userName));
+
+        if (row is null || !Roles.TryGetValue((string)row["RoleCode"]!, out var r))
+            return new { isSupportUser = false, userName };
+
+        return new
+        {
+            isSupportUser = true,
+            userName,
+            displayName = row["DisplayName"],
+            roleCode = row["RoleCode"],
+            roleName = r.Name,
+            canViewErrors = r.View,
+            canViewDiagnostics = r.Diag,
+            canManageTickets = r.Manage,
+            canBeAssigned = r.Assignable,
+            canTriage = r.Triage,
+            canConfigure = r.Configure,
+            isAvailable = Convert.ToInt64(row["IsAvailable"]) == 1,
+        };
+    }
+
+    public bool HasCapability(string? userName, string capability)
+    {
+        if (string.IsNullOrWhiteSpace(userName)) return false;
+
+        using var c = Open();
+        var row = QueryOne(c, null,
+            "SELECT RoleCode FROM SupportUser WHERE UserName = $u AND IsActive = 1", ("$u", userName));
+        if (row is null || !Roles.TryGetValue((string)row["RoleCode"]!, out var r)) return false;
+
+        return capability switch
+        {
+            "view" => r.View,
+            "diagnostics" => r.Diag,
+            "manage" => r.Manage,
+            "triage" => r.Triage,
+            "configure" => r.Configure,
+            _ => false,
+        };
+    }
+
+    public object ListAssignable()
+    {
+        using var c = Open();
+        var rows = Query(c, null, "SELECT * FROM SupportUser WHERE IsActive = 1 AND IsAvailable = 1");
+
+        var items = rows
+            .Where(r => Roles.TryGetValue((string)r["RoleCode"]!, out var x) && x.Assignable)
+            .Select(r => new
+            {
+                userName = r["UserName"],
+                displayName = r["DisplayName"],
+                roleCode = r["RoleCode"],
+                roleName = Roles[(string)r["RoleCode"]!].Name,
+                isAvailable = true,
+                openTicketCount = ExecScalarLong(c, null,
+                    "SELECT COUNT(*) FROM Ticket WHERE AssignedToUserName = $u AND Status IN "
+                    + "('new','assigned','in_progress','waiting_info','resolved','reopened')",
+                    ("$u", r["UserName"])),
+            })
+            // Least-loaded first, so a lead is not assigning alphabetically.
+            .OrderBy(x => x.openTicketCount).ThenBy(x => x.displayName)
+            .ToList();
+
+        return new { items, total = items.Count };
+    }
+
+    /// <summary>
+    /// Mirrors usp_Ticket_Assign: validated against the roster, audited every
+    /// time, and works WITHOUT a status change - so a reassignment leaves a
+    /// trace too, which it previously did not, because it is not a transition.
+    /// </summary>
+    public object? AssignTicket(string ticketNumber, string? assignTo, string changedBy, string? comments)
+    {
+        lock (_writeLock)
+        {
+            using var c = Open();
+
+            if (!HasCapability(changedBy, "manage")) return null;
+
+            var t = QueryOne(c, null,
+                "SELECT TicketId, Status, AssignedToUserName FROM Ticket WHERE TicketNumber = $n",
+                ("$n", ticketNumber));
+            if (t is null) return null;
+
+            var ticketId = Convert.ToInt64(t["TicketId"]);
+            var status = (string)t["Status"]!;
+            var previous = t["AssignedToUserName"] as string;
+
+            string? targetDisplay = null;
+            if (!string.IsNullOrWhiteSpace(assignTo))
+            {
+                var su = QueryOne(c, null,
+                    "SELECT DisplayName, RoleCode FROM SupportUser WHERE UserName = $u AND IsActive = 1",
+                    ("$u", assignTo));
+                // A free-text assignee looks harmless until the first typo,
+                // after which the ticket belongs to nobody and shows in no queue.
+                if (su is null) return null;
+                if (!Roles.TryGetValue((string)su["RoleCode"]!, out var role) || !role.Assignable) return null;
+                targetDisplay = (string)su["DisplayName"]!;
+            }
+
+            var now = DateTime.UtcNow;
+
+            Exec(c, null,
+                "UPDATE Ticket SET AssignedToUserName = $to, "
+                + "AssignedUtc = CASE WHEN $to IS NULL THEN NULL ELSE COALESCE(AssignedUtc, $now) END, "
+                + "FirstResponseUtc = CASE WHEN $to IS NULL THEN FirstResponseUtc "
+                + "ELSE COALESCE(FirstResponseUtc, $now) END WHERE TicketId = $t",
+                ("$to", assignTo), ("$now", Iso(now)), ("$t", ticketId));
+
+            var seq = ExecScalarLong(c, null,
+                "SELECT COALESCE(MAX(SequenceNo),0) + 1 FROM TicketHistory WHERE TicketId = $t",
+                ("$t", ticketId));
+
+            var note = comments ?? (assignTo is null ? "Ticket unassigned."
+                : previous is null ? $"Assigned to {targetDisplay}."
+                : $"Reassigned from {previous} to {targetDisplay}.");
+
+            Exec(c, null,
+                "INSERT INTO TicketHistory (TicketId, SequenceNo, FromStatus, ToStatus, "
+                + "ChangedByUserName, ChangedUtc, MinutesInFromStatus, Comments, "
+                + "AssignedToUserName, PreviousAssignedToUserName, ChangeKind, IsCustomerVisible) "
+                + "VALUES ($t,$seq,$st,$st,$by,$now,NULL,$c,$to,$prev,'assignment',0)",
+                ("$t", ticketId), ("$seq", seq), ("$st", status), ("$by", changedBy),
+                ("$now", Iso(now)), ("$c", note), ("$to", assignTo), ("$prev", previous));
+
+            // Advance New -> Assigned as its own validated transition, so the
+            // status history and minutes-in-status accounting stay correct.
+            if (assignTo is not null && status.Equals("new", StringComparison.OrdinalIgnoreCase)
+                && Transitions.ContainsKey(("new", "assigned")))
+            {
+                try { ChangeStatus(ticketNumber, "assigned", changedBy, "Assigned.", assignTo); }
+                catch (InvalidOperationException) { /* the workflow is the authority */ }
+            }
+
+            return new
+            {
+                ticketNumber, assignedTo = assignTo, assignedToName = targetDisplay,
+                previousAssignedTo = previous, sequenceNo = seq
+            };
+        }
+    }
+
+    public object RequestCategories() => new
+    {
+        items = new[]
+        {
+            new { code = "wrong_data",      displayName = "Data looks wrong or is missing" },
+            new { code = "cannot_complete", displayName = "I cannot complete a task" },
+            new { code = "slow",            displayName = "Something is very slow" },
+            new { code = "access",          displayName = "I need access to something" },
+            new { code = "how_to",          displayName = "I need help using a screen" },
+            new { code = "enhancement",     displayName = "Suggestion or enhancement request" },
+            new { code = "other",           displayName = "Something else" },
+        }
+    };
+
+    private static readonly Dictionary<string, string> CategorySeverity = new()
+    {
+        ["wrong_data"] = "medium", ["cannot_complete"] = "high", ["slow"] = "medium",
+        ["access"] = "low", ["how_to"] = "low", ["enhancement"] = "info", ["other"] = "low",
+    };
+
+    /// <summary>
+    /// Mirrors usp_Ticket_CreateManual. NOT deduplicated: there is no fault to
+    /// fingerprint, and two people describing the same annoyance in their own
+    /// words are two requests, not one.
+    ///
+    /// Severity comes from the CATEGORY, not from the user - otherwise everyone
+    /// marks their request critical and the SLA queue means nothing.
+    /// </summary>
+    public object? CreateManualTicket(string title, string? description, string? category,
+        string? erpModule, string? screen, string reportedBy)
+    {
+        if (string.IsNullOrWhiteSpace(title) || string.IsNullOrWhiteSpace(reportedBy)) return null;
+
+        lock (_writeLock)
+        {
+            using var c = Open();
+            var now = DateTime.UtcNow;
+            var cat = category is not null && CategorySeverity.ContainsKey(category) ? category : "other";
+            var severity = CategorySeverity[cat];
+            var sla = Sla.TryGetValue(severity, out var s2) ? s2 : Sla["low"];
+            var ticketNumber = NextReference(c, null, "TKT", now);
+
+            var ticketId = ExecScalarLong(c, null,
+                "INSERT INTO Ticket (TicketNumber, OccurrenceId, FingerprintId, Status, Severity, Queue, "
+                + "Title, UserDescription, ReportedByUserName, CreatedVia, ErpModule, Environment, "
+                + "CreatedUtc, LastStatusChangeUtc, SlaFirstResponseMinutes, SlaResolutionMinutes, "
+                + "LinkedOccurrenceCount, TicketSource, RequestCategory, ReportedScreen) "
+                + "VALUES ($num,NULL,NULL,'new',$sev,'general',$title,$desc,$by,'user',$mod,'Demo',"
+                + "$now,$now,$fr,$res,0,'manual',$cat,$screen); SELECT last_insert_rowid();",
+                ("$num", ticketNumber), ("$sev", severity),
+                ("$title", Redactor.ScrubText(title, 400)),
+                ("$desc", Redactor.ScrubText(description, 8000)),
+                ("$by", reportedBy), ("$mod", erpModule), ("$now", Iso(now)),
+                ("$fr", sla.FirstResponse), ("$res", sla.Resolution),
+                ("$cat", cat), ("$screen", screen));
+
+            Exec(c, null,
+                "INSERT INTO TicketHistory (TicketId, SequenceNo, FromStatus, ToStatus, "
+                + "ChangedByUserName, ChangedUtc, MinutesInFromStatus, Comments, ChangeKind, IsCustomerVisible) "
+                + "VALUES ($t,1,NULL,'new',$by,$now,NULL,'Ticket raised manually by the user.','status',1)",
+                ("$t", ticketId), ("$by", reportedBy), ("$now", Iso(now)));
+
+            return new { ticketNumber, ticketId, wasDeduplicated = false };
+        }
+    }
 
     // Mirrors erp_err.SlaPolicy.
     private static readonly Dictionary<string, (int FirstResponse, int Resolution)> Sla = new()
@@ -656,6 +899,7 @@ public class DemoStore
                     severityCode = r["Severity"],
                     queue = r["Queue"],
                     createdVia = r["CreatedVia"],
+                    ticketSource = Val(r, "TicketSource"),
                     reportedBy = r["ReportedByUserName"],
                     assignedTo = r["AssignedToUserName"],
                     erpModule = r["ErpModule"],
@@ -707,7 +951,12 @@ public class DemoStore
                 changedBy = h["ChangedByUserName"],
                 changedUtc = h["ChangedUtc"],
                 minutesInFromStatus = h["MinutesInFromStatus"],
-                comments = h["Comments"]
+                comments = h["Comments"],
+                // Surfaced so the assignment audit is VISIBLE, not merely
+                // stored. An audit trail nobody can read is not an audit trail.
+                changeKind = Val(h, "ChangeKind"),
+                assignedTo = Val(h, "AssignedToUserName"),
+                previousAssignedTo = Val(h, "PreviousAssignedToUserName")
             }).ToList();
 
         // "Time spent in each status" - derived from the audit rows, which is
@@ -761,6 +1010,12 @@ public class DemoStore
             severityCode = t["Severity"], queue = t["Queue"], createdVia = t["CreatedVia"],
             reportedBy = t["ReportedByUserName"],
             assignedTo = t["AssignedToUserName"],
+            // 'error' or 'manual'. Without this the console cannot tell a
+            // captured fault from a request somebody typed, and the badge
+            // showed "captured error" for everything.
+            ticketSource = Val(t, "TicketSource"),
+            requestCategory = Val(t, "RequestCategory"),
+            reportedScreen = Val(t, "ReportedScreen"),
             erpModule = Val(t, "ErpModule"), environment = t["Environment"],
             createdUtc = t["CreatedUtc"],
             firstResponseUtc = Val(t, "FirstResponseUtc"),
@@ -1352,6 +1607,26 @@ public class DemoStore
     /// <summary>Pre-populate a plausible history so the admin views are not empty.</summary>
     public void Seed()
     {
+        lock (_writeLock)
+        {
+            using var rc = Open();
+            // The support roster. fatima.saeed is DELIBERATELY absent - she is
+            // an ordinary ERP user, and the demo uses her to show the admin API
+            // refusing a normal user rather than just asserting that it would.
+            foreach (var (u, d, r) in new[]
+            {
+                ("sam.ops",    "Sam Ortega",  "support_lead"),
+                ("dev.patel",  "Dev Patel",   "developer"),
+                ("ana.silva",  "Ana Silva",   "support_agent"),
+                ("mgr.khoury", "Maya Khoury", "support_viewer"),
+            })
+            {
+                Exec(rc, null,
+                    "INSERT OR IGNORE INTO SupportUser (UserName, DisplayName, RoleCode) VALUES ($u,$d,$r)",
+                    ("$u", u), ("$d", d), ("$r", r));
+            }
+        }
+
         var users = new[] { "fatima.saeed", "omar.khan", "lisa.chen", "raj.patel" };
         var rnd = new Random(20260915);
 

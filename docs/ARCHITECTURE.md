@@ -1,6 +1,6 @@
 # ERP Error Management Framework — Technical Design
 
-Version 1.2.0 · 17 September 2026
+Version 1.3.0 · 17 September 2026
 
 This document answers the six points the brief explicitly left to the
 freelancer to propose:
@@ -17,7 +17,8 @@ freelancer to propose:
 Answers to the clarification questions of 16 September are in §4.2a (NgModule),
 §4.5 (JWT and public pages), §4.6 (EF6 EDMX / SP executor / EF Core),
 §4.4 (non-throwing failures), §5.3 (swallowed SQL errors) and §13 (ticket
-panels). Data loading and production performance are §14.
+panels). Data loading and production performance are §14; support-console
+access control, assignment and manually raised tickets are §15.
 
 Everything described here is implemented in this repository, not just proposed.
 §11 lists what is verified and how, and §12 lists the limitations honestly.
@@ -662,7 +663,7 @@ the `RequiresComment` / `RequiresAssignee` flags on each one.
 
 ## 11. What is verified, and how
 
-`dotnet run --project dotnet/Erp.ErrorManagement.Tests` — 91 checks, all
+`dotnet run --project dotnet/Erp.ErrorManagement.Tests` — 123 checks, all
 passing:
 
 * **All six T-SQL scripts parse** against the real SQL Server 2016 grammar,
@@ -945,3 +946,142 @@ filtering by severity *after* capping means "show me critical errors" searched
 only the most recent 300 rows, so a critical error from an hour earlier simply
 was not there. Fixed in the demo too — a reference implementation that
 demonstrates the wrong pattern is worse than no reference implementation.
+
+
+---
+
+## 15. Support-console access, assignment, and manual tickets
+
+### 15.1 How the console is restricted
+
+Two layers, and it matters which one is which.
+
+**Authentication** is the ERP's own JWT middleware. The framework never
+validates a token itself — a second validator is a second place to get signing
+keys, clock skew and issuer checks wrong, and it could disagree with yours.
+
+**Authorisation** is `ErpAdminAuthorizationFilter` plus the `erp_err` support
+roster. Every action on `AdminController` carries a
+`[RequiresSupport(capability)]` attribute, and the filter resolves the caller
+and checks that specific capability.
+
+An Angular route guard is **not** the boundary. A guard hides a menu item;
+anyone who can open a browser console can call
+`/api/error-management/admin/errors` directly, and the error store holds every
+stack trace, SQL object name and user name in the system — it is the single most
+useful thing in the ERP for someone probing it. The guard exists only so people
+who cannot use the console are not shown a menu item they cannot click.
+
+**The filter fails closed.** If the roster cannot be read, the answer is no.
+That is the opposite of every other failure path here — everywhere else, losing
+an error record beats breaking the ERP — and the asymmetry is deliberate: an
+authorisation check that fails open during a database blip is not a check.
+
+### 15.2 Capabilities, not a hierarchy
+
+| Role | view list | diagnostics | manage tickets | assignable | triage | configure |
+|---|---|---|---|---|---|---|
+| `support_agent` | ✓ | ✓ | ✓ | ✓ | | |
+| `support_lead` | ✓ | ✓ | ✓ | ✓ | ✓ | |
+| `developer` | ✓ | ✓ | ✓ | ✓ | ✓ | |
+| `support_viewer` | ✓ | | | | | |
+| `administrator` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+Flags rather than levels, because a hierarchy forces you to decide whether "can
+triage" outranks "can configure" and that question has no correct answer — real
+teams have people who do one and not the other.
+
+Note that **diagnostics is separate from view**. Seeing that an error happened
+on a screen is one permission; seeing its stack trace, SQL object and request
+payload is another, because that is where the sensitive detail lives. A manager
+who needs the dashboard and the recurring-problem report gets `support_viewer`
+and cannot open a stack trace.
+
+Verified end to end in the demo:
+
+| Endpoint | normal user | support lead | read-only viewer |
+|---|---|---|---|
+| `admin/dashboard` | 403 | 200 | 200 |
+| `admin/errors` | 403 | 200 | 200 |
+| `admin/problems` | 403 | 200 | 200 |
+| `tickets` (queue) | 403 | 200 | 200 |
+| `admin/assignable-users` | 403 | 200 | **403** |
+| `admin/error/{ref}` (stack trace) | 403 | 200 | **403** |
+| `tickets/mine` (own tickets) | **200** | 200 | 200 |
+
+### 15.3 Why the roster and not just a role claim
+
+Reading a role straight off the JWT is what most integrations do, and
+`SupportRoleClaims` supports it. The default is the roster because of two
+things:
+
+1. **Token lifetime.** Revoking support access has to take effect now, not when
+   someone's token happens to expire.
+2. **Who owns the list.** Support membership is operational data a support lead
+   should be able to change. In the identity provider, every change becomes a
+   request to whoever administers auth.
+
+If you set `SupportRoleClaims`, the two are OR'd — so adding a claim **grants**
+access and removing someone from the roster does **not** revoke it while they
+still hold the claim. Leave it empty if you want the roster to be
+authoritative.
+
+### 15.4 Assignment
+
+The assignee is picked from `usp_SupportUser_ListAssignable`, which returns only
+active, available people whose role has `CanBeAssigned`, **ordered by current
+open workload** so a lead can see who is already buried rather than assigning
+alphabetically. A free-text assignee field looks harmless right up to the first
+typo, after which the ticket belongs to nobody and appears in no queue — so the
+target is validated in SQL and a bad one is rejected.
+
+**Assignment is now audited properly, and previously was not.**
+`usp_Ticket_ChangeStatus` wrote the assignee to the ticket row and the
+transition into `Assigned` appeared in the history with who made the change —
+but the history never recorded **who the ticket was assigned to**. And
+reassignment between two support users is not a status change, so it left no
+trace at all. You could see the current assignee and nothing about how it got
+there.
+
+`usp_Ticket_Assign` fixes both. It writes a history row every time, carrying
+`AssignedToUserName`, `PreviousAssignedToUserName` and
+`ChangeKind = 'assignment'`. The row deliberately keeps the same status on both
+sides, because it is an assignment and not a transition — recording it as a
+transition would corrupt the minutes-in-status accounting.
+
+Who *performed* it always comes from the token, never from the request body.
+Accepting that from the caller would make the audit trail worth nothing.
+
+Assignment rows are `IsCustomerVisible = 0`: which engineer holds a ticket is
+internal, and showing the user invites them to chase that person directly.
+
+### 15.5 Manually raised tickets
+
+`Ticket.FingerprintId` used to be `NOT NULL`, so every ticket had to hang off a
+captured occurrence. A user who wants to report "the totals on this report look
+wrong" has no error to attach — nothing threw. That is an ordinary support
+request and the schema could not represent it.
+
+`db/011` relaxes the column, adds `TicketSource` (`error` | `manual`), and adds
+a `CHECK` constraint so a ticket is one or the other and never neither.
+
+The end user gets **+ New issue** on My Tickets, with a category list that is
+rows in `erp_err.RequestCategory` rather than a hard-coded enum. Support can
+raise one on a user's behalf — a phone call — via
+`POST admin/tickets/on-behalf`, and the ticket is owned by **the user**, so it
+appears in their My Tickets rather than the agent's.
+
+Three decisions worth flagging:
+
+**Severity comes from the category, not from the user.** Otherwise everyone
+marks their request critical and the SLA queue stops meaning anything.
+
+**Manual tickets are not deduplicated.** Fingerprint deduplication answers "is
+this the same fault?" and there is no fault here. Two people describing the same
+annoyance in their own words are two requests, and merging them would discard
+one person's description. Recurring-problem analysis therefore ignores manual
+tickets, which is correct — they are not errors.
+
+**Ownership comes from the token.** The owner fields are `[JsonIgnore]`, so a
+client cannot set them even by sending them, and nobody can raise a ticket in
+someone else's name.

@@ -28,16 +28,74 @@ import { FormsModule } from '@angular/forms';
             <h1>My reported issues</h1>
             <p class="sub">Signed in as <strong>{{ user }}</strong></p>
           </div>
-          <label class="toggle">
-            <input type="checkbox" [(ngModel)]="onlyOpen" (change)="load()" />
-            Open only
-          </label>
+          <div class="head-actions">
+            <label class="toggle">
+              <input type="checkbox" [(ngModel)]="onlyOpen" (change)="load()" />
+              Open only
+            </label>
+            <button class="new" (click)="toggleCreate()">
+              {{ creating() ? 'Cancel' : '+ New issue' }}
+            </button>
+          </div>
         </header>
+
+        @if (creating()) {
+          <form class="create" (ngSubmit)="submitNew()">
+            <p class="sub">
+              Raise an issue directly &mdash; no error needed. Use this when nothing
+              crashed but something is still wrong.
+            </p>
+
+            <label>
+              What is the problem?
+              <select [(ngModel)]="draft.requestCategory" name="cat">
+                @for (c of categories(); track c.code) {
+                  <option [ngValue]="c.code">{{ c.displayName }}</option>
+                }
+              </select>
+            </label>
+
+            <label>
+              Short summary
+              <input [(ngModel)]="draft.title" name="title" maxlength="200"
+                     placeholder="e.g. Totals on the monthly GL report look wrong" />
+            </label>
+
+            <label>
+              Details
+              <textarea rows="3" maxlength="4000" [(ngModel)]="draft.description" name="desc"
+                        placeholder="What you expected, what happened, and which record or screen"></textarea>
+            </label>
+
+            <div class="two">
+              <label>
+                Module <span>(optional)</span>
+                <input [(ngModel)]="draft.erpModule" name="mod" maxlength="40" placeholder="FI" />
+              </label>
+              <label>
+                Screen <span>(optional)</span>
+                <input [(ngModel)]="draft.reportedScreen" name="scr" maxlength="80"
+                       placeholder="GL Trial Balance" />
+              </label>
+            </div>
+
+            <div class="actions">
+              <button type="submit" [disabled]="!draft.title.trim() || submitting()">
+                {{ submitting() ? 'Creating...' : 'Create issue' }}
+              </button>
+              <span class="dim">
+                Priority is set from the category, so support can triage consistently.
+              </span>
+            </div>
+            @if (createError()) { <p class="error">{{ createError() }}</p> }
+          </form>
+        }
 
         @if (!tickets().length) {
           <p class="empty">
-            You have not reported any issues. Trigger an error on the Purchase Order
-            screen and press &ldquo;Report issue&rdquo; in the dialog.
+            You have not reported any issues. Either trigger an error on the
+            Purchase Order screen and press &ldquo;Report issue&rdquo;, or use
+            <strong>+ New issue</strong> above to raise one directly.
           </p>
         }
 
@@ -54,7 +112,8 @@ import { FormsModule } from '@angular/forms';
               </div>
               <p class="title">{{ t.title }}</p>
               <p class="dim">
-                {{ t.erpModule }} &middot; reported {{ t.createdUtc | date: 'dd MMM, HH:mm' }}
+                {{ t.erpModule || 'General' }} &middot; reported
+                {{ t.createdUtc | date: 'dd MMM, HH:mm' }}
               </p>
               @if (t.awaitingYourReply) {
                 <p class="waiting">Support is waiting for your reply</p>
@@ -160,6 +219,32 @@ import { FormsModule } from '@angular/forms';
       .dim { color: #98a2b3; }
       .empty { color: #98a2b3; font-size: 13px; margin-top: 14px; }
 
+      .head-actions { display: flex; gap: 10px; align-items: center; }
+      .new {
+        font: inherit; font-size: 12.5px; font-weight: 600; background: #1f2329; color: #fff;
+        border: none; border-radius: 6px; padding: 7px 13px; cursor: pointer; white-space: nowrap;
+      }
+
+      form.create {
+        margin-top: 14px; padding: 14px; border: 1px solid #ccdcff; background: #f6f9ff;
+        border-radius: 8px; display: grid; gap: 10px;
+      }
+      form.create .sub { margin: 0; }
+      form.create label { display: grid; gap: 4px; font-size: 12px; font-weight: 600; color: #344054; }
+      form.create label span { font-weight: 400; color: #98a2b3; }
+      form.create input, form.create select, form.create textarea {
+        font: inherit; font-size: 12.5px; padding: 7px 9px; border: 1px solid #d0d5dd;
+        border-radius: 6px; font-weight: 400; width: 100%; box-sizing: border-box; resize: vertical;
+      }
+      form.create .two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+      form.create .actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+      form.create .actions button {
+        font: inherit; font-size: 12.5px; font-weight: 600; background: #2d5bd7; color: #fff;
+        border: none; border-radius: 6px; padding: 8px 16px; cursor: pointer;
+      }
+      form.create .actions button:disabled { opacity: .5; cursor: default; }
+      form.create .dim { font-size: 11.5px; }
+
       .toggle { font-size: 12px; color: #475467; display: flex; gap: 5px; align-items: center;
                 white-space: nowrap; }
 
@@ -231,8 +316,62 @@ export class MyIssuesPage {
   onlyOpen = false;
   replyText = '';
 
+  creating = signal(false);
+  submitting = signal(false);
+  createError = signal<string | null>(null);
+  categories = signal<any[]>([]);
+
+  draft = {
+    title: '', description: '', requestCategory: 'wrong_data',
+    erpModule: '', reportedScreen: '',
+  };
+
   constructor() {
     this.load();
+    // Categories are rows in erp_err.RequestCategory, not a hard-coded enum,
+    // so support can change the list without a front-end release.
+    this.http
+      .get<any>('/api/error-management/request-categories')
+      .subscribe((d) => this.categories.set(d.items ?? []));
+  }
+
+  toggleCreate(): void {
+    this.creating.set(!this.creating());
+    this.createError.set(null);
+  }
+
+  submitNew(): void {
+    if (!this.draft.title.trim()) return;
+
+    this.submitting.set(true);
+    this.createError.set(null);
+
+    // No owner is sent: the server takes it from the token, so nobody can
+    // raise a ticket in someone else's name.
+    this.http
+      .post<any>('/api/error-management/tickets/manual', {
+        title: this.draft.title.trim(),
+        description: this.draft.description?.trim() || null,
+        requestCategory: this.draft.requestCategory,
+        erpModule: this.draft.erpModule?.trim() || null,
+        reportedScreen: this.draft.reportedScreen?.trim() || null,
+      })
+      .subscribe({
+        next: (r) => {
+          this.submitting.set(false);
+          this.creating.set(false);
+          this.draft = {
+            title: '', description: '', requestCategory: 'wrong_data',
+            erpModule: '', reportedScreen: '',
+          };
+          this.load();
+          if (r?.ticketNumber) this.open(r.ticketNumber);
+        },
+        error: (e) => {
+          this.submitting.set(false);
+          this.createError.set(e?.error?.message ?? 'The issue could not be created.');
+        },
+      });
   }
 
   load(): void {

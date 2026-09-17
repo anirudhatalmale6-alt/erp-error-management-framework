@@ -293,6 +293,70 @@ namespace Erp.ErrorManagement.WebApi2
             return Ok(new { added = true });
         }
 
+        /// <summary>
+        /// The end user raising a ticket BY HAND, with no captured error and no
+        /// Report Issue popup.
+        ///
+        /// Needed because plenty of real support requests have no exception
+        /// behind them - "the totals on this report look wrong", "I cannot find
+        /// the approve button". Nothing threw, so nothing was captured, and
+        /// before this the schema could not represent the ticket at all.
+        ///
+        /// Not deduplicated, unlike an error-derived ticket. Fingerprint
+        /// deduplication answers "is this the same fault?" and there is no
+        /// fault here - two people describing the same annoyance in their own
+        /// words are two requests, and merging them would discard one person's
+        /// description.
+        /// </summary>
+        [HttpPost, Route("tickets/manual")]
+        public async Task<IHttpActionResult> CreateManualTicket(
+            [FromBody] ManualTicketRequest request, CancellationToken cancellationToken)
+        {
+            if (!IsAuthenticated()) return StatusCode(HttpStatusCode.Unauthorized);
+
+            if (request == null || string.IsNullOrWhiteSpace(request.Title))
+                return BadRequest("A title is required.");
+
+            var ctx = ErrorContext.Values;
+
+            // Ownership comes from the token. The [JsonIgnore] on these
+            // properties means a client cannot set them even by sending them,
+            // so nobody can raise a ticket in someone else's name.
+            request.ReportedByUserId = ctx?.UserId;
+            request.ReportedByUserName = ctx?.UserName;
+            request.ErpModule = request.ErpModule ?? ctx?.ErpModule;
+            request.ReportedScreen = request.ReportedScreen ?? ctx?.Screen;
+            request.CreatedVia = "user";
+
+            if (request.ReportedByUserId == null && request.ReportedByUserName == null)
+            {
+                // Authenticated but we could not resolve who they are - so the
+                // ticket would have no owner, appear in nobody's My Tickets,
+                // and nobody could be asked for more detail.
+                return Content(HttpStatusCode.Forbidden, new
+                {
+                    message = "Your account could not be identified, so the ticket was not created."
+                });
+            }
+
+            var result = await _store.CreateManualTicketAsync(request, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (result == null)
+                return Content(HttpStatusCode.ServiceUnavailable,
+                    new { message = "The ticket could not be created. Please try again." });
+
+            return Ok(result);
+        }
+
+        /// <summary>The category list for the "create ticket" form.</summary>
+        [HttpGet, Route("request-categories")]
+        public async Task<IHttpActionResult> RequestCategories(CancellationToken cancellationToken)
+        {
+            var items = await _store.ListRequestCategoriesAsync(cancellationToken).ConfigureAwait(false);
+            return Ok(new { items });
+        }
+
         /* =================================================== plumbing ==== */
 
         /// <summary>

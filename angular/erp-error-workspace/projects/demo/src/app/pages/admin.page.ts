@@ -2,6 +2,7 @@ import { CommonModule, DatePipe } from '@angular/common';
 import { HttpClient } from '@angular/common/http';
 import { Component, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
+import { RouterLink } from '@angular/router';
 
 /**
  * The ERP Administration / Support panel from the brief: error history,
@@ -15,9 +16,9 @@ import { FormsModule } from '@angular/forms';
 @Component({
   selector: 'demo-admin',
   standalone: true,
-  imports: [CommonModule, FormsModule, DatePipe],
+  imports: [CommonModule, FormsModule, DatePipe, RouterLink],
   template: `
-    <section class="cards">
+    <section class="cards" [class.hidden]="me() && !me()!.isSupportUser">
       <div class="card">
         <span class="label">Errors captured</span>
         <span class="value">{{ dashboard()?.errorsCaptured ?? '-' }}</span>
@@ -41,14 +42,38 @@ import { FormsModule } from '@angular/forms';
       </div>
     </section>
 
-    <nav class="tabs">
+    @if (me() && !me()!.isSupportUser) {
+      <section class="panel denied">
+        <h2>You do not have access to the support console</h2>
+        <p class="sub">
+          Signed in as <strong>{{ me()!.userName }}</strong>. This console shows every
+          error, stack trace and SQL object in the ERP, so access is limited to the
+          support roster.
+        </p>
+        <p class="sub">
+          This message is not the security boundary &mdash; every endpoint behind it
+          returns <code>403</code> independently, so hiding the screen is a courtesy,
+          not the control. To track your own issues, use
+          <a routerLink="/my-issues">My issues</a>.
+        </p>
+      </section>
+    }
+
+    <nav class="tabs" [class.hidden]="me() && !me()!.isSupportUser">
       @for (t of tabs; track t.id) {
         <button [class.active]="tab() === t.id" (click)="tab.set(t.id); refresh()">{{ t.label }}</button>
       }
       <span class="spacer"></span>
+      @if (me(); as m) {
+        <span class="whoami" [class.nosupport]="!m.isSupportUser">
+          {{ m.displayName || m.userName }}
+          @if (m.isSupportUser) { &middot; {{ m.roleName }} } @else { &middot; no console access }
+        </span>
+      }
       <button class="ghost" (click)="refresh()">Refresh</button>
     </nav>
 
+    @if (!me() || me()!.isSupportUser) {
     @switch (tab()) {
       @case ('problems') {
         <section class="panel">
@@ -257,6 +282,16 @@ import { FormsModule } from '@angular/forms';
                 <div><dt>Severity</dt><dd><span class="sev" [class]="t.severityCode">{{ t.severityCode }}</span></dd></div>
                 <div><dt>Queue</dt><dd>{{ t.queue }}</dd></div>
                 <div><dt>Raised by</dt><dd>{{ t.reportedBy }} ({{ t.createdVia }})</dd></div>
+                <div>
+                  <dt>Source</dt>
+                  <dd>
+                    @if (t.ticketSource === 'manual') {
+                      <span class="src manual">raised by hand</span>
+                    } @else {
+                      <span class="src">captured error</span>
+                    }
+                  </dd>
+                </div>
                 <div><dt>Assigned to</dt><dd>{{ t.assignedTo || '-' }}</dd></div>
                 <div><dt>Created</dt><dd>{{ t.createdUtc | date: 'dd MMM HH:mm' }}</dd></div>
                 <div><dt>First response</dt><dd>{{ (t.firstResponseUtc | date: 'dd MMM HH:mm') || '-' }}</dd></div>
@@ -269,6 +304,25 @@ import { FormsModule } from '@angular/forms';
 
               @if (t.userDescription) {
                 <blockquote>&ldquo;{{ t.userDescription }}&rdquo;</blockquote>
+              }
+
+              <h3>Assigned to</h3>
+              <div class="assign">
+                <select [(ngModel)]="assignTarget" [disabled]="!me()?.canManageTickets">
+                  <option [ngValue]="null">&mdash; unassigned &mdash;</option>
+                  @for (u of assignable(); track u.userName) {
+                    <option [ngValue]="u.userName">
+                      {{ u.displayName }} ({{ u.roleName }}) &middot; {{ u.openTicketCount }} open
+                    </option>
+                  }
+                </select>
+                <button [disabled]="!me()?.canManageTickets" (click)="assign(t.ticketNumber)">
+                  {{ t.assignedTo ? 'Reassign' : 'Assign' }}
+                </button>
+              </div>
+              @if (assignError()) { <p class="error">{{ assignError() }}</p> }
+              @if (!me()?.canManageTickets) {
+                <p class="dim">Your role is read-only, so assignment is disabled.</p>
               }
 
               <h3>Move to</h3>
@@ -289,9 +343,18 @@ import { FormsModule } from '@angular/forms';
               <h3>Audit trail</h3>
               <ol class="history">
                 @for (h of t.history; track h.sequenceNo) {
-                  <li>
+                  <li [class.assignment]="h.changeKind === 'assignment'">
                     <div class="row">
-                      <strong>{{ h.fromStatusName || 'Created' }} &rarr; {{ h.toStatusName }}</strong>
+                      @if (h.changeKind === 'assignment') {
+                        <strong>
+                          @if (!h.assignedTo) { Unassigned }
+                          @else if (h.previousAssignedTo) {
+                            Reassigned: {{ h.previousAssignedTo }} &rarr; {{ h.assignedTo }}
+                          } @else { Assigned to {{ h.assignedTo }} }
+                        </strong>
+                      } @else {
+                        <strong>{{ h.fromStatusName || 'Created' }} &rarr; {{ h.toStatusName }}</strong>
+                      }
                       <span class="dim">{{ h.changedUtc | date: 'dd MMM HH:mm:ss' }}</span>
                     </div>
                     <div class="row dim">
@@ -377,6 +440,7 @@ import { FormsModule } from '@angular/forms';
           }
         </section>
       }
+    }
     }
   `,
   styles: [
@@ -502,6 +566,34 @@ import { FormsModule } from '@angular/forms';
       }
       ol.trail p { margin: 3px 0 0; font-size: 12.5px; }
 
+      .hidden { display: none !important; }
+      .denied { border-color: #f3c6c2; background: #fffaf9; }
+      .denied h2 { color: #9f1d15; }
+      .denied a { color: #2d5bd7; font-weight: 600; }
+
+      .whoami {
+        font-size: 11.5px; font-weight: 700; background: #e7f6ec; color: #12703a;
+        border-radius: 999px; padding: 4px 11px;
+      }
+      .whoami.nosupport { background: #fde8e8; color: #9f1d15; }
+
+      .assign { display: flex; gap: 7px; align-items: center; }
+      .assign select {
+        flex: 1; font: inherit; font-size: 12.5px; padding: 6px 9px;
+        border: 1px solid #d0d5dd; border-radius: 6px;
+      }
+      .assign button {
+        font: inherit; font-size: 12.5px; font-weight: 600; background: #1f2329; color: #fff;
+        border: none; border-radius: 6px; padding: 7px 14px; cursor: pointer;
+      }
+      .assign button:disabled { opacity: .45; cursor: default; }
+
+      ol.history li.assignment { border-left-color: #2d5bd7; }
+
+      .src { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+             background: #eef2f6; color: #475467; border-radius: 4px; padding: 2px 6px; }
+      .src.manual { background: #eef4ff; color: #2d5bd7; }
+
       th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
       th.sortable:hover { color: #1f2329; }
       .arrow { color: #2d5bd7; font-weight: 700; }
@@ -565,6 +657,11 @@ export class AdminPage {
   errorFilters: any = {
     searchText: '', severity: null, layer: null, onlyUnticketed: false, pageSize: 25,
   };
+
+  me = signal<any>(null);
+  assignable = signal<any[]>([]);
+  assignTarget: string | null = null;
+  assignError = signal<string | null>(null);
   tickets = signal<any[]>([]);
   selected = signal<any>(null);
   trail = signal<any[]>([]);
@@ -576,6 +673,29 @@ export class AdminPage {
   }
 
   refresh(): void {
+    // Who am I, and what may I do. The UI hides what the capabilities do not
+    // allow - but every endpoint re-checks, so tampering with this response
+    // only changes what is drawn, never what is permitted.
+    this.http.get<any>('/api/error-management/admin/whoami').subscribe((m) => {
+      this.me.set(m);
+
+      // Do not even issue the admin reads for someone without access. They
+      // would all 403 correctly, but firing them would fill the error store
+      // with 403s the framework itself caused.
+      if (!m?.isSupportUser) return;
+
+      this.loadConsole();
+
+      if (m?.canManageTickets) {
+        this.http
+          .get<any>('/api/error-management/admin/assignable-users')
+          .subscribe((d) => this.assignable.set(d.items ?? []));
+      }
+    });
+
+  }
+
+  private loadConsole(): void {
     this.http.get<any>('/api/error-management/admin/dashboard').subscribe((d) => this.dashboard.set(d));
     this.goProblems(this.problemsPage()?.pageNumber ?? 1);
     this.reloadErrors(this.errorsPage()?.pageNumber ?? 1);
@@ -652,11 +772,34 @@ export class AdminPage {
     return Math.min(a, b);
   }
 
+  assign(ticketNumber: string): void {
+    this.assignError.set(null);
+    this.http
+      .post<any>(`/api/error-management/admin/tickets/${ticketNumber}/assign`, {
+        assignToUserName: this.assignTarget,
+      })
+      .subscribe({
+        next: () => {
+          // Reload the picker too: the open-ticket counts have changed.
+          this.refresh();
+          this.selectTicket(ticketNumber);
+        },
+        error: (e) =>
+          this.assignError.set(
+            e?.error?.message ?? 'The assignment was rejected.',
+          ),
+      });
+  }
+
   selectTicket(ticketNumber: string): void {
     this.transitionError.set(null);
+    this.assignError.set(null);
     this.http
       .get<any>(`/api/error-management/tickets/${ticketNumber}`)
-      .subscribe((t) => this.selected.set(t));
+      .subscribe((t) => {
+        this.selected.set(t);
+        this.assignTarget = t?.assignedTo ?? null;
+      });
   }
 
   move(ticketNumber: string, transition: { to: string; display: string; requiresComment: boolean }): void {

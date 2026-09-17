@@ -30,6 +30,56 @@ namespace Erp.ErrorManagement
         /// <summary>The end user replying on their own ticket. False if not theirs.</summary>
         Task<bool> AddUserCommentAsync(string ticketNumber, string userId, string userName,
             string commentText, CancellationToken ct = default);
+
+        /// <summary>
+        /// A ticket raised by hand, with no captured error behind it.
+        /// Deliberately not deduplicated - see usp_Ticket_CreateManual.
+        /// </summary>
+        Task<TicketCreateResult> CreateManualTicketAsync(ManualTicketRequest request,
+            CancellationToken ct = default);
+
+        /// <summary>
+        /// Assignment as its own audited operation - works without a status
+        /// change, validates the target against the roster, and always writes a
+        /// history row (including for reassignment).
+        /// </summary>
+        Task<AssignResult> AssignTicketAsync(string ticketNumber, string assignToUserId,
+            string assignToUserName, string changedByUserId, string changedByUserName,
+            string comments, CancellationToken ct = default);
+
+        Task<List<RequestCategoryOption>> ListRequestCategoriesAsync(CancellationToken ct = default);
+    }
+
+    public class ManualTicketRequest
+    {
+        [JsonProperty("title")]           public string Title { get; set; }
+        [JsonProperty("description")]     public string Description { get; set; }
+        [JsonProperty("requestCategory")] public string RequestCategory { get; set; }
+        [JsonProperty("erpModule")]       public string ErpModule { get; set; }
+        [JsonProperty("reportedScreen")]  public string ReportedScreen { get; set; }
+        [JsonProperty("severityCode")]    public string SeverityCode { get; set; }
+
+        /// <summary>Set server-side from the token. Never accepted from the client.</summary>
+        [JsonIgnore] public string ReportedByUserId { get; set; }
+        [JsonIgnore] public string ReportedByUserName { get; set; }
+        [JsonIgnore] public string Environment { get; set; }
+        [JsonIgnore] public string CreatedVia { get; set; } = "user";
+    }
+
+    public class AssignResult
+    {
+        [JsonProperty("ticketNumber")]   public string TicketNumber { get; set; }
+        [JsonProperty("assignedTo")]     public string AssignedToUserName { get; set; }
+        [JsonProperty("assignedToName")] public string AssignedToDisplayName { get; set; }
+        [JsonProperty("previousAssignedTo")] public string PreviousAssignedToUserName { get; set; }
+        [JsonProperty("sequenceNo")]     public int SequenceNo { get; set; }
+    }
+
+    public class RequestCategoryOption
+    {
+        [JsonProperty("code")]                public string Code { get; set; }
+        [JsonProperty("displayName")]         public string DisplayName { get; set; }
+        [JsonProperty("defaultSeverityCode")] public string DefaultSeverityCode { get; set; }
     }
 
     /// <summary>
@@ -368,6 +418,162 @@ namespace Erp.ErrorManagement
                 SafeFallback("Failed to add user comment", ex);
                 return false;
             }
+        }
+
+        public async Task<TicketCreateResult> CreateManualTicketAsync(ManualTicketRequest request,
+            CancellationToken ct = default)
+        {
+            if (request == null || string.IsNullOrWhiteSpace(request.Title)) return null;
+
+            try
+            {
+                using (var connection = new SqlConnection(_options.ConnectionString))
+                using (var command = new SqlCommand("erp_err.usp_Ticket_CreateManual", connection))
+                {
+                    command.CommandType = CommandType.StoredProcedure;
+                    command.CommandTimeout = _options.CommandTimeoutSeconds;
+
+                    // Scrubbed: free text the user typed, which support will
+                    // read and which may be exported. They will paste a token
+                    // or a password in here eventually.
+                    command.Parameters.Add("@Title", SqlDbType.NVarChar, 400).Value =
+                        Redactor.ScrubText(request.Title, 400);
+                    command.Parameters.Add("@Description", SqlDbType.NVarChar, -1).Value =
+                        (object)Redactor.ScrubText(request.Description, 8000) ?? DBNull.Value;
+                    command.Parameters.Add("@RequestCategory", SqlDbType.NVarChar, 60).Value =
+                        (object)request.RequestCategory ?? "other";
+                    command.Parameters.Add("@ErpModule", SqlDbType.NVarChar, 100).Value =
+                        (object)request.ErpModule ?? DBNull.Value;
+                    command.Parameters.Add("@ReportedScreen", SqlDbType.NVarChar, 200).Value =
+                        (object)request.ReportedScreen ?? DBNull.Value;
+                    command.Parameters.Add("@Environment", SqlDbType.NVarChar, 40).Value =
+                        (object)(request.Environment ?? _options.Environment) ?? DBNull.Value;
+                    command.Parameters.Add("@ReportedByUserId", SqlDbType.NVarChar, 128).Value =
+                        (object)request.ReportedByUserId ?? DBNull.Value;
+                    command.Parameters.Add("@ReportedByUserName", SqlDbType.NVarChar, 200).Value =
+                        (object)request.ReportedByUserName ?? DBNull.Value;
+                    command.Parameters.Add("@CreatedVia", SqlDbType.NVarChar, 20).Value =
+                        (object)request.CreatedVia ?? "user";
+                    // Severity is a HINT, not a command: the procedure falls
+                    // back to the category default. A user marking everything
+                    // "critical" must not be able to jump the SLA queue.
+                    command.Parameters.Add("@SeverityCode", SqlDbType.NVarChar, 20).Value =
+                        (object)request.SeverityCode ?? DBNull.Value;
+
+                    var outParam = command.Parameters.Add("@TicketNumber", SqlDbType.VarChar, 24);
+                    outParam.Direction = ParameterDirection.Output;
+
+                    await connection.OpenAsync(ct).ConfigureAwait(false);
+
+                    using (var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false))
+                    {
+                        if (await reader.ReadAsync(ct).ConfigureAwait(false))
+                        {
+                            return new TicketCreateResult
+                            {
+                                TicketNumber = GetNullableString(reader, "TicketNumber"),
+                                TicketId = GetNullableLong(reader, "TicketId") ?? 0,
+                                WasDeduplicated = false
+                            };
+                        }
+                    }
+
+                    var number = outParam.Value as string;
+                    return number == null ? null : new TicketCreateResult { TicketNumber = number };
+                }
+            }
+            catch (Exception ex)
+            {
+                SafeFallback("Manual ticket creation failed", ex);
+                return null;
+            }
+        }
+
+        public async Task<AssignResult> AssignTicketAsync(string ticketNumber, string assignToUserId,
+            string assignToUserName, string changedByUserId, string changedByUserName,
+            string comments, CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(ticketNumber)) return null;
+
+            try
+            {
+                using (var connection = new SqlConnection(_options.ConnectionString))
+                using (var command = new SqlCommand("erp_err.usp_Ticket_Assign", connection))
+                {
+                    command.CommandType = CommandType.StoredProcedure;
+                    command.CommandTimeout = _options.CommandTimeoutSeconds;
+                    command.Parameters.Add("@TicketNumber", SqlDbType.VarChar, 24).Value = ticketNumber;
+                    command.Parameters.Add("@AssignToUserId", SqlDbType.NVarChar, 128).Value =
+                        (object)assignToUserId ?? DBNull.Value;
+                    command.Parameters.Add("@AssignToUserName", SqlDbType.NVarChar, 200).Value =
+                        (object)assignToUserName ?? DBNull.Value;
+                    command.Parameters.Add("@ChangedByUserId", SqlDbType.NVarChar, 128).Value =
+                        (object)changedByUserId ?? DBNull.Value;
+                    command.Parameters.Add("@ChangedByUserName", SqlDbType.NVarChar, 200).Value =
+                        (object)changedByUserName ?? DBNull.Value;
+                    command.Parameters.Add("@Comments", SqlDbType.NVarChar, -1).Value =
+                        (object)Redactor.ScrubText(comments, 2000) ?? DBNull.Value;
+
+                    await connection.OpenAsync(ct).ConfigureAwait(false);
+                    using (var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false))
+                    {
+                        if (!await reader.ReadAsync(ct).ConfigureAwait(false)) return null;
+
+                        return new AssignResult
+                        {
+                            TicketNumber = GetNullableString(reader, "TicketNumber"),
+                            AssignedToUserName = GetNullableString(reader, "AssignedToUserName"),
+                            AssignedToDisplayName = GetNullableString(reader, "AssignedToDisplayName"),
+                            PreviousAssignedToUserName = GetNullableString(reader, "PreviousAssignedToUserName"),
+                            SequenceNo = (int)(GetNullableLong(reader, "SequenceNo") ?? 0)
+                        };
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // Assignment errors are RAISERROR from the procedure - an
+                // unauthorised caller, or a target who is not on the roster.
+                // Surfaced as null so the API can return a clean 400 rather
+                // than leaking the SQL message.
+                SafeFallback("Ticket assignment failed", ex);
+                return null;
+            }
+        }
+
+        public async Task<List<RequestCategoryOption>> ListRequestCategoriesAsync(CancellationToken ct = default)
+        {
+            var result = new List<RequestCategoryOption>();
+
+            try
+            {
+                using (var connection = new SqlConnection(_options.ConnectionString))
+                using (var command = new SqlCommand("erp_err.usp_RequestCategory_List", connection))
+                {
+                    command.CommandType = CommandType.StoredProcedure;
+                    command.CommandTimeout = _options.CommandTimeoutSeconds;
+
+                    await connection.OpenAsync(ct).ConfigureAwait(false);
+                    using (var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false))
+                    {
+                        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+                        {
+                            result.Add(new RequestCategoryOption
+                            {
+                                Code = GetNullableString(reader, "Code"),
+                                DisplayName = GetNullableString(reader, "DisplayName"),
+                                DefaultSeverityCode = GetNullableString(reader, "DefaultSeverityCode")
+                            });
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                SafeFallback("Failed to list request categories", ex);
+            }
+
+            return result;
         }
 
         private void SafeFallback(string message, Exception ex)

@@ -47,6 +47,10 @@ namespace Erp.ErrorManagement.WebApi2
                 options.AnonymousCaptureRatePerMinute,
                 options.AnonymousCaptureBurst);
 
+            // Resolves who is support staff, from the erp_err roster. Fails
+            // CLOSED - if it cannot read the roster, nobody is authorised.
+            var directory = new SqlSupportDirectory(options);
+
             // 1. Ambient context + correlation, before routing.
             config.MessageHandlers.Add(new ErpErrorCorrelationHandler(options.DefaultErpModule));
 
@@ -60,13 +64,18 @@ namespace Erp.ErrorManagement.WebApi2
             //    permits exactly one handler, by design.
             config.Services.Replace(typeof(IExceptionHandler), new ErpExceptionHandler(options));
 
+            // 3a. Gate the support console API. The filter is a no-op for any
+            //     action without [RequiresSupport], so adding it cannot affect
+            //     a single existing ERP endpoint.
+            config.Filters.Add(new ErpAdminAuthorizationFilter(directory, options));
+
             // 4. Let the framework's own controller be constructed with its
             //    dependencies.  Chains to whatever activator is already
             //    registered, so an existing Unity/Autofac/Ninject container
             //    keeps resolving every other controller exactly as before.
             var existing = config.Services.GetHttpControllerActivator();
             config.Services.Replace(typeof(IHttpControllerActivator),
-                new ErpControllerActivator(existing, capture, store, throttle));
+                new ErpControllerActivator(existing, capture, store, throttle, directory));
 
             return config;
         }
@@ -118,14 +127,17 @@ namespace Erp.ErrorManagement.WebApi2
         private readonly ErrorCaptureService _capture;
         private readonly IErrorStore _store;
         private readonly AnonymousCaptureThrottle _throttle;
+        private readonly ISupportDirectory _directory;
 
         public ErpControllerActivator(IHttpControllerActivator inner,
-            ErrorCaptureService capture, IErrorStore store, AnonymousCaptureThrottle throttle)
+            ErrorCaptureService capture, IErrorStore store, AnonymousCaptureThrottle throttle,
+            ISupportDirectory directory)
         {
             _inner = inner;
             _capture = capture;
             _store = store;
             _throttle = throttle;
+            _directory = directory;
         }
 
         public System.Web.Http.Controllers.IHttpController Create(
@@ -135,6 +147,9 @@ namespace Erp.ErrorManagement.WebApi2
         {
             if (controllerType == typeof(ErrorManagementController))
                 return new ErrorManagementController(_capture, _store, _throttle);
+
+            if (controllerType == typeof(AdminController))
+                return new AdminController(_store, _directory);
 
             if (_inner != null)
                 return _inner.Create(request, controllerDescriptor, controllerType);

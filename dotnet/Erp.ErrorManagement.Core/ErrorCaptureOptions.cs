@@ -115,6 +115,35 @@ namespace Erp.ErrorManagement
         /// </summary>
         public bool AllowAnonymousTicketCreation { get; set; } = false;
 
+        /// <summary>
+        /// Token role claims that additionally grant support-console access,
+        /// on top of the erp_err.SupportUser roster.
+        ///
+        /// Empty by default, which means the roster is the only source. Set it
+        /// if you would rather drive authorisation from your identity provider:
+        /// a caller holding any of these roles is treated as an administrator
+        /// even with no roster row.
+        ///
+        /// Both sources are OR'd. That is a deliberate choice and worth
+        /// understanding: it means adding a role here GRANTS access, and
+        /// removing someone from the roster does NOT revoke it if they still
+        /// hold the claim. If you need the roster to be authoritative, leave
+        /// this empty.
+        /// </summary>
+        public List<string> SupportRoleClaims { get; set; } = new List<string>();
+
+        /// <summary>
+        /// Claim type to read those roles from. Defaults to the standard role
+        /// claim; override for a bespoke token.
+        /// </summary>
+        public string RoleClaimType { get; set; } = "http://schemas.microsoft.com/ws/2008/06/identity/claims/role";
+
+        /// <summary>
+        /// Role code assumed for a caller who is authorised by claim rather
+        /// than by roster. Must exist in erp_err.SupportRole.
+        /// </summary>
+        public string ClaimAuthorisedRoleCode { get; set; } = "administrator";
+
         /// <summary>Last chance to change or drop an envelope.  Return null to discard.</summary>
         public Func<ErrorEnvelope, ErrorEnvelope> BeforeSend { get; set; }
 

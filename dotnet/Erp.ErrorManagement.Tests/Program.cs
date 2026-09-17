@@ -44,6 +44,7 @@ namespace Erp.ErrorManagement.Tests
             RunThrottleChecks();
             RunEndUserSqlChecks(Path.Combine(repoRoot, "db"));
             RunDynamicSqlChecks(Path.Combine(repoRoot, "db"));
+            RunSupportAccessChecks(Path.Combine(repoRoot, "db"), repoRoot);
 
             Console.WriteLine();
             Console.WriteLine(_failures == 0
@@ -619,6 +620,132 @@ namespace Erp.ErrorManagement.Tests
                 noTiebreak.Count == 0 ? "none missing" : string.Join(" | ", noTiebreak),
                 "none missing");
             Check("positive control: sort clauses were actually found", clauses.Count > 0, true);
+        }
+
+        /* ======================== support access / manual tickets ======= */
+
+        /// <summary>
+        /// Structural guarantees for admin access and manual tickets.
+        ///
+        /// These are assertions about SHAPE, not behaviour - the behaviour
+        /// needs a running SQL Server. They exist to catch the specific
+        /// mistakes that are easy to make later: adding an admin endpoint
+        /// without a capability attribute, letting the authorisation check fail
+        /// open, or letting a client supply the ticket owner.
+        /// </summary>
+        private static void RunSupportAccessChecks(string dbFolder, string repoRoot)
+        {
+            Console.WriteLine("\n=== Support access, assignment audit, manual tickets ===");
+
+            var path = Path.Combine(dbFolder, "011_support_access_and_manual_tickets.sql");
+            if (!File.Exists(path)) { Fail("011 not found"); return; }
+
+            var sql = StripSqlComments(File.ReadAllText(path));
+
+            // --- authorisation fails closed --------------------------------
+            var cap = Section(sql, "FUNCTION erp_err.fn_SupportCapability");
+            Check("capability check exists", cap.Length > 0, true);
+            Check("no identity -> no capability (fails closed)",
+                cap.Contains("@UserId IS NULL AND @UserName IS NULL") && cap.Contains("RETURN 0"), true);
+            Check("an unknown capability name grants nothing",
+                cap.Contains("ELSE CONVERT(BIT, 0)"), true);
+            Check("only ACTIVE roster rows and ACTIVE roles count",
+                cap.Contains("su.IsActive = 1") && cap.Contains("r.IsActive = 1"), true);
+
+            // --- assignment is validated and audited ----------------------
+            var assign = Section(sql, "PROCEDURE erp_err.usp_Ticket_Assign");
+            Check("assignment requires the 'manage' capability",
+                assign.Contains("fn_SupportCapability") && assign.Contains("N'manage'"), true);
+            Check("the assignee is validated against the roster",
+                assign.Contains("CanBeAssigned = 1"), true);
+            Check("assignment writes a history row",
+                assign.Contains("INSERT erp_err.TicketStatusHistory"), true);
+            Check("...recording WHO it was assigned to",
+                assign.Contains("@targetName"), true);
+            Check("...and who it was taken FROM, so reassignment is auditable",
+                assign.Contains("@PrevAssignee"), true);
+            Check("the assignment row is marked as an assignment, not a transition",
+                assign.Contains("N'assignment'"), true);
+            // A reassignment is not a status change, so it must not be recorded
+            // as one - that would corrupt the minutes-in-status accounting.
+            Check("the assignment row does NOT fabricate a status transition",
+                assign.Contains("@StatusId, @StatusId"), true);
+            Check("assignment detail is internal, not shown to the end user",
+                assign.Contains("N'assignment')"), true);
+
+            // --- manual tickets -------------------------------------------
+            var manual = Section(sql, "PROCEDURE erp_err.usp_Ticket_CreateManual");
+            // Asserted on the VALUES list, not on the inline comment next to it -
+            // StripSqlComments removes the comment, so matching "1 /*new*/"
+            // could never succeed. OccurrenceId and FingerprintId are both NULL.
+            Check("a manual ticket has no occurrence and no fingerprint",
+                manual.Contains("@TicketNumber, NULL, NULL,"), true);
+            Check("a manual ticket must have an owner",
+                manual.Contains("A manual ticket must have an owner"), true);
+            Check("severity comes from the CATEGORY, not the caller's wish",
+                manual.Contains("DefaultSeverityId FROM erp_err.RequestCategory"), true);
+            Check("manual tickets are marked as such", manual.Contains("N'manual'"), true);
+
+            Check("Ticket.FingerprintId is relaxed to NULL for manual tickets",
+                sql.Contains("ALTER COLUMN FingerprintId BIGINT NULL"), true);
+            Check("a CHECK constraint stops a ticket being neither error nor manual",
+                sql.Contains("CK_Ticket_SourceIntegrity"), true);
+
+            // POSITIVE CONTROL: the section reader must actually be finding
+            // text, or every Contains() above passes vacuously.
+            Check("positive control: sections were located, not empty",
+                cap.Length > 100 && assign.Length > 100 && manual.Length > 100, true);
+            Check("positive control: a string that is NOT in 011 is not found",
+                sql.Contains("usp_ThisProcedureDoesNotExist"), false);
+
+            // --- the production API gates every admin action ---------------
+            var adminPath = Path.Combine(repoRoot, "dotnet", "Erp.ErrorManagement.WebApi2",
+                "AdminController.cs");
+            if (!File.Exists(adminPath)) { Fail("AdminController.cs not found"); return; }
+
+            var admin = File.ReadAllText(adminPath);
+            var routes = System.Text.RegularExpressions.Regex.Matches(admin, @"\[Http(Get|Post)");
+            Check("the admin controller has routes to protect", routes.Count > 0, true);
+
+            // Every action must be covered: either the controller-level
+            // attribute or its own. Counting attributes is crude but it fails
+            // loudly if someone adds an endpoint and forgets the gate.
+            var gates = System.Text.RegularExpressions.Regex.Matches(admin, @"\[RequiresSupport\(");
+            Check("every admin action carries a capability gate",
+                gates.Count >= routes.Count, true);
+
+            var filterPath = Path.Combine(repoRoot, "dotnet", "Erp.ErrorManagement.WebApi2",
+                "ErpAdminAuthorizationFilter.cs");
+            var filter = File.ReadAllText(filterPath);
+            Check("the filter 401s an unauthenticated caller",
+                filter.Contains("HttpStatusCode.Unauthorized"), true);
+            Check("the filter 403s an authenticated non-support caller",
+                filter.Contains("HttpStatusCode.Forbidden"), true);
+            Check("a role-claim lookup failure fails CLOSED",
+                filter.Contains("// Fail closed, as above.") && filter.Contains("return false;"), true);
+
+            // The audit trail is worthless if the client can say who acted.
+            Check("the API takes the acting user from the token, not the body",
+                admin.Contains("me.UserId") && admin.Contains("me.UserName"), true);
+            Check("AssignRequest does not accept a 'changed by' field",
+                admin.Contains("ChangedBy"), false);
+
+            var userCtl = File.ReadAllText(Path.Combine(repoRoot, "dotnet",
+                "Erp.ErrorManagement.WebApi2", "ErrorManagementController.cs"));
+            Check("manual-ticket ownership is set from the token",
+                userCtl.Contains("request.ReportedByUserId = ctx?.UserId"), true);
+
+            var core = File.ReadAllText(Path.Combine(repoRoot, "dotnet",
+                "Erp.ErrorManagement.Core", "SqlErrorStore.cs"));
+            Check("...and a client cannot send it (JsonIgnore on the owner fields)",
+                core.Contains("[JsonIgnore] public string ReportedByUserId"), true);
+
+            var dir = File.ReadAllText(Path.Combine(repoRoot, "dotnet",
+                "Erp.ErrorManagement.Core", "SupportAuthorization.cs"));
+            Check("identity resolution returns Anonymous on failure (fails closed)",
+                dir.Contains("return SupportIdentity.Anonymous;"), true);
+            Check("SupportIdentity.Has() denies everything for a non-support user",
+                dir.Contains("if (!IsSupportUser) return false;"), true);
         }
 
         /// <summary>Locate the `DECLARE @sql NVARCHAR(MAX) = ...;` expression text.</summary>
