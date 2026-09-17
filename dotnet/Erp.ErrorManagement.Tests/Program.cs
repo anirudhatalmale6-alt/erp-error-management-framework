@@ -43,6 +43,7 @@ namespace Erp.ErrorManagement.Tests
             RunOrmUnwrapChecks();
             RunThrottleChecks();
             RunEndUserSqlChecks(Path.Combine(repoRoot, "db"));
+            RunDynamicSqlChecks(Path.Combine(repoRoot, "db"));
 
             Console.WriteLine();
             Console.WriteLine(_failures == 0
@@ -502,6 +503,272 @@ namespace Erp.ErrorManagement.Tests
             // POSITIVE CONTROL: the stripper must be capable of finding a leak.
             Check("positive control: the stripper finds a field that IS present",
                 getForUser.Contains("ErrorReference"), true);
+        }
+
+        /* ================================= dynamic SQL ================== */
+
+        /// <summary>
+        /// Parse the SQL that the dynamic procedures actually BUILD, not just
+        /// the script that builds it.
+        ///
+        /// This matters more than it sounds. ScriptDom parsing 010 only proves
+        /// the wrapper is valid T-SQL - the query inside the string literal is,
+        /// to the parser, just text. A missing comma or an unbalanced
+        /// parenthesis in there compiles fine and fails at runtime, on the
+        /// support console, in production.
+        ///
+        /// So: reassemble each @sql expression the way SQL Server would, for
+        /// every combination of the branches it contains, substitute a real
+        /// whitelisted ORDER BY clause, and parse each result.
+        /// </summary>
+        private static void RunDynamicSqlChecks(string dbFolder)
+        {
+            Console.WriteLine("\n=== Dynamic SQL: parse what the procedures actually BUILD ===");
+
+            var path = Path.Combine(dbFolder, "010_search_performance.sql");
+            if (!File.Exists(path)) { Fail("010_search_performance.sql not found"); return; }
+
+            var raw = File.ReadAllText(path);
+            var sql = StripSqlComments(raw);
+
+            // A real ORDER BY clause from the whitelist in the same script, so
+            // the substitution is representative rather than invented.
+            const string orderBy = "o.OccurredUtc DESC, o.OccurrenceId DESC";
+
+            var procs = new[]
+            {
+                "PROCEDURE erp_err.usp_Error_Search",
+                "PROCEDURE erp_err.usp_Ticket_Search",
+                "PROCEDURE erp_err.usp_Error_RecurringProblems",
+            };
+
+            var totalVariants = 0;
+
+            foreach (var proc in procs)
+            {
+                var body = Section(sql, proc);
+                if (body.Length == 0) { Fail($"{proc} not found"); continue; }
+
+                var expr = ExtractSqlAssignment(body);
+                if (expr == null) { Fail($"{proc} - could not locate the @sql assignment"); continue; }
+
+                var variants = ExpandBranches(expr);
+                if (variants.Count == 0) { Fail($"{proc} - no variants produced"); continue; }
+
+                var name = proc.Substring(proc.LastIndexOf('.') + 1);
+                var bad = 0;
+
+                foreach (var v in variants)
+                {
+                    var built = EvaluateConcat(v).Replace("@orderBy", orderBy);
+                    totalVariants++;
+
+                    var parser = new TSql130Parser(true);
+                    using var reader = new StringReader(built);
+                    parser.Parse(reader, out IList<ParseError> errors);
+
+                    if (errors is { Count: > 0 })
+                    {
+                        bad++;
+                        Console.WriteLine($"        {errors[0].Message} (line {errors[0].Line})");
+                    }
+                }
+
+                Check($"{name}: all {variants.Count} generated variants parse", bad, 0);
+            }
+
+            Check($"positive control: variants were actually generated and parsed", totalVariants > 0, true);
+
+            // The security property of the whole approach: the caller's sort
+            // value must never reach the SQL text. It is a lookup key only.
+            var searchBody = Section(sql, "PROCEDURE erp_err.usp_Error_Search");
+            Check("@SortBy is never concatenated into the SQL text",
+                searchBody.Contains("+ @SortBy") || searchBody.Contains("@SortBy +"), false);
+            Check("...it is resolved through the whitelist instead",
+                searchBody.Contains("fn_ResolveSort"), true);
+
+            // Every value must travel as a parameter.
+            Check("usp_Error_Search passes values via sp_executesql parameters",
+                searchBody.Contains("sp_executesql") && searchBody.Contains("@SearchText NVARCHAR(200)"), true);
+
+            // The defect this script exists to fix: no per-row correlated count.
+            var recurring = Section(sql, "PROCEDURE erp_err.usp_Error_RecurringProblems");
+            Check("recurring problems no longer counts per fingerprint row",
+                recurring.Contains("CROSS APPLY"), false);
+            Check("...it aggregates the window once, with HAVING",
+                recurring.Contains("GROUP BY o.FingerprintId") && recurring.Contains("HAVING COUNT_BIG(*)"), true);
+
+            // Bounded reads.
+            var trail = Section(sql, "PROCEDURE erp_err.usp_Error_GetCorrelationTrail");
+            Check("correlation trail is bounded by TOP (@MaxRows)",
+                trail.Contains("TOP (@MaxRows)"), true);
+            Check("...and reports the true total so truncation is visible",
+                trail.Contains("TotalInTrail"), true);
+
+            // Every whitelisted sort must end in a unique tiebreaker, or rows
+            // shuffle between pages and pagination appears to lose records.
+            var whitelistBlock = sql.Substring(sql.IndexOf("USING (VALUES", StringComparison.Ordinal));
+            whitelistBlock = whitelistBlock.Substring(0, whitelistBlock.IndexOf(") AS s (ListName", StringComparison.Ordinal));
+            var clauses = System.Text.RegularExpressions.Regex.Matches(
+                whitelistBlock, @"N'((?:o|t|f|w|sv|st|q|l)\.[^']*)'");
+            var noTiebreak = clauses
+                .Select(m => m.Groups[1].Value)
+                .Where(c => !c.Contains("OccurrenceId") && !c.Contains("TicketId") && !c.Contains("FingerprintId"))
+                .ToList();
+            Check("every whitelisted sort ends with a unique tiebreaker",
+                noTiebreak.Count == 0 ? "none missing" : string.Join(" | ", noTiebreak),
+                "none missing");
+            Check("positive control: sort clauses were actually found", clauses.Count > 0, true);
+        }
+
+        /// <summary>Locate the `DECLARE @sql NVARCHAR(MAX) = ...;` expression text.</summary>
+        private static string ExtractSqlAssignment(string body)
+        {
+            var i = body.IndexOf("DECLARE @sql NVARCHAR(MAX) =", StringComparison.Ordinal);
+            if (i < 0) return null;
+            i += "DECLARE @sql NVARCHAR(MAX) =".Length;
+
+            // Ends at the first semicolon that is not inside a string literal.
+            var inString = false;
+            for (var j = i; j < body.Length; j++)
+            {
+                if (body[j] == '\'')
+                {
+                    // '' inside a literal is an escaped quote, not a terminator.
+                    if (inString && j + 1 < body.Length && body[j + 1] == '\'') { j++; continue; }
+                    inString = !inString;
+                }
+                else if (body[j] == ';' && !inString)
+                {
+                    return body.Substring(i, j - i);
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Expand every SCAFFOLDING `CASE WHEN ... THEN N'a' ELSE N'b' END`
+        /// into both of its outcomes, so each branch combination is parsed
+        /// rather than only the one that happens to run first.
+        ///
+        /// Must be literal-aware. The first version searched the raw text for
+        /// "CASE WHEN" and found the one inside the SELECT list of
+        /// usp_Ticket_Search - a CASE that is part of the SQL *text*, not of the
+        /// concatenation - then tore it in half and reported four parse
+        /// failures that did not exist. A test that cannot tell a string
+        /// literal from surrounding code produces exactly the kind of false
+        /// alarm that gets a suite ignored.
+        /// </summary>
+        private static List<string> ExpandBranches(string expr)
+        {
+            var results = new List<string> { expr };
+
+            for (var guard = 0; guard < 8; guard++)
+            {
+                var next = new List<string>();
+                var expanded = false;
+
+                foreach (var e in results)
+                {
+                    var start = IndexOfOutsideLiteral(e, "CASE WHEN", 0);
+                    if (start < 0) { next.Add(e); continue; }
+
+                    var end = IndexOfOutsideLiteral(e, " END", start);
+                    if (end < 0) { next.Add(e); continue; }
+
+                    var caseExpr = e.Substring(start, end + 4 - start);
+                    var thenIdx = IndexOfOutsideLiteral(caseExpr, "THEN", 0);
+                    var elseIdx = IndexOfOutsideLiteral(caseExpr, "ELSE", 0);
+                    if (thenIdx < 0 || elseIdx < 0) { next.Add(e); continue; }
+
+                    var thenPart = caseExpr.Substring(thenIdx + 4, elseIdx - thenIdx - 4).Trim();
+                    var elsePart = caseExpr.Substring(elseIdx + 4, caseExpr.Length - elseIdx - 4 - 4).Trim();
+
+                    next.Add(e.Substring(0, start) + thenPart + e.Substring(end + 4));
+                    next.Add(e.Substring(0, start) + elsePart + e.Substring(end + 4));
+                    expanded = true;
+                }
+
+                results = next;
+                if (!expanded) break;
+            }
+
+            return results;
+        }
+
+        /// <summary>
+        /// IndexOf that skips anything inside a single-quoted T-SQL literal,
+        /// honouring '' as an escaped quote.
+        /// </summary>
+        private static int IndexOfOutsideLiteral(string text, string needle, int from)
+        {
+            var inString = false;
+
+            for (var i = from; i < text.Length; i++)
+            {
+                if (text[i] == '\'')
+                {
+                    if (inString && i + 1 < text.Length && text[i + 1] == '\'') { i++; continue; }
+                    inString = !inString;
+                    continue;
+                }
+
+                if (!inString
+                    && i + needle.Length <= text.Length
+                    && string.CompareOrdinal(text, i, needle, 0, needle.Length) == 0)
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
+        /// <summary>
+        /// Evaluate a `N'a' + N'b' + @var` concatenation into the string SQL
+        /// Server would produce: literals un-escaped, variables left in place
+        /// for the caller to substitute.
+        /// </summary>
+        private static string EvaluateConcat(string expr)
+        {
+            var sb = new System.Text.StringBuilder();
+            var i = 0;
+
+            while (i < expr.Length)
+            {
+                // N'...' or '...'
+                if (expr[i] == '\'' || (expr[i] == 'N' && i + 1 < expr.Length && expr[i + 1] == '\''))
+                {
+                    var q = expr[i] == 'N' ? i + 1 : i;
+                    var j = q + 1;
+                    while (j < expr.Length)
+                    {
+                        if (expr[j] == '\'')
+                        {
+                            if (j + 1 < expr.Length && expr[j + 1] == '\'') { sb.Append('\''); j += 2; continue; }
+                            break;
+                        }
+                        sb.Append(expr[j]);
+                        j++;
+                    }
+                    i = j + 1;
+                    continue;
+                }
+
+                // @variable - keep the token so it can be substituted
+                if (expr[i] == '@')
+                {
+                    var j = i;
+                    while (j < expr.Length && (char.IsLetterOrDigit(expr[j]) || expr[j] == '@' || expr[j] == '_')) j++;
+                    sb.Append(expr.Substring(i, j - i));
+                    i = j;
+                    continue;
+                }
+
+                i++;   // whitespace and '+' between terms
+            }
+
+            return sb.ToString();
         }
 
         /// <summary>

@@ -37,7 +37,7 @@ config.UseErpErrorManagement(new ErrorCaptureOptions {
 });
 ```
 
-**SQL Server** — run `db/001` … `db/007` once. Everything lives in its own
+**SQL Server** — run `db/001` … `db/007` then `db/010` once. Everything lives in its own
 `erp_err` schema; no existing object is read, altered or dropped. (`008` and
 `009` are optional add-ons — see `docs/ARCHITECTURE.md` §5.3.)
 
@@ -62,6 +62,7 @@ db/                     SQL Server schema, procedures, seed data, retention job
   005_retention_and_archive.sql archive tables + the nightly batched retention job
   006_security.sql              least-privilege grants (EXECUTE only for the app)
   007_end_user_ticket_access.sql "My Tickets" - ownership enforced in SQL
+  010_search_performance.sql    server-side sort/keyset paging + indexes
   008_optional_...              OPTIONAL: Extended Events for swallowed errors
   009_optional_...              OPTIONAL: one-line capture from a CATCH block
 
@@ -74,7 +75,7 @@ dotnet/
   Erp.ErrorManagement.Core/        netstandard2.0 — shared by BOTH stacks
   Erp.ErrorManagement.WebApi2/     net472 — Web API 2 integration
   Erp.ErrorManagement.AspNetCore/  net8.0 — for future modules
-  Erp.ErrorManagement.Tests/       77 verification checks (see below)
+  Erp.ErrorManagement.Tests/       91 verification checks (see below)
 
 demo/api/               runnable demo API (SQLite — a harness, not the product)
 docs/ARCHITECTURE.md    the technical design
@@ -90,7 +91,7 @@ tools/                  cross-language fingerprint verification
 dotnet run --project dotnet/Erp.ErrorManagement.Tests
 ```
 
-77 checks, covering:
+91 checks, covering:
 
 * every T-SQL script parsing against the **real SQL Server 2016 grammar**
   (Microsoft's `ScriptDom` — the parser SSMS and sqlpackage use);
@@ -103,7 +104,10 @@ dotnet run --project dotnet/Erp.ErrorManagement.Tests
 * unwrapping of every EF6/EDMX and EF Core exception wrapper;
 * the anonymous-capture rate limiter;
 * ownership enforcement on the end-user ticket procedures, asserted against
-  comment-stripped SQL.
+  comment-stripped SQL;
+* **the SQL that the dynamic search procedures actually build** — every branch
+  combination expanded and parsed, so a syntax error inside a string literal
+  cannot reach production.
 
 Each group includes a **positive control** — a check that deliberately expects
 the negative result — because a suite that cannot fail proves nothing.
@@ -178,6 +182,11 @@ application is already in trouble, which is the worst moment to invoke an ORM.
 `LineNumber`, `Number` and `Class` are already on it — so stored-procedure
 errors are captured with **no changes to any procedure**.
 
+**Every list is paged, filtered and sorted in SQL.** The browser never receives
+more than one page, sorting goes through a whitelist rather than string
+concatenation, and the error list also offers keyset paging because `OFFSET`
+has to walk and discard every row it skips. See `docs/ARCHITECTURE.md` §14.
+
 **The framework observes; it never changes control flow.** The interceptor
 re-throws, the logger does not swallow, and every persistence path ends in a
 caught exception with a fallback. If the error store is down, posting a journal
@@ -190,4 +199,4 @@ still works.
 The framework is complete and verified as described above. Open items are listed in
 `docs/ARCHITECTURE.md` §12 — chiefly that the T-SQL has been **parsed** against
 the real grammar but not **executed**, because I have no SQL Server instance.
-Run `db/001…007` against a development database before production.
+Run `db/001…007` and `db/010` against a development database before production.

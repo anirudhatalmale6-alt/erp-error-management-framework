@@ -60,8 +60,24 @@ import { FormsModule } from '@angular/forms';
           <table>
             <thead>
               <tr>
-                <th>Occurrences</th><th>Users</th><th>Severity</th><th>Layer</th>
-                <th>Normalised signature</th><th>Location</th><th>Last seen</th><th>Ticket</th>
+                <th class="sortable" (click)="sortProblems('window_count')">
+                  Occurrences <span class="arrow">{{ sortArrow('problems', 'window_count') }}</span>
+                </th>
+                <th class="sortable" (click)="sortProblems('users')">
+                  Users <span class="arrow">{{ sortArrow('problems', 'users') }}</span>
+                </th>
+                <th class="sortable" (click)="sortProblems('severity')">
+                  Severity <span class="arrow">{{ sortArrow('problems', 'severity') }}</span>
+                </th>
+                <th>Layer</th>
+                <th>Normalised signature</th>
+                <th class="sortable" (click)="sortProblems('module')">
+                  Location <span class="arrow">{{ sortArrow('problems', 'module') }}</span>
+                </th>
+                <th class="sortable" (click)="sortProblems('last_seen')">
+                  Last seen <span class="arrow">{{ sortArrow('problems', 'last_seen') }}</span>
+                </th>
+                <th>Ticket</th>
               </tr>
             </thead>
             <tbody>
@@ -85,18 +101,70 @@ import { FormsModule } from '@angular/forms';
               }
             </tbody>
           </table>
+          @if (problemsPage(); as pg) {
+            <div class="pager">
+              <span>
+                {{ pg.total ? ((pg.pageNumber - 1) * pg.pageSize + 1) : 0 }}&ndash;{{
+                  min(pg.pageNumber * pg.pageSize, pg.total) }} of {{ pg.total }}
+                &middot; sorted by <code>{{ pg.sortBy }}</code>
+              </span>
+              <span class="spacer"></span>
+              <button [disabled]="pg.pageNumber <= 1" (click)="goProblems(pg.pageNumber - 1)">Previous</button>
+              <span class="pageno">{{ pg.pageNumber }} / {{ pg.totalPages || 1 }}</span>
+              <button [disabled]="pg.pageNumber >= pg.totalPages" (click)="goProblems(pg.pageNumber + 1)">Next</button>
+            </div>
+          }
         </section>
       }
 
       @case ('errors') {
         <section class="panel">
           <h2>Error history</h2>
-          <p class="sub">Every captured occurrence, across all layers.</p>
+          <p class="sub">
+            Every captured occurrence, across all layers. Filtering, sorting and paging
+            all happen in SQL &mdash; the browser only ever receives one page.
+          </p>
+          <div class="filters">
+            <input [(ngModel)]="errorFilters.searchText" (keyup.enter)="reloadErrors(1)"
+                   placeholder="search message / type / screen" />
+            <select [(ngModel)]="errorFilters.severity" (change)="reloadErrors(1)">
+              <option [ngValue]="null">All severities</option>
+              @for (sv of severities; track sv) { <option [ngValue]="sv">{{ sv }}</option> }
+            </select>
+            <select [(ngModel)]="errorFilters.layer" (change)="reloadErrors(1)">
+              <option [ngValue]="null">All layers</option>
+              @for (l of layers; track l) { <option [ngValue]="l">{{ l }}</option> }
+            </select>
+            <label class="chk">
+              <input type="checkbox" [(ngModel)]="errorFilters.onlyUnticketed" (change)="reloadErrors(1)" />
+              No ticket yet
+            </label>
+            <select [(ngModel)]="errorFilters.pageSize" (change)="reloadErrors(1)">
+              @for (n of pageSizes; track n) { <option [ngValue]="n">{{ n }} / page</option> }
+            </select>
+          </div>
           <table>
             <thead>
               <tr>
-                <th>Reference</th><th>When</th><th>Sev</th><th>Layer</th><th>Type</th>
-                <th>Message</th><th>Where</th><th>User</th><th>Ticket</th>
+                <th>Reference</th>
+                <th class="sortable" (click)="sortErrors('occurred_desc')">
+                  When <span class="arrow">{{ sortArrow('errors', 'occurred_desc') }}</span>
+                </th>
+                <th class="sortable" (click)="sortErrors('severity')">
+                  Sev <span class="arrow">{{ sortArrow('errors', 'severity') }}</span>
+                </th>
+                <th class="sortable" (click)="sortErrors('layer')">
+                  Layer <span class="arrow">{{ sortArrow('errors', 'layer') }}</span>
+                </th>
+                <th>Type</th>
+                <th>Message</th>
+                <th class="sortable" (click)="sortErrors('module')">
+                  Where <span class="arrow">{{ sortArrow('errors', 'module') }}</span>
+                </th>
+                <th class="sortable" (click)="sortErrors('user')">
+                  User <span class="arrow">{{ sortArrow('errors', 'user') }}</span>
+                </th>
+                <th>Ticket</th>
               </tr>
             </thead>
             <tbody>
@@ -121,6 +189,19 @@ import { FormsModule } from '@angular/forms';
               }
             </tbody>
           </table>
+          @if (errorsPage(); as pg) {
+            <div class="pager">
+              <span>
+                {{ pg.total ? ((pg.pageNumber - 1) * pg.pageSize + 1) : 0 }}&ndash;{{
+                  min(pg.pageNumber * pg.pageSize, pg.total) }} of {{ pg.total }}
+                &middot; sorted by <code>{{ pg.sortBy }}</code>
+              </span>
+              <span class="spacer"></span>
+              <button [disabled]="pg.pageNumber <= 1" (click)="reloadErrors(pg.pageNumber - 1)">Previous</button>
+              <span class="pageno">{{ pg.pageNumber }} / {{ pg.totalPages || 1 }}</span>
+              <button [disabled]="pg.pageNumber >= pg.totalPages" (click)="reloadErrors(pg.pageNumber + 1)">Next</button>
+            </div>
+          }
         </section>
       }
 
@@ -421,6 +502,30 @@ import { FormsModule } from '@angular/forms';
       }
       ol.trail p { margin: 3px 0 0; font-size: 12.5px; }
 
+      th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+      th.sortable:hover { color: #1f2329; }
+      .arrow { color: #2d5bd7; font-weight: 700; }
+
+      .filters { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 11px; align-items: center; }
+      .filters input[type=text], .filters input:not([type]), .filters select {
+        font: inherit; font-size: 12.5px; padding: 6px 9px;
+        border: 1px solid #d0d5dd; border-radius: 6px;
+      }
+      .filters input:not([type]) { min-width: 240px; }
+      .filters .chk { display: flex; align-items: center; gap: 5px; font-size: 12.5px; color: #475467; }
+
+      .pager {
+        display: flex; align-items: center; gap: 9px; margin-top: 11px;
+        padding-top: 10px; border-top: 1px solid #f2f4f7; font-size: 12.5px; color: #667085;
+      }
+      .pager .spacer { flex: 1; }
+      .pager button {
+        font: inherit; font-size: 12.5px; font-weight: 600; background: #fff;
+        border: 1px solid #d0d5dd; border-radius: 6px; padding: 5px 12px; cursor: pointer;
+      }
+      .pager button:disabled { opacity: .45; cursor: default; }
+      .pager .pageno { font-variant-numeric: tabular-nums; font-weight: 600; color: #1f2329; }
+
       @media (max-width: 1100px) {
         .cards { grid-template-columns: repeat(3, 1fr); }
         .split { grid-template-columns: 1fr; }
@@ -442,6 +547,24 @@ export class AdminPage {
   dashboard = signal<any>(null);
   problems = signal<any[]>([]);
   errors = signal<any[]>([]);
+  problemsPage = signal<any>(null);
+  errorsPage = signal<any>(null);
+
+  severities = ['critical', 'high', 'medium', 'low', 'info'];
+  layers = ['angular', 'http', 'webapi', 'business', 'data', 'database'];
+  pageSizes = [10, 25, 50, 100];
+
+  /**
+   * Sort state lives here and travels to the server as a WHITELIST KEY, never
+   * as a column name - the server maps it through its own table, so nothing the
+   * browser sends can reach an ORDER BY clause.
+   */
+  errorSort = 'occurred_desc';
+  problemSort = 'window_count';
+
+  errorFilters: any = {
+    searchText: '', severity: null, layer: null, onlyUnticketed: false, pageSize: 25,
+  };
   tickets = signal<any[]>([]);
   selected = signal<any>(null);
   trail = signal<any[]>([]);
@@ -454,13 +577,79 @@ export class AdminPage {
 
   refresh(): void {
     this.http.get<any>('/api/error-management/admin/dashboard').subscribe((d) => this.dashboard.set(d));
-    this.http.get<any>('/api/error-management/admin/problems').subscribe((d) => this.problems.set(d.items));
-    this.http.get<any>('/api/error-management/admin/errors').subscribe((d) => this.errors.set(d.items));
+    this.goProblems(this.problemsPage()?.pageNumber ?? 1);
+    this.reloadErrors(this.errorsPage()?.pageNumber ?? 1);
     this.http.get<any>('/api/error-management/tickets').subscribe((d) => {
       this.tickets.set(d.items);
       const current = this.selected()?.ticketNumber;
       if (current) this.selectTicket(current);
     });
+  }
+
+  /** Server-side paging: one page requested, one page received. */
+  reloadErrors(page: number): void {
+    const f = this.errorFilters;
+    const params: Record<string, string> = {
+      sortBy: this.errorSort,
+      pageNumber: String(Math.max(1, page)),
+      pageSize: String(f.pageSize),
+    };
+    if (f.searchText?.trim()) params['searchText'] = f.searchText.trim();
+    if (f.severity) params['severity'] = f.severity;
+    if (f.layer) params['layer'] = f.layer;
+    if (f.onlyUnticketed) params['onlyUnticketed'] = 'true';
+
+    this.http
+      .get<any>('/api/error-management/admin/errors', { params })
+      .subscribe((d) => {
+        this.errors.set(d.items);
+        this.errorsPage.set(d);
+      });
+  }
+
+  goProblems(page: number): void {
+    this.http
+      .get<any>('/api/error-management/admin/problems', {
+        params: {
+          sortBy: this.problemSort,
+          pageNumber: String(Math.max(1, page)),
+          pageSize: '25',
+          minOccurrences: '1',
+        },
+      })
+      .subscribe((d) => {
+        this.problems.set(d.items);
+        this.problemsPage.set(d);
+      });
+  }
+
+  /** Clicking the same header twice flips direction where a pair exists. */
+  sortErrors(key: string): void {
+    if (key === 'occurred_desc' && this.errorSort === 'occurred_desc') key = 'occurred_asc';
+    else if (key === 'occurred_desc' && this.errorSort === 'occurred_asc') key = 'occurred_desc';
+    this.errorSort = key;
+    // Back to page 1: staying on page 9 of a re-sorted list shows an
+    // arbitrary slice of a different ordering, which reads as data loss.
+    this.reloadErrors(1);
+  }
+
+  sortProblems(key: string): void {
+    if (key === 'last_seen' && this.problemSort === 'last_seen') key = 'first_seen';
+    else if (key === 'last_seen' && this.problemSort === 'first_seen') key = 'last_seen';
+    this.problemSort = key;
+    this.goProblems(1);
+  }
+
+  sortArrow(list: 'errors' | 'problems', key: string): string {
+    const active = list === 'errors' ? this.errorSort : this.problemSort;
+    if (active === key) return '\u2193';
+    if (key === 'occurred_desc' && active === 'occurred_asc') return '\u2191';
+    if (key === 'last_seen' && active === 'first_seen') return '\u2191';
+    return '';
+  }
+
+  min(a: number, b: number): number {
+    return Math.min(a, b);
   }
 
   selectTicket(ticketNumber: string): void {

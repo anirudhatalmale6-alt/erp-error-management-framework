@@ -173,11 +173,34 @@ app.MapPost("/api/error-management/tickets/{ticketNumber}/status",
 });
 
 // --------------------------------------------------------------- admin/read --
-app.MapGet("/api/error-management/admin/errors", (DemoStore db, string? severity, string? layer)
-    => Results.Json(db.SearchErrors(severity, layer), json));
+// Filtering, sorting and paging are all query parameters handled server-side.
+// The browser never receives more than one page.
+app.MapGet("/api/error-management/admin/errors", (
+        DemoStore db,
+        string? severity, string? layer, string? category, string? erpModule,
+        string? userName, string? correlationId, string? searchText,
+        string? fromUtc, string? toUtc, bool? onlyUnticketed,
+        string? sortBy, int pageNumber = 1, int pageSize = 25)
+    => Results.Json(db.SearchErrors(new ErrorQuery
+    {
+        Severity = severity, Layer = layer, Category = category, ErpModule = erpModule,
+        UserName = userName, CorrelationId = correlationId, SearchText = searchText,
+        FromUtc = fromUtc, ToUtc = toUtc, OnlyUnticketed = onlyUnticketed,
+        SortBy = sortBy, PageNumber = pageNumber, PageSize = pageSize
+    }), json));
 
-app.MapGet("/api/error-management/admin/problems", (DemoStore db)
-    => Results.Json(db.RecurringProblems(), json));
+app.MapGet("/api/error-management/admin/problems", (
+        DemoStore db,
+        string? severity, string? layer, string? erpModule, bool? includeMuted,
+        string? fromUtc, int minOccurrences = 1,
+        string? sortBy = null, int pageNumber = 1, int pageSize = 25)
+    => Results.Json(db.RecurringProblems(new ProblemQuery
+    {
+        Severity = severity, Layer = layer, ErpModule = erpModule,
+        IncludeMuted = includeMuted, FromUtc = fromUtc,
+        MinOccurrences = minOccurrences,
+        SortBy = sortBy, PageNumber = pageNumber, PageSize = pageSize
+    }), json));
 
 app.MapGet("/api/error-management/admin/dashboard", (DemoStore db)
     => Results.Json(db.Dashboard(), json));

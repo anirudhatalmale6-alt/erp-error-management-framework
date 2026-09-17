@@ -1,6 +1,6 @@
 # ERP Error Management Framework — Technical Design
 
-Version 1.1.0 · 16 September 2026
+Version 1.2.0 · 17 September 2026
 
 This document answers the six points the brief explicitly left to the
 freelancer to propose:
@@ -17,7 +17,7 @@ freelancer to propose:
 Answers to the clarification questions of 16 September are in §4.2a (NgModule),
 §4.5 (JWT and public pages), §4.6 (EF6 EDMX / SP executor / EF Core),
 §4.4 (non-throwing failures), §5.3 (swallowed SQL errors) and §13 (ticket
-panels).
+panels). Data loading and production performance are §14.
 
 Everything described here is implemented in this repository, not just proposed.
 §11 lists what is verified and how, and §12 lists the limitations honestly.
@@ -662,7 +662,7 @@ the `RequiresComment` / `RequiresAssignee` flags on each one.
 
 ## 11. What is verified, and how
 
-`dotnet run --project dotnet/Erp.ErrorManagement.Tests` — 77 checks, all
+`dotnet run --project dotnet/Erp.ErrorManagement.Tests` — 91 checks, all
 passing:
 
 * **All six T-SQL scripts parse** against the real SQL Server 2016 grammar,
@@ -691,6 +691,13 @@ passing:
 * **NgModule support** is verified by build, not by assertion:
   `projects/legacy-ngmodule-check` is a real NgModule app that AOT-compiles
   against the built library.
+* **The SQL that the dynamic procedures actually BUILD** is parsed, not just
+  the script that builds it. Every branch combination is expanded and parsed
+  (12 variants across three procedures). Parsing only the outer script would
+  leave a syntax error inside a string literal to be discovered in production.
+  Plus structural assertions that `@SortBy` is never concatenated, that the
+  per-row correlated count is gone, that the correlation trail is bounded, and
+  that every whitelisted sort ends in a unique tiebreaker.
 
 Every group includes a **positive control** — a check that deliberately expects
 the negative result — so a suite that cannot fail cannot pass either.
@@ -794,3 +801,147 @@ The resolution note is withheld until the ticket is actually resolved - a
 half-written note read as a promise is worse than no note - and a closed ticket
 is read-only, because a conversation nobody is watching is worse than a closed
 door.
+
+
+---
+
+## 14. Data loading and production performance
+
+Short answer: **server-side, always.** Filtering, sorting and paging are all
+done in SQL, and the browser never receives more than one page. No list
+endpoint in the framework can return an unbounded result set.
+
+### 14.1 What each read does
+
+| Procedure | Paging | Filtering | Sorting | Bound |
+|---|---|---|---|---|
+| `usp_Error_Search` | OFFSET/FETCH **or keyset** | 20 predicates, all in SQL | 8 whitelisted keys | `@PageSize` ≤ 500 |
+| `usp_Ticket_Search` | OFFSET/FETCH | 15 predicates | 8 whitelisted keys | `@PageSize` ≤ 500 |
+| `usp_Error_RecurringProblems` | OFFSET/FETCH | 5 predicates | 7 whitelisted keys | `@PageSize` ≤ 500 |
+| `usp_Ticket_ListForUser` | OFFSET/FETCH | scoped to the caller | waiting-first, then date | `@PageSize` ≤ 200 |
+| `usp_Ticket_GetDetail` | n/a — one ticket | n/a | n/a | linked occurrences `TOP 200` |
+| `usp_Error_GetCorrelationTrail` | n/a | one correlation id | layer, then time | `TOP (@MaxRows)`, ≤ 1000 |
+| `usp_Dashboard_Summary` | n/a — aggregates | date window | n/a | `TOP 10` per breakdown |
+
+`usp_Error_Search` also defaults to **the last 30 days** when no date filter and
+no specific identifier is supplied. An unbounded default is how a support
+console takes the ERP's SQL Server down on its first day.
+
+### 14.2 Sorting without a SQL-injection hole
+
+Parameterised sorting has two obvious implementations and both are wrong:
+
+* `ORDER BY CASE @SortBy WHEN 'severity' THEN … END` is safe but not sargable,
+  so SQL Server sorts the entire filtered set on every request — discarding the
+  very index that makes the default view fast.
+* Concatenating `@SortBy` into dynamic SQL is fast and is an injection hole, in
+  the one schema that holds every error message in the system.
+
+So the caller's value is used **only as a lookup key** into
+`erp_err.SortWhitelist`. What reaches the `ORDER BY` clause is text I wrote.
+An unrecognised key silently falls back to the default rather than erroring,
+because a stale bookmark should not break the console — and the response
+reports the sort that was **actually applied**, not the one that was asked for.
+
+Every whitelisted clause ends with a unique tiebreaker (`OccurrenceId`,
+`TicketId` or `FingerprintId`). Without one, two rows with equal sort values can
+swap places between page 1 and page 2 — so one row appears twice and another is
+never shown. That is the classic "pagination loses records" bug, and it reads to
+whoever reports it as data loss.
+
+### 14.3 The scale ceiling nobody mentions: OFFSET
+
+`OFFSET 500000 ROWS FETCH NEXT 50` has to walk and discard half a million rows
+before returning anything. Page 3 is instant; page 10,000 of a 40-million-row
+table is a scan.
+
+So `usp_Error_Search` also accepts a **keyset cursor**
+(`@AfterOccurredUtc` + `@AfterOccurrenceId`). The cost of a keyset seek does not
+grow with depth. The trade is that it is next/previous only — you cannot jump to
+page 47 — so both modes exist:
+
+* **OFFSET** for the console, where people filter down and look at the first few
+  pages and want "1–50 of 1,284";
+* **keyset** for infinite scroll and for any programmatic sweep over a large
+  range, where depth is unbounded.
+
+Keyset is only coherent for the default chronological order, because the cursor
+*is* `(OccurredUtc, OccurrenceId)`. Ask for both a cursor and a different sort
+and the sort wins — silently reordering someone's results is worse than
+ignoring a cursor they can re-request.
+
+`@IncludeTotalCount` exists for the same reason. `COUNT(*) OVER ()` is often the
+expensive half of the query on a large filtered set; a console needs the total,
+an infinite-scroll view does not.
+
+### 14.4 The defect this section found
+
+`usp_Error_RecurringProblems` as written in v1.1 was:
+
+```sql
+FROM erp_err.ErrorFingerprint f
+CROSS APPLY (SELECT COUNT_BIG(*), COUNT(DISTINCT o.UserName)
+             FROM erp_err.ErrorOccurrence o
+             WHERE o.FingerprintId = f.FingerprintId
+               AND o.OccurredUtc >= @FromUtc) w
+WHERE w.WindowOccurrences >= @MinOccurrences
+```
+
+That `CROSS APPLY` runs **once per fingerprint** — including for every
+fingerprint with no occurrence in the window at all — and the filter that would
+have eliminated most of them is applied *after* the count. With 4,000
+fingerprints over 40 million occurrences that is 4,000 index seeks, each with
+its own distinct-count sort.
+
+It was fine on demo data and would have fallen over on real data, which is the
+worst kind of defect: nothing reveals it until the table is big and somebody is
+already relying on the screen.
+
+Rewritten to aggregate the window **once**, with the threshold applied during
+aggregation via `HAVING`, then join the result. The cost now tracks the size of
+the *window* rather than the size of the *table*. `db/010`.
+
+Two smaller ones fixed at the same time: `usp_Error_GetCorrelationTrail` had no
+limit at all (a cascading failure can put thousands of rows under one
+correlation id), and it now returns the true total alongside the capped rows so
+a truncated trail is visibly truncated rather than looking complete.
+
+### 14.5 Indexes
+
+`db/010` adds the indexes the new sorts need, because offering a sort with no
+supporting index is how you ship the "fast in the demo, crawls in production"
+failure this section exists to avoid:
+
+| Index | Serves |
+|---|---|
+| `IX_Occurrence_Module_Occurred` | the most common shape: recent errors for one module |
+| `IX_Occurrence_Severity_Occurred` | sort/filter by severity within a window |
+| `IX_Occurrence_Window_Aggregate` | the recurring-problems `GROUP BY` — covering, so no base-table lookup |
+| `IX_Occurrence_Unticketed` (filtered) | the triage inbox; stays small |
+| `IX_Ticket_Open_Created` | oldest-open-first and SLA-breach-first queues |
+| `IX_Ticket_Unassigned` (filtered) | unassigned queue |
+| `IX_Ticket_Reporter_Created` / `…ReporterId…` | "My Tickets" — the only one an ordinary user can trigger, so the one that must never be slow |
+
+All created with existence checks, so `db/010` is safe to re-run on a live
+database. A **columnstore** index on `ErrorOccurrence` would make the dashboard
+aggregates substantially faster and is written out in a comment — not created,
+because it changes the plan for every query in the script and wants testing on
+your data in a maintenance window.
+
+### 14.6 The console UI
+
+The Angular admin console requests one page at a time, with the filters, sort
+key and page number as query parameters, and re-requests on every change. There
+is no client-side filtering or sorting anywhere — which also means there is no
+virtual scrolling to configure, because there is never a large array in the
+browser to virtualise.
+
+Changing the sort returns to page 1. Staying on page 9 of a re-sorted list shows
+an arbitrary slice of a different ordering, which again reads as data loss.
+
+The demo previously took the newest 300 rows and filtered them **in memory**.
+That is worth naming because it is subtly wrong rather than merely slow:
+filtering by severity *after* capping means "show me critical errors" searched
+only the most recent 300 rows, so a critical error from an hour earlier simply
+was not there. Fixed in the demo too — a reference implementation that
+demonstrates the wrong pattern is worse than no reference implementation.

@@ -15,6 +15,38 @@ using Microsoft.Data.Sqlite;
 ///
 /// It is NOT the production store.  See the banner in Program.cs.
 /// </summary>
+public class ErrorQuery
+{
+    public string? Severity { get; set; }
+    public string? Layer { get; set; }
+    public string? Category { get; set; }
+    public string? ErpModule { get; set; }
+    public string? UserName { get; set; }
+    public string? ErrorReference { get; set; }
+    public string? CorrelationId { get; set; }
+    public long? FingerprintId { get; set; }
+    public string? FromUtc { get; set; }
+    public string? ToUtc { get; set; }
+    public string? SearchText { get; set; }
+    public bool? OnlyUnticketed { get; set; }
+    public string? SortBy { get; set; }
+    public int PageNumber { get; set; } = 1;
+    public int PageSize { get; set; } = 50;
+}
+
+public class ProblemQuery
+{
+    public string? FromUtc { get; set; }
+    public int MinOccurrences { get; set; } = 1;
+    public string? Severity { get; set; }
+    public string? Layer { get; set; }
+    public string? ErpModule { get; set; }
+    public bool? IncludeMuted { get; set; }
+    public string? SortBy { get; set; }
+    public int PageNumber { get; set; } = 1;
+    public int PageSize { get; set; } = 50;
+}
+
 public class DemoStore
 {
     private readonly string _connectionString;
@@ -751,43 +783,134 @@ public class DemoStore
         };
     }
 
-    public object SearchErrors(string? severity, string? layer)
+    /// <summary>
+    /// Mirrors usp_Error_Search: filtering, sorting and paging all happen in
+    /// SQL, and only one page ever leaves the database.
+    ///
+    /// The previous version took the newest 300 rows and then filtered them in
+    /// memory with LINQ. That is wrong in a way worth naming: filtering by
+    /// severity AFTER capping means "show me critical errors" searched only the
+    /// most recent 300 rows, so a critical error from an hour ago simply was
+    /// not there. It looked fine on demo data and would have been a support
+    /// console that quietly lies.
+    /// </summary>
+    public object SearchErrors(ErrorQuery q)
     {
         using var c = Open();
-        var rows = Query(c, null, """
+
+        // Whitelisted sort, exactly like erp_err.SortWhitelist - the caller's
+        // value is a lookup key, never concatenated SQL.
+        // Resolve to the EFFECTIVE key, and report that back rather than
+        // echoing what was asked for. Echoing an unrecognised key told the UI
+        // its sort had been applied when it had silently fallen back - the
+        // arrows then pointed at a column the rows were not ordered by.
+        var effectiveSort = ErrorSorts.ContainsKey(q.SortBy ?? "") ? q.SortBy! : "occurred_desc";
+        var orderBy = ErrorSorts[effectiveSort];
+
+        var where = new List<string> { "1=1" };
+        var ps = new List<(string, object?)>();
+
+        void Filter(string sql, string name, object? value)
+        {
+            if (value is null || (value is string sv && string.IsNullOrWhiteSpace(sv))) return;
+            where.Add(sql);
+            ps.Add((name, value));
+        }
+
+        Filter("o.Severity = $sev", "$sev", q.Severity);
+        Filter("o.Layer = $layer", "$layer", q.Layer);
+        Filter("o.Category = $cat", "$cat", q.Category);
+        Filter("o.ErpModule = $mod", "$mod", q.ErpModule);
+        Filter("o.UserName = $user", "$user", q.UserName);
+        Filter("o.ErrorReference = $ref", "$ref", q.ErrorReference);
+        Filter("o.CorrelationId = $corr", "$corr", q.CorrelationId);
+        Filter("f.FingerprintId = $fp", "$fp", q.FingerprintId);
+        Filter("o.OccurredUtc >= $from", "$from", q.FromUtc);
+        Filter("o.OccurredUtc <= $to", "$to", q.ToUtc);
+
+        if (q.OnlyUnticketed == true) where.Add("o.TicketId IS NULL");
+
+        if (!string.IsNullOrWhiteSpace(q.SearchText))
+        {
+            where.Add("(o.Message LIKE $q OR o.ExceptionType LIKE $q OR o.Screen LIKE $q)");
+            ps.Add(("$q", "%" + q.SearchText + "%"));
+        }
+
+        var predicate = string.Join(" AND ", where);
+        var pageSize = Math.Clamp(q.PageSize <= 0 ? 50 : q.PageSize, 1, 500);
+        var page = Math.Max(1, q.PageNumber);
+
+        // The total is a separate COUNT so the page query stays a plain
+        // indexed read. In production this is COUNT(*) OVER () in the same
+        // statement, and it is optional for exactly this reason - it is the
+        // expensive half on a large filtered set.
+        var total = ExecScalarLong(c, null, $"""
+            SELECT COUNT(*) FROM Occurrence o
+            JOIN Fingerprint f ON f.FingerprintId = o.FingerprintId
+            WHERE {predicate}
+            """, ps.ToArray());
+
+        var rows = Query(c, null, $"""
             SELECT o.*, f.FingerprintHash, f.OccurrenceCount, f.DistinctUserCount,
                    f.FirstSeenUtc, f.LastSeenUtc, f.TriageState, f.SignatureText,
                    t.TicketNumber, t.Status AS TicketStatus
             FROM Occurrence o
             JOIN Fingerprint f ON f.FingerprintId = o.FingerprintId
             LEFT JOIN Ticket t ON t.TicketId = o.TicketId
-            ORDER BY o.OccurredUtc DESC, o.OccurrenceId DESC LIMIT 300
-            """);
-
-        var items = rows
-            .Where(r => severity is null || string.Equals(r["Severity"] as string, severity, StringComparison.OrdinalIgnoreCase))
-            .Where(r => layer is null || string.Equals(r["Layer"] as string, layer, StringComparison.OrdinalIgnoreCase))
-            .Select(r => new
+            WHERE {predicate}
+            ORDER BY {orderBy}
+            LIMIT $take OFFSET $skip
+            """, ps.Concat(new (string, object?)[]
             {
-                errorReference = r["ErrorReference"], occurredUtc = r["OccurredUtc"],
-                layer = r["Layer"], category = r["Category"], severity = r["Severity"],
-                exceptionType = r["ExceptionType"], message = r["Message"],
-                erpModule = r["ErpModule"], screen = r["Screen"], component = r["Component"],
-                apiController = r["ApiController"], apiAction = r["ApiAction"],
-                apiEndpoint = r["ApiEndpoint"], httpStatusCode = r["HttpStatusCode"],
-                sqlErrorNumber = r["SqlErrorNumber"], sqlObjectName = r["SqlObjectName"],
-                sqlLineNumber = r["SqlLineNumber"], sqlDatabaseName = r["SqlDatabaseName"],
-                userName = r["UserName"], correlationId = r["CorrelationId"],
-                environment = r["Environment"], browserName = r["BrowserName"],
-                fingerprintHash = ((string?)r["FingerprintHash"])?[..12],
-                fingerprintOccurrenceCount = r["OccurrenceCount"],
-                distinctUserCount = r["DistinctUserCount"],
-                triageState = r["TriageState"],
-                ticketNumber = r["TicketNumber"]
-            }).ToList();
+                ("$take", pageSize), ("$skip", (page - 1) * pageSize)
+            }).ToArray());
 
-        return new { items, total = items.Count };
+        var items = rows.Select(r => new
+        {
+            errorReference = r["ErrorReference"], occurredUtc = r["OccurredUtc"],
+            layer = r["Layer"], category = r["Category"], severity = r["Severity"],
+            exceptionType = r["ExceptionType"], message = r["Message"],
+            erpModule = r["ErpModule"], screen = r["Screen"], component = r["Component"],
+            apiController = r["ApiController"], apiAction = r["ApiAction"],
+            apiEndpoint = r["ApiEndpoint"], httpStatusCode = r["HttpStatusCode"],
+            sqlErrorNumber = r["SqlErrorNumber"], sqlObjectName = r["SqlObjectName"],
+            sqlLineNumber = r["SqlLineNumber"], sqlDatabaseName = r["SqlDatabaseName"],
+            userName = r["UserName"], correlationId = r["CorrelationId"],
+            environment = r["Environment"], browserName = r["BrowserName"],
+            fingerprintHash = ((string?)r["FingerprintHash"])?[..12],
+            fingerprintOccurrenceCount = r["OccurrenceCount"],
+            distinctUserCount = r["DistinctUserCount"],
+            triageState = r["TriageState"],
+            ticketNumber = r["TicketNumber"]
+        }).ToList();
+
+        return new
+        {
+            items,
+            total,
+            pageNumber = page,
+            pageSize,
+            totalPages = (int)Math.Ceiling(total / (double)pageSize),
+            sortBy = effectiveSort
+        };
     }
+
+    /// <summary>Whitelisted sorts. Every one ends in a unique tiebreaker.</summary>
+    private static readonly Dictionary<string, string> ErrorSorts = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["occurred_desc"] = "o.OccurredUtc DESC, o.OccurrenceId DESC",
+        ["occurred_asc"]  = "o.OccurredUtc ASC, o.OccurrenceId ASC",
+        // Severity sorts by RANK, not alphabetically - 'critical' < 'high' is
+        // true as text but meaningless as severity.
+        ["severity"]      = "CASE o.Severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
+                          + "WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END ASC, "
+                          + "o.OccurredUtc DESC, o.OccurrenceId DESC",
+        ["module"]        = "o.ErpModule ASC, o.OccurredUtc DESC, o.OccurrenceId DESC",
+        ["screen"]        = "o.Screen ASC, o.OccurredUtc DESC, o.OccurrenceId DESC",
+        ["user"]          = "o.UserName ASC, o.OccurredUtc DESC, o.OccurrenceId DESC",
+        ["frequency"]     = "f.OccurrenceCount DESC, o.OccurredUtc DESC, o.OccurrenceId DESC",
+        ["layer"]         = "o.Layer ASC, o.OccurredUtc DESC, o.OccurrenceId DESC",
+    };
 
     public object GetErrorDetail(string errorReference)
     {
@@ -832,14 +955,71 @@ public class DemoStore
         };
     }
 
-    public object RecurringProblems()
+    /// <summary>
+    /// Mirrors the rewritten usp_Error_RecurringProblems: the occurrence table
+    /// is aggregated ONCE over the window, then joined - not counted per
+    /// fingerprint row.
+    /// </summary>
+    public object RecurringProblems(ProblemQuery q)
     {
         using var c = Open();
-        var items = Query(c, null, """
-            SELECT f.*, t.TicketNumber AS OpenTicketNumber
-            FROM Fingerprint f LEFT JOIN Ticket t ON t.TicketId = f.OpenTicketId
-            ORDER BY f.OccurrenceCount DESC, f.LastSeenUtc DESC LIMIT 100
-            """).Select(r => new
+
+        var effectiveSort = ProblemSorts.ContainsKey(q.SortBy ?? "") ? q.SortBy! : "window_count";
+        var orderBy = ProblemSorts[effectiveSort];
+
+        var from = q.FromUtc ?? Iso(DateTime.UtcNow.AddDays(-30));
+        var minOcc = q.MinOccurrences <= 0 ? 1 : q.MinOccurrences;
+        var pageSize = Math.Clamp(q.PageSize <= 0 ? 50 : q.PageSize, 1, 500);
+        var page = Math.Max(1, q.PageNumber);
+
+        var where = new List<string> { "1=1" };
+        var ps = new List<(string, object?)> { ("$from", from), ("$minOcc", minOcc) };
+
+        if (!string.IsNullOrWhiteSpace(q.Severity)) { where.Add("f.Severity = $sev"); ps.Add(("$sev", q.Severity)); }
+        if (!string.IsNullOrWhiteSpace(q.Layer))    { where.Add("f.Layer = $layer"); ps.Add(("$layer", q.Layer)); }
+        if (!string.IsNullOrWhiteSpace(q.ErpModule)){ where.Add("f.ErpModule = $mod"); ps.Add(("$mod", q.ErpModule)); }
+        if (q.IncludeMuted != true) where.Add("f.TriageState <> 'muted'");
+
+        var predicate = string.Join(" AND ", where);
+
+        // One grouped pass over the window, with the threshold applied during
+        // aggregation via HAVING.
+        const string winCte = """
+            WITH win AS (
+              SELECT FingerprintId,
+                     COUNT(*) AS WindowOccurrences,
+                     COUNT(DISTINCT UserName) AS WindowDistinctUsers,
+                     MAX(OccurredUtc) AS WindowLastSeenUtc
+              FROM Occurrence
+              WHERE OccurredUtc >= $from
+              GROUP BY FingerprintId
+              HAVING COUNT(*) >= $minOcc
+            )
+            """;
+
+        var total = ExecScalarLong(c, null, $"""
+            {winCte}
+            SELECT COUNT(*) FROM win w
+            JOIN Fingerprint f ON f.FingerprintId = w.FingerprintId
+            WHERE {predicate}
+            """, ps.ToArray());
+
+        var rows = Query(c, null, $"""
+            {winCte}
+            SELECT f.*, w.WindowOccurrences, w.WindowDistinctUsers, w.WindowLastSeenUtc,
+                   t.TicketNumber AS OpenTicketNumber
+            FROM win w
+            JOIN Fingerprint f ON f.FingerprintId = w.FingerprintId
+            LEFT JOIN Ticket t ON t.TicketId = f.OpenTicketId
+            WHERE {predicate}
+            ORDER BY {orderBy}
+            LIMIT $take OFFSET $skip
+            """, ps.Concat(new (string, object?)[]
+            {
+                ("$take", pageSize), ("$skip", (page - 1) * pageSize)
+            }).ToArray());
+
+        var items = rows.Select(r => new
         {
             fingerprintHash = ((string)r["FingerprintHash"]!)[..12],
             signatureText = r["SignatureText"],
@@ -848,13 +1028,36 @@ public class DemoStore
             erpModule = r["ErpModule"], screen = r["Screen"], component = r["Component"],
             sqlObjectName = r["SqlObjectName"], apiEndpoint = r["ApiEndpoint"],
             firstSeenUtc = r["FirstSeenUtc"], lastSeenUtc = r["LastSeenUtc"],
-            occurrenceCount = r["OccurrenceCount"], distinctUserCount = r["DistinctUserCount"],
+            lifetimeOccurrences = r["OccurrenceCount"],
+            distinctUserCount = r["DistinctUserCount"],
+            windowOccurrences = r["WindowOccurrences"],
+            windowDistinctUsers = r["WindowDistinctUsers"],
             triageState = r["TriageState"],
-            openTicketNumber = r["OpenTicketNumber"]
+            openTicketNumber = r["OpenTicketNumber"],
+            // Kept for the existing template binding.
+            occurrenceCount = r["WindowOccurrences"]
         }).ToList();
 
-        return new { items, total = items.Count };
+        return new
+        {
+            items, total, pageNumber = page, pageSize,
+            totalPages = (int)Math.Ceiling(total / (double)pageSize),
+            sortBy = effectiveSort
+        };
     }
+
+    private static readonly Dictionary<string, string> ProblemSorts = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["window_count"]   = "w.WindowOccurrences DESC, f.FingerprintId DESC",
+        ["lifetime_count"] = "f.OccurrenceCount DESC, f.FingerprintId DESC",
+        ["users"]          = "w.WindowDistinctUsers DESC, f.FingerprintId DESC",
+        ["severity"]       = "CASE f.Severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
+                           + "WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END ASC, "
+                           + "w.WindowOccurrences DESC, f.FingerprintId DESC",
+        ["last_seen"]      = "f.LastSeenUtc DESC, f.FingerprintId DESC",
+        ["first_seen"]     = "f.FirstSeenUtc ASC, f.FingerprintId ASC",
+        ["module"]         = "f.ErpModule ASC, w.WindowOccurrences DESC, f.FingerprintId DESC",
+    };
 
     public object Dashboard()
     {
