@@ -46,6 +46,7 @@ namespace Erp.ErrorManagement.Tests
             RunDynamicSqlChecks(Path.Combine(repoRoot, "db"));
             RunSupportAccessChecks(Path.Combine(repoRoot, "db"), repoRoot);
             RunLinkedScamStandardsChecks(Path.Combine(repoRoot, "db"));
+            RunSourceNamingChecks(repoRoot);
 
             Console.WriteLine();
             Console.WriteLine(_failures == 0
@@ -627,6 +628,54 @@ namespace Erp.ErrorManagement.Tests
         /* ======================== support access / manual tickets ======= */
 
         /* ================== LinkedScam ERP standards compliance ========= */
+
+        /// <summary>
+        /// The standards check above reads db/*.sql only, which leaves a gap:
+        /// the application code REFERS to database objects by name, in string
+        /// literals.  A stale `erp_err.usp_Error_Capture` in SqlErrorStore.cs
+        /// parses fine, compiles fine, passes every SQL check - and fails at
+        /// run time, on the capture path, which is the one path built to fail
+        /// silently.  So it would not fail loudly; it would just mean no errors
+        /// were ever recorded.
+        ///
+        /// Hence: scan the C#/TypeScript sources for the old schema name too.
+        /// </summary>
+        private static void RunSourceNamingChecks(string repoRoot)
+        {
+            Console.WriteLine("\n=== Application sources reference the current schema ===");
+
+            var roots = new[] { "dotnet", "angular", "demo", "tools" }
+                .Select(d => Path.Combine(repoRoot, d))
+                .Where(Directory.Exists);
+
+            var sources = roots
+                .SelectMany(r => Directory.GetFiles(r, "*.*", SearchOption.AllDirectories))
+                .Where(f => f.EndsWith(".cs") || f.EndsWith(".ts") || f.EndsWith(".mjs"))
+                .Where(f => !f.Contains("node_modules")
+                         && !f.Contains(Path.DirectorySeparatorChar + "dist" + Path.DirectorySeparatorChar)
+                         && !f.Contains(Path.DirectorySeparatorChar + "obj" + Path.DirectorySeparatorChar)
+                         && !f.Contains(Path.DirectorySeparatorChar + "bin" + Path.DirectorySeparatorChar)
+                         // this file, which names the old schema in order to ban it
+                         && !f.EndsWith("Erp.ErrorManagement.Tests" + Path.DirectorySeparatorChar + "Program.cs"))
+                .OrderBy(f => f)
+                .ToList();
+
+            Check("there are sources to scan", sources.Count > 20, true);
+
+            var stale = sources.Where(f => File.ReadAllText(f).Contains("erp_err"))
+                               .Select(f => f.Substring(repoRoot.Length).TrimStart(Path.DirectorySeparatorChar))
+                               .ToList();
+
+            Check(stale.Count == 0
+                    ? "no source file references the old erp_err schema"
+                    : $"no source file references the old erp_err schema (found in {string.Join(", ", stale)})",
+                stale.Count, 0);
+
+            // POSITIVE CONTROL - the scan must be able to SEE the old name,
+            // otherwise "found none" only proves the scan read nothing.
+            Check("positive control: the scan detects the old name when present",
+                "EXEC erp_err.usp_Error_Capture".Contains("erp_err"), true);
+        }
 
         /// <summary>
         /// Enforce the three LinkedScam standards documents against every

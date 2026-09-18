@@ -39,15 +39,21 @@ config.UseErpErrorManagement(new ErrorCaptureOptions {
 
 **SQL Server** — **[`db/README.md`](db/README.md) is the deployment runbook**:
 script order, the two things to set first, what to watch during Test, and the
-Test → EBS-PROD promotion checklist. Run `db/001` … `db/007` then `db/010` and
-`db/011` once. Every
-object lives in the **`ERM`** schema and follows the LinkedScam ERP standards
-(`ERM.ERM_TableName`, standard `ROWID`/`DBNo`/`AppNo` + audit columns,
-`LS-ERM-TKT-YYMMDD-X` reference codes) — see `docs/ARCHITECTURE.md` §16.
-Set your system user id before go-live:
-`ALTER FUNCTION ERM.fn_SystemUserID() RETURNS INT AS BEGIN RETURN <id> END;` Everything lives in its own
-`erp_err` schema; no existing object is read, altered or dropped. (`008` and
-`009` are optional add-ons — see `docs/ARCHITECTURE.md` §5.3.)
+Test → EBS-PROD promotion checklist. Run `db/001` … `db/007`, then `db/010` and
+`db/011`, once.
+
+Every object lives in the **`ERM`** schema and follows the LinkedScam ERP
+standards (`ERM.ERM_TableName`, standard `ROWID`/`DBNo`/`AppNo` + audit columns,
+`LS-ERM-TKT-YYMMDD-X` reference codes) — see `docs/ARCHITECTURE.md` §16. No
+existing ERP object is read, altered or dropped by any script. Set your system
+user id before go-live:
+
+```sql
+ALTER FUNCTION ERM.fn_SystemUserID() RETURNS INT AS BEGIN RETURN <id> END;
+```
+
+(`008` and `009` are optional add-ons, not part of the default install — see
+`docs/ARCHITECTURE.md` §5.3.)
 
 **Legacy NgModule apps** — the same `provideErpErrorManagement(...)` goes in
 `AppModule.providers`, plus `ErpLegacyHttpErrorInterceptor` via
@@ -85,7 +91,7 @@ dotnet/
   Erp.ErrorManagement.Core/        netstandard2.0 — shared by BOTH stacks
   Erp.ErrorManagement.WebApi2/     net472 — Web API 2 integration
   Erp.ErrorManagement.AspNetCore/  net8.0 — for future modules
-  Erp.ErrorManagement.Tests/       143 verification checks (see below)
+  Erp.ErrorManagement.Tests/       146 verification checks (see below)
 
 demo/api/               runnable demo API (SQLite — a harness, not the product)
 docs/ARCHITECTURE.md    the technical design
@@ -101,7 +107,7 @@ tools/                  cross-language fingerprint verification
 dotnet run --project dotnet/Erp.ErrorManagement.Tests
 ```
 
-143 checks, covering:
+146 checks, covering:
 
 * every T-SQL script parsing against the **real SQL Server 2016 grammar**
   (Microsoft's `ScriptDom` — the parser SSMS and sqlpackage use);
@@ -121,6 +127,9 @@ dotnet run --project dotnet/Erp.ErrorManagement.Tests
 * **the LinkedScam standards** — no `erp_err` anywhere, every table
   `ERM.ERM_*`, all nine standard columns present and in order, the reference
   format, and the atomic (non-racing) counter;
+* the same naming check across the **C# and TypeScript sources**, not just the
+  SQL — application code names database objects in string literals, and a stale
+  one there would fail only at run time, on the deliberately silent capture path;
 * support-console authorisation failing **closed**, every admin action carrying
   a capability gate, and the acting user coming from the token rather than the
   request body.
@@ -167,7 +176,7 @@ their own tickets.
 
 `demo/api` is a **demonstration harness**. It re-implements the stored-procedure
 logic over SQLite so the framework can be seen working on a laptop. Production
-persists through `erp_err.usp_Error_Capture` on SQL Server. The banner at the
+persists through `ERM.usp_Error_Capture` on SQL Server. The banner at the
 top of `demo/api/Program.cs` says the same thing.
 
 ---

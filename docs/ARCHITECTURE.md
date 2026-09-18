@@ -69,7 +69,7 @@ is what §6 is about.
    │   ├ form/LOV helper          │  └ IExceptionHandler        │
    │   ├ fingerprint (TS)         │        │                    │
    │   ├ redaction (allow-list)   │  Erp.ErrorManagement.Core   │
-   │   ├ offline queue + beacon   │   ├ fingerprint (C#)  ──────┼──►  erp_err schema
+   │   ├ offline queue + beacon   │   ├ fingerprint (C#)  ──────┼──►  ERM schema
    │   └ dialog + ticket flow     │   ├ redaction               │      ├ tables
    │                              │   ├ classifier              │      ├ procedures
    └──────────────────────────────┘   └ SqlErrorStore  ─────────┼──►   └ retention job
@@ -200,7 +200,7 @@ builder.Services.AddErpErrorManagement(o => { o.ConnectionString = …; });
 app.UseErpErrorManagement();   // first, so it wraps everything below
 ```
 
-Same Core assembly, same envelope, same `erp_err` schema. A fault reported by a
+Same Core assembly, same envelope, same `ERM` schema. A fault reported by a
 new .NET 8 module lands on the **same fingerprint row** as the same fault
 reported by the legacy API.
 
@@ -302,7 +302,7 @@ user. The endpoint table:
 
 **The consequence nobody asks about until later:** an anonymous capture endpoint
 means anyone who can reach the ERP can write rows into the error store, at any
-rate. Left open that fills the store with junk, grows `erp_err` until it affects
+rate. Left open that fills the store with junk, grows `ERM` until it affects
 the ERP database it shares a disk with, and stays unnoticed for weeks because
 capture failures are deliberately quiet. So anonymous capture is **rate-limited
 per client IP** (token bucket, 60/min burst 20 by default). Authenticated
@@ -366,13 +366,13 @@ observes the exception that comes back out.
 
 ### 5.1 Isolation
 
-Everything lives in a dedicated `erp_err` schema. No existing table, view,
+Everything lives in a dedicated `ERM` schema. No existing table, view,
 procedure, function, trigger, user or role is read, altered or dropped by any
 script in `db/`. The application login needs one grant:
 
 ```sql
-GRANT EXECUTE ON SCHEMA::erp_err TO [erp_app];
-DENY SELECT, INSERT, UPDATE, DELETE ON SCHEMA::erp_err TO [erp_app];
+GRANT EXECUTE ON SCHEMA::ERM TO [erp_app];
+DENY SELECT, INSERT, UPDATE, DELETE ON SCHEMA::ERM TO [erp_app];
 ```
 
 EXECUTE only. The application cannot read the error store directly, so a
@@ -437,7 +437,7 @@ Two details that matter in practice:
 procedure's own `TRY/CATCH` is invisible to everything outside that procedure —
 no framework can see it without editing the procedure. If you need those too,
 the option is a server-side Extended Events session on `error_reported` filtered
-to severity ≥ 16, shipped into `erp_err` by a scheduled job. That is additive
+to severity ≥ 16, shipped into `ERM` by a scheduled job. That is additive
 and needs no procedure changes either, but it is not enabled by default because
 it has a (small) standing cost on the instance and most shops will not want it.
 
@@ -464,10 +464,10 @@ two years (§7).
 ### 5.5 Multiple schemas, multiple applications
 
 The brief mentions modules that share a SQL Server instance but use different
-schemas. Nothing in `erp_err` assumes a schema: `ApiApplication`,
+schemas. Nothing in `ERM` assumes a schema: `ApiApplication`,
 `SqlSchemaName`, `SqlDatabaseName`, `TenantId` and `Environment` are columns on
 the occurrence, and every search procedure filters on them. Three applications
-across three schemas write to one `erp_err` and the console can show them
+across three schemas write to one `ERM` and the console can show them
 together or separately.
 
 ---
@@ -554,7 +554,7 @@ Two-stage, configuration-driven, batched:
 hot table ──(ArchiveAfterDays)──► *_Archive ──(PurgeAfterDays)──► gone
 ```
 
-Shipped defaults, all rows in `erp_err.RetentionPolicy`:
+Shipped defaults, all rows in `ERM.ERM_RetentionPolicy`:
 
 | Data set | Archive after | Purge after | Rationale |
 |---|---|---|---|
@@ -594,7 +594,7 @@ and copied into every ticket export. You find out during an audit.
 An allow-list fails the other way: an unclassified field shows up as `***` and
 someone asks for it to be added. That is a support ticket, not a breach.
 
-The allow-list lives in `erp_err.RedactionAllowList`, so extending it is a row,
+The allow-list lives in `ERM.ERM_RedactionAllowList`, so extending it is a row,
 not a front-end release.
 
 Underneath the allow-list sits a **backstop sweep** over all free text —
@@ -656,7 +656,7 @@ week of real data — and a real answer to "how noisy is this?" — before any u
 sees a dialog. Then deploy the front end with `notificationMode: 'silent'`, look
 at what arrives, and only then turn the dialog on.
 
-The master switch `capture.enabled` in `erp_err.Setting` turns the whole thing
+The master switch `capture.enabled` in `ERM.ERM_Setting` turns the whole thing
 off without a deployment, and takes effect within `config.cacheSeconds`.
 
 ---
@@ -678,7 +678,7 @@ the `RequiresComment` / `RequiresAssignee` flags on each one.
 
 ## 11. What is verified, and how
 
-`dotnet run --project dotnet/Erp.ErrorManagement.Tests` — 143 checks, all
+`dotnet run --project dotnet/Erp.ErrorManagement.Tests` — 146 checks, all
 passing:
 
 * **All six T-SQL scripts parse** against the real SQL Server 2016 grammar,
@@ -854,7 +854,7 @@ Parameterised sorting has two obvious implementations and both are wrong:
   the one schema that holds every error message in the system.
 
 So the caller's value is used **only as a lookup key** into
-`erp_err.SortWhitelist`. What reaches the `ORDER BY` clause is text I wrote.
+`ERM.ERM_SortWhitelist`. What reaches the `ORDER BY` clause is text I wrote.
 An unrecognised key silently falls back to the default rather than erroring,
 because a stale bookmark should not break the console — and the response
 reports the sort that was **actually applied**, not the one that was asked for.
@@ -975,7 +975,7 @@ Two layers, and it matters which one is which.
 validates a token itself — a second validator is a second place to get signing
 keys, clock skew and issuer checks wrong, and it could disagree with yours.
 
-**Authorisation** is `ErpAdminAuthorizationFilter` plus the `erp_err` support
+**Authorisation** is `ErpAdminAuthorizationFilter` plus the `ERM` support
 roster. Every action on `AdminController` carries a
 `[RequiresSupport(capability)]` attribute, and the filter resolves the caller
 and checks that specific capability.
@@ -1081,7 +1081,7 @@ request and the schema could not represent it.
 a `CHECK` constraint so a ticket is one or the other and never neither.
 
 The end user gets **+ New issue** on My Tickets, with a category list that is
-rows in `erp_err.RequestCategory` rather than a hard-coded enum. Support can
+rows in `ERM.ERM_RequestCategory` rather than a hard-coded enum. Support can
 raise one on a user's behalf — a phone call — via
 `POST admin/tickets/on-behalf`, and the ticket is owned by **the user**, so it
 appears in their My Tickets rather than the agent's.

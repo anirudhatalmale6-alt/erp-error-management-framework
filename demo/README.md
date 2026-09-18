@@ -96,7 +96,7 @@ My issues and answer it.
 * ownership enforcement on the end-user panel.
 
 **Not real** — the storage. Production persists through
-`erp_err.usp_Error_Capture` on SQL Server (`db/004_programmability.sql`). This
+`ERM.usp_Error_Capture` on SQL Server (`db/004_programmability.sql`). This
 demo re-implements that logic over SQLite so it needs no database server. The
 SQLite code is a **mirror** of the T-SQL, not a substitute for it: the T-SQL is
 the deliverable, and it is verified separately by the ScriptDom parse in
