@@ -15,7 +15,7 @@
  * '***' and someone asks for it to be added.  That is a support ticket, not a
  * breach.
  *
- * The allow-list itself lives in erp_err.RedactionAllowList so it can be
+ * The allow-list itself lives in ERM.ERM_RedactionAllowList so it can be
  * extended without a front-end release.
  */
 

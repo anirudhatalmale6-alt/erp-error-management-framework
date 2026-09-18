@@ -19,7 +19,7 @@ import { ErpErrorCategory, ErpErrorLayer } from '../models/error-envelope';
  * Volatile:  ids, GUIDs, dates, quoted literals, numbers, file paths, line and
  *            column numbers, minified bundle hashes, user names, timestamps.
  *
- * The signature text is stored next to the hash in erp_err.ErrorFingerprint, so
+ * The signature text is stored next to the hash in ERM.ERM_ErrorFingerprint, so
  * an administrator can always see WHY two errors were grouped - a hash nobody
  * can explain is a hash nobody will trust.
  *

@@ -23,16 +23,16 @@ GO
 /* -----------------------------------------------------------------------------
    Ownership predicate, in one place.
 
-   Matching on EITHER UserId OR UserName, because which one is populated depends
+   Matching on EITHER UserID OR UserName, because which one is populated depends
    on what the JWT carried at the moment the ticket was raised, and that can
    change across a token format migration.  A ticket raised last year may have
-   only a UserName; one raised today may have both.  Requiring UserId would
+   only a UserName; one raised today may have both.  Requiring UserID would
    silently hide a user's own older tickets from them.
    ----------------------------------------------------------------------------- */
-CREATE OR ALTER FUNCTION erp_err.fn_UserOwnsTicket
+CREATE OR ALTER FUNCTION ERM.fn_UserOwnsTicket
 (
-    @TicketId   BIGINT,
-    @UserId     NVARCHAR(128),
+    @ERM_TicketID   BIGINT,
+    @UserID     NVARCHAR(128),
     @UserName   NVARCHAR(200)
 )
 RETURNS BIT
@@ -40,12 +40,12 @@ AS
 BEGIN
     /* No identity supplied = owns nothing.  An anonymous caller must never
        satisfy this, whatever the ticket looks like. */
-    IF @UserId IS NULL AND @UserName IS NULL RETURN 0;
+    IF @UserID IS NULL AND @UserName IS NULL RETURN 0;
 
     IF EXISTS (
-        SELECT 1 FROM erp_err.Ticket t
-        WHERE t.TicketId = @TicketId
-          AND (   (@UserId   IS NOT NULL AND t.ReportedByUserId   = @UserId)
+        SELECT 1 FROM ERM.ERM_Ticket t
+        WHERE t.ERM_TicketID = @ERM_TicketID
+          AND (   (@UserID   IS NOT NULL AND t.ReportedByUserID   = @UserID)
                OR (@UserName IS NOT NULL AND t.ReportedByUserName = @UserName))
     )
         RETURN 1;
@@ -60,11 +60,11 @@ GO
    Adds AwaitingYourReply, which is what makes the panel actionable rather than
    informational: it tells the user that support is blocked on THEM.  Derived
    from the ticket sitting in a paused status, which is exactly what
-   "Waiting for Information" is flagged as in erp_err.TicketStatus.
+   "Waiting for Information" is flagged as in ERM.ERM_TicketStatus.
    ============================================================================= */
-CREATE OR ALTER PROCEDURE erp_err.usp_Ticket_ListForUser
+CREATE OR ALTER PROCEDURE ERM.usp_Ticket_ListForUser
 (
-    @UserId     NVARCHAR(128) = NULL,
+    @UserID     NVARCHAR(128) = NULL,
     @UserName   NVARCHAR(200) = NULL,
     @OnlyOpen   BIT = 0,
     @PageNumber INT = 1,
@@ -79,7 +79,7 @@ BEGIN
 
     /* No identity, no rows.  Deliberately not an error: an unauthenticated
        caller asking for "my tickets" has none, which is a valid answer. */
-    IF @UserId IS NULL AND @UserName IS NULL RETURN;
+    IF @UserID IS NULL AND @UserName IS NULL RETURN;
 
     SELECT t.TicketNumber, t.Title,
            st.Code AS StatusCode, st.DisplayName AS StatusName, st.IsOpen,
@@ -92,14 +92,14 @@ BEGIN
               column, because the user does not care which table it lived in. */
            (SELECT TOP 1 x.Note FROM (
                 SELECT h.Comments AS Note, h.ChangedUtc AS At
-                FROM erp_err.TicketStatusHistory h
-                WHERE h.TicketId = t.TicketId
+                FROM ERM.ERM_TicketStatusHistory h
+                WHERE h.ERM_TicketID = t.ERM_TicketID
                   AND h.IsCustomerVisible = 1
                   AND h.Comments IS NOT NULL
                 UNION ALL
                 SELECT c.CommentText, c.CreatedUtc
-                FROM erp_err.TicketComment c
-                WHERE c.TicketId = t.TicketId
+                FROM ERM.ERM_TicketComment c
+                WHERE c.ERM_TicketID = t.ERM_TicketID
                   AND c.IsCustomerVisible = 1
                   AND c.AuthorRole <> N'reporter'
             ) x ORDER BY x.At DESC) AS LatestUpdate,
@@ -108,10 +108,10 @@ BEGIN
            CONVERT(BIT, CASE WHEN st.IsPaused = 1 THEN 1 ELSE 0 END) AS AwaitingYourReply,
 
            COUNT(*) OVER () AS TotalRowCount
-    FROM erp_err.Ticket t
-    JOIN erp_err.TicketStatus st ON st.StatusId = t.StatusId
-    JOIN erp_err.Severity     sv ON sv.SeverityId = t.SeverityId
-    WHERE ((@UserId   IS NOT NULL AND t.ReportedByUserId   = @UserId)
+    FROM ERM.ERM_Ticket t
+    JOIN ERM.ERM_TicketStatus st ON st.StatusID = t.StatusID
+    JOIN ERM.ERM_Severity     sv ON sv.SeverityID = t.SeverityID
+    WHERE ((@UserID   IS NOT NULL AND t.ReportedByUserID   = @UserID)
         OR (@UserName IS NOT NULL AND t.ReportedByUserName = @UserName))
       AND (@OnlyOpen = 0 OR st.IsOpen = 1)
     ORDER BY
@@ -135,23 +135,23 @@ GO
    read any ticket by number.  This procedure enforces ownership first and
    returns nothing at all if the check fails.
    ============================================================================= */
-CREATE OR ALTER PROCEDURE erp_err.usp_Ticket_GetForUser
+CREATE OR ALTER PROCEDURE ERM.usp_Ticket_GetForUser
 (
-    @TicketNumber VARCHAR(24),
-    @UserId       NVARCHAR(128) = NULL,
+    @TicketNumber VARCHAR(30),
+    @UserID       NVARCHAR(128) = NULL,
     @UserName     NVARCHAR(200) = NULL
 )
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @TicketId BIGINT =
-        (SELECT TicketId FROM erp_err.Ticket WHERE TicketNumber = @TicketNumber);
+    DECLARE @ERM_TicketID BIGINT =
+        (SELECT ERM_TicketID AS TicketId FROM ERM.ERM_Ticket WHERE TicketNumber = @TicketNumber);
 
     /* Not found and not yours return the same thing: nothing.  The caller
        cannot tell them apart, which is the point. */
-    IF @TicketId IS NULL RETURN;
-    IF erp_err.fn_UserOwnsTicket(@TicketId, @UserId, @UserName) = 0 RETURN;
+    IF @ERM_TicketID IS NULL RETURN;
+    IF ERM.fn_UserOwnsTicket(@ERM_TicketID, @UserID, @UserName) = 0 RETURN;
 
     /* ---- 1: header, end-user fields only -------------------------------- */
     SELECT
@@ -180,17 +180,17 @@ BEGIN
         /* A closed ticket is read-only.  Letting a user comment on it would
            create a conversation nobody is watching. */
         CONVERT(BIT, CASE WHEN st.IsTerminal = 1 THEN 0 ELSE 1 END) AS CanComment
-        /* Deliberately NOT selected: AssignedToUserName, FingerprintId,
+        /* Deliberately NOT selected: AssignedToUserName, ERM_ErrorFingerprintID,
            SlaFirstResponseBreached, SlaResolutionBreached, TotalElapsedMinutes,
            ActiveProcessingMinutes, ReopenCount, LinkedOccurrenceCount, Queue.
            SLA breach and elapsed metrics in particular are internal
            performance data; showing a user that their ticket has breached its
            SLA invites a conversation support has not agreed to have. */
-    FROM erp_err.Ticket t
-    JOIN erp_err.TicketStatus st ON st.StatusId = t.StatusId
-    JOIN erp_err.Severity     sv ON sv.SeverityId = t.SeverityId
-    LEFT JOIN erp_err.ErrorOccurrence o ON o.OccurrenceId = t.OccurrenceId
-    WHERE t.TicketId = @TicketId;
+    FROM ERM.ERM_Ticket t
+    JOIN ERM.ERM_TicketStatus st ON st.StatusID = t.StatusID
+    JOIN ERM.ERM_Severity     sv ON sv.SeverityID = t.SeverityID
+    LEFT JOIN ERM.ERM_ErrorOccurrence o ON o.ERM_ErrorOccurrenceID = t.ERM_ErrorOccurrenceID
+    WHERE t.ERM_TicketID = @ERM_TicketID;
 
     /* ---- 2: customer-visible status history ----------------------------- */
     SELECT h.SequenceNo,
@@ -199,9 +199,9 @@ BEGIN
            h.Comments
            /* ChangedByUserName omitted: which support engineer touched the
               ticket is internal. */
-    FROM erp_err.TicketStatusHistory h
-    JOIN erp_err.TicketStatus ts ON ts.StatusId = h.ToStatusId
-    WHERE h.TicketId = @TicketId
+    FROM ERM.ERM_TicketStatusHistory h
+    JOIN ERM.ERM_TicketStatus ts ON ts.StatusID = h.ToStatusID
+    WHERE h.ERM_TicketID = @ERM_TicketID
       AND h.IsCustomerVisible = 1
     ORDER BY h.SequenceNo;
 
@@ -213,8 +213,8 @@ BEGIN
                 ELSE N'Support' END AS AuthorName,
            c.CommentText,
            c.CreatedUtc
-    FROM erp_err.TicketComment c
-    WHERE c.TicketId = @TicketId
+    FROM ERM.ERM_TicketComment c
+    WHERE c.ERM_TicketID = @ERM_TicketID
       AND c.IsCustomerVisible = 1
     ORDER BY c.CreatedUtc;
 END
@@ -229,10 +229,10 @@ GO
    Returns the number of rows written: 1 on success, 0 if the ticket is not
    theirs or is closed.  The caller cannot distinguish those two, by design.
    ============================================================================= */
-CREATE OR ALTER PROCEDURE erp_err.usp_Ticket_AddUserComment
+CREATE OR ALTER PROCEDURE ERM.usp_Ticket_AddUserComment
 (
-    @TicketNumber VARCHAR(24),
-    @UserId       NVARCHAR(128) = NULL,
+    @TicketNumber VARCHAR(30),
+    @UserID       NVARCHAR(128) = NULL,
     @UserName     NVARCHAR(200) = NULL,
     @CommentText  NVARCHAR(MAX)
 )
@@ -247,19 +247,19 @@ BEGIN
         RETURN;
     END
 
-    DECLARE @TicketId BIGINT =
-        (SELECT TicketId FROM erp_err.Ticket WHERE TicketNumber = @TicketNumber);
+    DECLARE @ERM_TicketID BIGINT =
+        (SELECT ERM_TicketID AS TicketId FROM ERM.ERM_Ticket WHERE TicketNumber = @TicketNumber);
 
-    IF @TicketId IS NULL OR erp_err.fn_UserOwnsTicket(@TicketId, @UserId, @UserName) = 0
+    IF @ERM_TicketID IS NULL OR ERM.fn_UserOwnsTicket(@ERM_TicketID, @UserID, @UserName) = 0
     BEGIN
         SELECT 0 AS RowsWritten;
         RETURN;
     END
 
     DECLARE @IsTerminal BIT =
-        (SELECT st.IsTerminal FROM erp_err.Ticket t
-         JOIN erp_err.TicketStatus st ON st.StatusId = t.StatusId
-         WHERE t.TicketId = @TicketId);
+        (SELECT st.IsTerminal FROM ERM.ERM_Ticket t
+         JOIN ERM.ERM_TicketStatus st ON st.StatusID = t.StatusID
+         WHERE t.ERM_TicketID = @ERM_TicketID);
 
     IF @IsTerminal = 1
     BEGIN
@@ -271,10 +271,10 @@ BEGIN
 
     BEGIN TRANSACTION;
 
-        INSERT erp_err.TicketComment
-            (TicketId, AuthorUserId, AuthorUserName, AuthorRole, CommentText, IsCustomerVisible, CreatedUtc)
+        INSERT ERM.ERM_TicketComment
+            (ERM_TicketID, AuthorUserID, AuthorUserName, AuthorRole, CommentText, IsCustomerVisible, CreatedUtc)
         VALUES
-            (@TicketId, @UserId, @UserName, N'reporter', @CommentText, 1, @Now);
+            (@ERM_TicketID, @UserID, @UserName, N'reporter', @CommentText, 1, @Now);
 
         /* A reply from the user un-blocks support.  Moving the ticket out of
            the paused status automatically is the difference between a queue
@@ -288,23 +288,23 @@ BEGIN
            are for a support-driven change.  If the configured workflow does
            not allow waiting_info -> in_progress, this is skipped rather than
            forced: the workflow is the authority, not this procedure. */
-        DECLARE @StatusId TINYINT = (SELECT StatusId FROM erp_err.Ticket WHERE TicketId = @TicketId);
+        DECLARE @StatusID TINYINT = (SELECT StatusID FROM ERM.ERM_Ticket WHERE ERM_TicketID = @ERM_TicketID);
         DECLARE @PausedNow BIT =
-            (SELECT IsPaused FROM erp_err.TicketStatus WHERE StatusId = @StatusId);
+            (SELECT IsPaused FROM ERM.ERM_TicketStatus WHERE StatusID = @StatusID);
 
         IF @PausedNow = 1
         BEGIN
             DECLARE @InProgressId TINYINT =
-                (SELECT StatusId FROM erp_err.TicketStatus WHERE Code = N'in_progress' AND IsActive = 1);
+                (SELECT StatusID FROM ERM.ERM_TicketStatus WHERE Code = N'in_progress' AND IsActive = 1);
 
             IF @InProgressId IS NOT NULL
-               AND EXISTS (SELECT 1 FROM erp_err.TicketStatusTransition
-                           WHERE FromStatusId = @StatusId AND ToStatusId = @InProgressId AND IsActive = 1)
+               AND EXISTS (SELECT 1 FROM ERM.ERM_TicketStatusTransition
+                           WHERE FromStatusID = @StatusID AND ToStatusID = @InProgressId AND IsActive = 1)
             BEGIN
-                EXEC erp_err.usp_Ticket_ChangeStatus
-                     @TicketId          = @TicketId,
-                     @ToStatusId        = @InProgressId,
-                     @ChangedByUserId   = @UserId,
+                EXEC ERM.usp_Ticket_ChangeStatus
+                     @ERM_TicketID          = @ERM_TicketID,
+                     @ToStatusID        = @InProgressId,
+                     @ChangedByUserID   = @UserID,
                      @ChangedByUserName = @UserName,
                      @Comments          = N'Reporter replied with the requested information.',
                      @IsCustomerVisible = 1;
@@ -317,7 +317,7 @@ BEGIN
 END
 GO
 
-MERGE erp_err.SchemaVersion AS t
+MERGE ERM.ERM_SchemaVersion AS t
 USING (SELECT N'007_end_user_ticket_access.sql' AS ScriptName) AS s
     ON t.ScriptName = s.ScriptName
 WHEN NOT MATCHED THEN

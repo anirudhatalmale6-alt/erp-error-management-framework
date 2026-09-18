@@ -8,15 +8,171 @@ SET ANSI_NULLS ON;
 SET QUOTED_IDENTIFIER ON;
 GO
 
-/* --------------------------------------------------------------- numbering */
-/* Human-facing reference numbers.  A SEQUENCE (not IDENTITY, not MAX()+1) so
-   the number can be reserved inside the same transaction that writes the row
-   without serialising writers or leaving gaps that matter.                    */
-IF NOT EXISTS (SELECT 1 FROM sys.sequences WHERE object_id = OBJECT_ID(N'erp_err.ErrorNumberSeq'))
-    CREATE SEQUENCE erp_err.ErrorNumberSeq  AS BIGINT START WITH 1 INCREMENT BY 1 CACHE 50;
+/* =============================================================================
+   REFERENCE CODE GENERATION - LinkedScam standard
+   -----------------------------------------------------------------------------
+        Ticket:  LS-ERM-TKT-YYMMDD-X
+        Error:   LS-ERM-ERR-YYMMDD-X
+
+   X restarts at 1 whenever the date changes, and the ticket and error counters
+   are independent.
+
+   WHY THIS IS NOT A SEQUENCE
+   --------------------------
+   The previous implementation used a SQL Server SEQUENCE. A sequence is ideal
+   for a monotonic number - but it cannot reset daily, so it cannot produce this
+   format at all.
+
+   WHY IT IS NOT SELECT MAX(...) + 1
+   ---------------------------------
+   The obvious replacement is to read the highest counter for today and add one.
+   That is a read followed by a write, and two sessions doing it at the same
+   moment both read the same value and both write the same reference. Under
+   NOLOCK-ish default isolation this is not a rare race: error capture is
+   bursty by nature - one bad deployment produces hundreds of errors in the same
+   second, from different users, across several application instances. This is
+   exactly the case the standard's point 7 calls out.
+
+   WHAT THIS DOES INSTEAD
+   ----------------------
+   One row per (type, date) holding the last value used, and a SINGLE atomic
+   UPDATE that increments and returns the new value in the same statement:
+
+       UPDATE ... SET LastValue = LastValue + 1
+       OUTPUT inserted.LastValue INTO @claimed
+       WHERE RefType = @t AND RefDate = @d;
+
+   The UPDATE takes an exclusive lock on the row for its duration, so two
+   concurrent callers are serialised by the engine and each receives a distinct
+   value. There is no window between reading and writing, because there is no
+   read.
+
+   The only remaining race is the FIRST reference of a given day, when the row
+   does not exist yet and two sessions both try to create it. That is settled by
+   the primary key: one INSERT wins, the loser catches the duplicate-key error
+   and re-runs the UPDATE, which now finds the row. A retry loop is used rather
+   than SERIALIZABLE + MERGE because MERGE under concurrency has its own
+   well-documented deadlock behaviour, and this path executes at most once per
+   type per day.
+
+   The uniqueness is therefore guaranteed by the database, not by application
+   timing - which is what the standard requires.
+   ============================================================================= */
+
+IF OBJECT_ID(N'ERM.ERM_ReferenceCounter', N'U') IS NULL
+BEGIN
+    CREATE TABLE ERM.ERM_ReferenceCounter
+    (
+        [ROWID]       UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_ReferenceCounter_ROWID DEFAULT (NEWID()),
+        [DBNo]        INT              NOT NULL CONSTRAINT DF_ReferenceCounter_DBNo  DEFAULT (1),
+        [AppNo]       INT              NOT NULL CONSTRAINT DF_ReferenceCounter_AppNo DEFAULT (1),
+
+        ERM_ReferenceCounterID INT      IDENTITY(1,1) NOT NULL,
+        /* 'TKT' or 'ERR'. CHAR(3) because the standard fixes both at three. */
+        RefType       CHAR(3)          NOT NULL,
+        /* DATE, not DATETIME: the counter is per calendar day and a time
+           component would silently create a new counter every millisecond. */
+        RefDate       DATE             NOT NULL,
+        LastValue     INT              NOT NULL CONSTRAINT DF_ReferenceCounter_Last DEFAULT (0),
+
+        /* ---- standard LinkedScam audit / status columns ---- */
+        [IsActive]    BIT      NOT NULL CONSTRAINT DF_ReferenceCounter_IsActive  DEFAULT (1),
+        [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_ReferenceCounter_IsDeleted DEFAULT (0),
+        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_ReferenceCounter_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_ReferenceCounter_CreatedDate DEFAULT (GETUTCDATE()),
+        [UpdatedBy]   INT      NULL,
+        [UpdatedDate] DATETIME NULL,
+
+        CONSTRAINT PK_ReferenceCounter PRIMARY KEY CLUSTERED (RefType, RefDate),
+        CONSTRAINT UQ_ReferenceCounter_ID UNIQUE (ERM_ReferenceCounterID)
+    );
+END
 GO
-IF NOT EXISTS (SELECT 1 FROM sys.sequences WHERE object_id = OBJECT_ID(N'erp_err.TicketNumberSeq'))
-    CREATE SEQUENCE erp_err.TicketNumberSeq AS BIGINT START WITH 1 INCREMENT BY 1 CACHE 50;
+
+/* -----------------------------------------------------------------------------
+   usp_NextReference
+   -----------------------------------------------------------------------------
+   Returns the next reference for a type, formatted to the standard.
+
+   Called from inside the capture and ticket transactions. It deliberately does
+   NOT open its own transaction: it must enlist in the caller's, so that a
+   rolled-back capture does not leave a consumed counter value behind. Gaps
+   would not break anything, but they would make the numbers confusing to audit.
+   ----------------------------------------------------------------------------- */
+CREATE OR ALTER PROCEDURE ERM.usp_NextReference
+(
+    @RefType   CHAR(3),            -- 'TKT' | 'ERR'
+    @Reference VARCHAR(30) OUTPUT
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF @RefType NOT IN ('TKT', 'ERR')
+    BEGIN
+        RAISERROR (N'Reference type must be TKT or ERR.', 16, 1);
+        RETURN;
+    END
+
+    /* The date the reference is stamped with. GETUTCDATE() to match the
+       LinkedScam UTC standard - using local time would make the counter reset
+       at a different moment than every timestamp in the schema, and produce
+       two references numbered -1 on the same calendar day at the boundary. */
+    DECLARE @Today DATE = CONVERT(DATE, GETUTCDATE());
+    DECLARE @Claimed TABLE (Value INT);
+    DECLARE @Next INT = NULL;
+    DECLARE @Attempt INT = 0;
+
+    WHILE @Next IS NULL AND @Attempt < 3
+    BEGIN
+        SET @Attempt += 1;
+
+        DELETE @Claimed;
+
+        /* Single atomic statement: increment and return, no read-then-write
+           window for a concurrent session to slip into. */
+        UPDATE ERM.ERM_ReferenceCounter
+           SET LastValue   = LastValue + 1,
+               UpdatedDate = GETUTCDATE()
+        OUTPUT inserted.LastValue INTO @Claimed (Value)
+         WHERE RefType = @RefType
+           AND RefDate = @Today;
+
+        SELECT @Next = Value FROM @Claimed;
+
+        IF @Next IS NULL
+        BEGIN
+            /* First reference of the day for this type. Two sessions can reach
+               here together; the primary key decides which one creates the row
+               and the other loops round to the UPDATE above. */
+            BEGIN TRY
+                INSERT ERM.ERM_ReferenceCounter (RefType, RefDate, LastValue)
+                VALUES (@RefType, @Today, 1);
+
+                SET @Next = 1;
+            END TRY
+            BEGIN CATCH
+                /* 2627/2601 = duplicate key: somebody else created it a
+                   microsecond ago, which is success as far as we are concerned.
+                   Anything else is a real failure and must surface. */
+                IF ERROR_NUMBER() NOT IN (2627, 2601) THROW;
+            END CATCH
+        END
+    END
+
+    IF @Next IS NULL
+    BEGIN
+        RAISERROR (N'Could not allocate a reference number after 3 attempts.', 16, 1);
+        RETURN;
+    END
+
+    /* LS-ERM-TKT-260903-1
+       The counter is NOT zero-padded: the standard's examples show -1, -2, -3,
+       and padding them to -0001 would not match. */
+    SET @Reference = 'LS-ERM-' + @RefType + '-'
+                   + FORMAT(@Today, 'yyMMdd') + '-'
+                   + CONVERT(VARCHAR(10), @Next);
+END
 GO
 
 /* =============================================================================
@@ -28,20 +184,23 @@ GO
    a single row here with OccurrenceCount = 4000 - and to at most one open
    ticket, not 4,000 tickets.
    ============================================================================= */
-IF OBJECT_ID(N'erp_err.ErrorFingerprint', N'U') IS NULL
+IF OBJECT_ID(N'ERM.ERM_ErrorFingerprint', N'U') IS NULL
 BEGIN
-    CREATE TABLE erp_err.ErrorFingerprint
+    CREATE TABLE ERM.ERM_ErrorFingerprint
     (
-        FingerprintId       BIGINT          IDENTITY(1,1) NOT NULL,
+        [ROWID]       UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_ErrorFingerprint_ROWID DEFAULT (NEWID()),
+        [DBNo]        INT              NOT NULL CONSTRAINT DF_ErrorFingerprint_DBNo  DEFAULT (1),
+        [AppNo]       INT              NOT NULL CONSTRAINT DF_ErrorFingerprint_AppNo DEFAULT (1),
+        ERM_ErrorFingerprintID       BIGINT          IDENTITY(1,1) NOT NULL,
         -- SHA-256 of the normalised signature, lower-case hex, 64 chars.
         FingerprintHash     CHAR(64)        NOT NULL,
         -- The human-readable signature the hash was taken over, kept so an
         -- admin can see WHY two errors were considered the same.
         SignatureText       NVARCHAR(1000)  NOT NULL,
 
-        LayerId             TINYINT         NOT NULL,
-        CategoryId          SMALLINT        NOT NULL,
-        SeverityId          TINYINT         NOT NULL,
+        LayerID             TINYINT         NOT NULL,
+        CategoryID          SMALLINT        NOT NULL,
+        SeverityID          TINYINT         NOT NULL,
 
         ExceptionType       NVARCHAR(400)   NULL,
         -- Message with volatile parts (ids, guids, numbers, quoted literals,
@@ -67,19 +226,25 @@ BEGIN
         MutedUntilUtc       DATETIME2(3)    NULL,
         -- The currently open ticket for this problem, if any.  Set by
         -- usp_Ticket_Create; cleared when that ticket reaches a terminal status.
-        OpenTicketId        BIGINT          NULL,
+        OpenTicketID        BIGINT          NULL,
         Notes               NVARCHAR(MAX)   NULL,
-
-        CONSTRAINT PK_ErrorFingerprint PRIMARY KEY CLUSTERED (FingerprintId),
+        /* ---- standard LinkedScam audit / status columns ---- */
+        [IsActive]    BIT      NOT NULL CONSTRAINT DF_ErrorFingerprint_IsActive  DEFAULT (1),
+        [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_ErrorFingerprint_IsDeleted DEFAULT (0),
+        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_ErrorFingerprint_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_ErrorFingerprint_CreatedDate DEFAULT (GETUTCDATE()),
+        [UpdatedBy]   INT      NULL,
+        [UpdatedDate] DATETIME NULL,
+        CONSTRAINT PK_ErrorFingerprint PRIMARY KEY CLUSTERED (ERM_ErrorFingerprintID),
         CONSTRAINT UQ_ErrorFingerprint_Hash UNIQUE (FingerprintHash),
-        CONSTRAINT FK_Fingerprint_Layer    FOREIGN KEY (LayerId)    REFERENCES erp_err.AppLayer (LayerId),
-        CONSTRAINT FK_Fingerprint_Category FOREIGN KEY (CategoryId) REFERENCES erp_err.ErrorCategory (CategoryId),
-        CONSTRAINT FK_Fingerprint_Severity FOREIGN KEY (SeverityId) REFERENCES erp_err.Severity (SeverityId)
+        CONSTRAINT FK_Fingerprint_Layer    FOREIGN KEY (LayerID)    REFERENCES ERM.ERM_AppLayer (LayerID),
+        CONSTRAINT FK_Fingerprint_Category FOREIGN KEY (CategoryID) REFERENCES ERM.ERM_ErrorCategory (CategoryID),
+        CONSTRAINT FK_Fingerprint_Severity FOREIGN KEY (SeverityID) REFERENCES ERM.ERM_Severity (SeverityID)
     );
 
-    CREATE INDEX IX_Fingerprint_LastSeen  ON erp_err.ErrorFingerprint (LastSeenUtc DESC) INCLUDE (OccurrenceCount, SeverityId, TriageState);
-    CREATE INDEX IX_Fingerprint_Module    ON erp_err.ErrorFingerprint (ErpModule, LastSeenUtc DESC);
-    CREATE INDEX IX_Fingerprint_Triage    ON erp_err.ErrorFingerprint (TriageState, SeverityId) INCLUDE (LastSeenUtc, OccurrenceCount);
+    CREATE INDEX IX_Fingerprint_LastSeen  ON ERM.ERM_ErrorFingerprint (LastSeenUtc DESC) INCLUDE (OccurrenceCount, SeverityID, TriageState);
+    CREATE INDEX IX_Fingerprint_Module    ON ERM.ERM_ErrorFingerprint (ErpModule, LastSeenUtc DESC);
+    CREATE INDEX IX_Fingerprint_Triage    ON ERM.ERM_ErrorFingerprint (TriageState, SeverityID) INCLUDE (LastSeenUtc, OccurrenceCount);
 END
 GO
 
@@ -91,14 +256,17 @@ GO
    heavy payload lives 1:1 in ErrorOccurrenceDetail so retention can drop
    payloads early while keeping the trend data.
    ============================================================================= */
-IF OBJECT_ID(N'erp_err.ErrorOccurrence', N'U') IS NULL
+IF OBJECT_ID(N'ERM.ERM_ErrorOccurrence', N'U') IS NULL
 BEGIN
-    CREATE TABLE erp_err.ErrorOccurrence
+    CREATE TABLE ERM.ERM_ErrorOccurrence
     (
-        OccurrenceId        BIGINT          IDENTITY(1,1) NOT NULL,
-        -- Shown to the user in the modal, e.g. 'ERR-2026-00004821'.
-        ErrorReference      VARCHAR(24)     NOT NULL,
-        FingerprintId       BIGINT          NOT NULL,
+        [ROWID]       UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_ErrorOccurrence_ROWID DEFAULT (NEWID()),
+        [DBNo]        INT              NOT NULL CONSTRAINT DF_ErrorOccurrence_DBNo  DEFAULT (1),
+        [AppNo]       INT              NOT NULL CONSTRAINT DF_ErrorOccurrence_AppNo DEFAULT (1),
+        ERM_ErrorOccurrenceID        BIGINT          IDENTITY(1,1) NOT NULL,
+        -- Shown to the user in the modal, e.g. 'LS-ERM-ERR-260903-2'.
+        ErrorReference      VARCHAR(30)     NOT NULL,
+        ERM_ErrorFingerprintID       BIGINT          NOT NULL,
 
         /* ---- when ---- */
         OccurredUtc         DATETIME2(3)    NOT NULL,
@@ -109,9 +277,9 @@ BEGIN
         ReceivedUtc         DATETIME2(3)    NOT NULL CONSTRAINT DF_Occurrence_Received DEFAULT (SYSUTCDATETIME()),
 
         /* ---- what ---- */
-        LayerId             TINYINT         NOT NULL,
-        CategoryId          SMALLINT        NOT NULL,
-        SeverityId          TINYINT         NOT NULL,
+        LayerID             TINYINT         NOT NULL,
+        CategoryID          SMALLINT        NOT NULL,
+        SeverityID          TINYINT         NOT NULL,
         ExceptionType       NVARCHAR(400)   NULL,
         -- Raw (still redacted) message, unlike the fingerprint's normalised one.
         Message             NVARCHAR(2000)  NULL,
@@ -146,23 +314,23 @@ BEGIN
         SqlSchemaName       NVARCHAR(128)   NULL,
 
         /* ---- who ---- */
-        UserId              NVARCHAR(128)   NULL,
+        UserID              NVARCHAR(128)   NULL,
         UserName            NVARCHAR(200)   NULL,
         UserDisplayName     NVARCHAR(200)   NULL,
-        TenantId            NVARCHAR(64)    NULL,
-        SessionId           NVARCHAR(100)   NULL,
+        TenantID            NVARCHAR(64)    NULL,
+        SessionID           NVARCHAR(100)   NULL,
         ClientIp            NVARCHAR(64)    NULL,
 
         /* ---- correlation ---- */
         -- Generated in the browser, forwarded on every hop, so an Angular
         -- error, its HTTP failure, the .NET exception and the SQL error all
         -- carry the same value and can be assembled into one incident view.
-        CorrelationId       UNIQUEIDENTIFIER NOT NULL,
+        CorrelationID       UNIQUEIDENTIFIER NOT NULL,
         -- Identifies this single HTTP request within the correlation.
-        RequestId           UNIQUEIDENTIFIER NULL,
+        RequestID           UNIQUEIDENTIFIER NULL,
         -- Set when this occurrence was raised as a direct consequence of
         -- another (e.g. the Angular HTTP error whose cause is the .NET one).
-        ParentOccurrenceId  BIGINT          NULL,
+        ParentOccurrenceID  BIGINT          NULL,
 
         /* ---- environment / client ---- */
         Environment         NVARCHAR(40)    NOT NULL,
@@ -179,37 +347,46 @@ BEGIN
         -- Was the user actually shown the modal for this one?
         WasUserNotified     BIT             NOT NULL CONSTRAINT DF_Occurrence_Notified DEFAULT (0),
         -- Populated when a ticket is raised from this occurrence.
-        TicketId            BIGINT          NULL,
-
-        CONSTRAINT PK_ErrorOccurrence PRIMARY KEY CLUSTERED (OccurrenceId),
+        ERM_TicketID            BIGINT          NULL,
+        /* ---- standard LinkedScam audit / status columns ---- */
+        [IsActive]    BIT      NOT NULL CONSTRAINT DF_ErrorOccurrence_IsActive  DEFAULT (1),
+        [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_ErrorOccurrence_IsDeleted DEFAULT (0),
+        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_ErrorOccurrence_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_ErrorOccurrence_CreatedDate DEFAULT (GETUTCDATE()),
+        [UpdatedBy]   INT      NULL,
+        [UpdatedDate] DATETIME NULL,
+        CONSTRAINT PK_ErrorOccurrence PRIMARY KEY CLUSTERED (ERM_ErrorOccurrenceID),
         CONSTRAINT UQ_ErrorOccurrence_Reference UNIQUE (ErrorReference),
-        CONSTRAINT FK_Occurrence_Fingerprint FOREIGN KEY (FingerprintId) REFERENCES erp_err.ErrorFingerprint (FingerprintId),
-        CONSTRAINT FK_Occurrence_Layer       FOREIGN KEY (LayerId)       REFERENCES erp_err.AppLayer (LayerId),
-        CONSTRAINT FK_Occurrence_Category    FOREIGN KEY (CategoryId)    REFERENCES erp_err.ErrorCategory (CategoryId),
-        CONSTRAINT FK_Occurrence_Severity    FOREIGN KEY (SeverityId)    REFERENCES erp_err.Severity (SeverityId),
-        CONSTRAINT FK_Occurrence_Parent      FOREIGN KEY (ParentOccurrenceId) REFERENCES erp_err.ErrorOccurrence (OccurrenceId)
+        CONSTRAINT FK_Occurrence_Fingerprint FOREIGN KEY (ERM_ErrorFingerprintID) REFERENCES ERM.ERM_ErrorFingerprint (ERM_ErrorFingerprintID),
+        CONSTRAINT FK_Occurrence_Layer       FOREIGN KEY (LayerID)       REFERENCES ERM.ERM_AppLayer (LayerID),
+        CONSTRAINT FK_Occurrence_Category    FOREIGN KEY (CategoryID)    REFERENCES ERM.ERM_ErrorCategory (CategoryID),
+        CONSTRAINT FK_Occurrence_Severity    FOREIGN KEY (SeverityID)    REFERENCES ERM.ERM_Severity (SeverityID),
+        CONSTRAINT FK_Occurrence_Parent      FOREIGN KEY (ParentOccurrenceID) REFERENCES ERM.ERM_ErrorOccurrence (ERM_ErrorOccurrenceID)
     );
 
-    CREATE INDEX IX_Occurrence_OccurredUtc  ON erp_err.ErrorOccurrence (OccurredUtc DESC)
-        INCLUDE (FingerprintId, SeverityId, LayerId, ErpModule, UserName, TicketId);
-    CREATE INDEX IX_Occurrence_Fingerprint  ON erp_err.ErrorOccurrence (FingerprintId, OccurredUtc DESC);
-    CREATE INDEX IX_Occurrence_Correlation  ON erp_err.ErrorOccurrence (CorrelationId, OccurredUtc);
-    CREATE INDEX IX_Occurrence_User         ON erp_err.ErrorOccurrence (UserName, OccurredUtc DESC);
-    CREATE INDEX IX_Occurrence_Module       ON erp_err.ErrorOccurrence (ErpModule, Screen, OccurredUtc DESC);
-    CREATE INDEX IX_Occurrence_Api          ON erp_err.ErrorOccurrence (ApiController, ApiAction, OccurredUtc DESC);
-    CREATE INDEX IX_Occurrence_Sql          ON erp_err.ErrorOccurrence (SqlErrorNumber, OccurredUtc DESC) WHERE SqlErrorNumber IS NOT NULL;
-    CREATE INDEX IX_Occurrence_Ticket       ON erp_err.ErrorOccurrence (TicketId) WHERE TicketId IS NOT NULL;
+    CREATE INDEX IX_Occurrence_OccurredUtc  ON ERM.ERM_ErrorOccurrence (OccurredUtc DESC)
+        INCLUDE (ERM_ErrorFingerprintID, SeverityID, LayerID, ErpModule, UserName, ERM_TicketID);
+    CREATE INDEX IX_Occurrence_Fingerprint  ON ERM.ERM_ErrorOccurrence (ERM_ErrorFingerprintID, OccurredUtc DESC);
+    CREATE INDEX IX_Occurrence_Correlation  ON ERM.ERM_ErrorOccurrence (CorrelationID, OccurredUtc);
+    CREATE INDEX IX_Occurrence_User         ON ERM.ERM_ErrorOccurrence (UserName, OccurredUtc DESC);
+    CREATE INDEX IX_Occurrence_Module       ON ERM.ERM_ErrorOccurrence (ErpModule, Screen, OccurredUtc DESC);
+    CREATE INDEX IX_Occurrence_Api          ON ERM.ERM_ErrorOccurrence (ApiController, ApiAction, OccurredUtc DESC);
+    CREATE INDEX IX_Occurrence_Sql          ON ERM.ERM_ErrorOccurrence (SqlErrorNumber, OccurredUtc DESC) WHERE SqlErrorNumber IS NOT NULL;
+    CREATE INDEX IX_Occurrence_Ticket       ON ERM.ERM_ErrorOccurrence (ERM_TicketID) WHERE ERM_TicketID IS NOT NULL;
 END
 GO
 
 /* =============================================================================
    ErrorOccurrenceDetail - the heavy 1:1 payload
    ============================================================================= */
-IF OBJECT_ID(N'erp_err.ErrorOccurrenceDetail', N'U') IS NULL
+IF OBJECT_ID(N'ERM.ERM_ErrorOccurrenceDetail', N'U') IS NULL
 BEGIN
-    CREATE TABLE erp_err.ErrorOccurrenceDetail
+    CREATE TABLE ERM.ERM_ErrorOccurrenceDetail
     (
-        OccurrenceId        BIGINT          NOT NULL,
+        [ROWID]       UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_ErrorOccurrenceDetail_ROWID DEFAULT (NEWID()),
+        [DBNo]        INT              NOT NULL CONSTRAINT DF_ErrorOccurrenceDetail_DBNo  DEFAULT (1),
+        [AppNo]       INT              NOT NULL CONSTRAINT DF_ErrorOccurrenceDetail_AppNo DEFAULT (1),
+        ERM_ErrorOccurrenceID        BIGINT          NOT NULL,
         StackTrace          NVARCHAR(MAX)   NULL,
         -- Full inner-exception chain, outermost first, already flattened.
         InnerExceptionChain NVARCHAR(MAX)   NULL,
@@ -226,9 +403,16 @@ BEGIN
         -- Anything module-specific the caller wants to attach.
         CustomDataJson      NVARCHAR(MAX)   NULL,
         SqlStatementText    NVARCHAR(MAX)   NULL,
-        CONSTRAINT PK_ErrorOccurrenceDetail PRIMARY KEY CLUSTERED (OccurrenceId),
-        CONSTRAINT FK_OccurrenceDetail_Occurrence FOREIGN KEY (OccurrenceId)
-            REFERENCES erp_err.ErrorOccurrence (OccurrenceId) ON DELETE CASCADE
+        /* ---- standard LinkedScam audit / status columns ---- */
+        [IsActive]    BIT      NOT NULL CONSTRAINT DF_ErrorOccurrenceDetail_IsActive  DEFAULT (1),
+        [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_ErrorOccurrenceDetail_IsDeleted DEFAULT (0),
+        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_ErrorOccurrenceDetail_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_ErrorOccurrenceDetail_CreatedDate DEFAULT (GETUTCDATE()),
+        [UpdatedBy]   INT      NULL,
+        [UpdatedDate] DATETIME NULL,
+        CONSTRAINT PK_ErrorOccurrenceDetail PRIMARY KEY CLUSTERED (ERM_ErrorOccurrenceID),
+        CONSTRAINT FK_OccurrenceDetail_Occurrence FOREIGN KEY (ERM_ErrorOccurrenceID)
+            REFERENCES ERM.ERM_ErrorOccurrence (ERM_ErrorOccurrenceID) ON DELETE CASCADE
     );
 END
 GO
@@ -236,32 +420,35 @@ GO
 /* =============================================================================
    Ticket
    ============================================================================= */
-IF OBJECT_ID(N'erp_err.Ticket', N'U') IS NULL
+IF OBJECT_ID(N'ERM.ERM_Ticket', N'U') IS NULL
 BEGIN
-    CREATE TABLE erp_err.Ticket
+    CREATE TABLE ERM.ERM_Ticket
     (
-        TicketId            BIGINT          IDENTITY(1,1) NOT NULL,
-        TicketNumber        VARCHAR(24)     NOT NULL,      -- 'TKT-2026-00000317'
+        [ROWID]       UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_Ticket_ROWID DEFAULT (NEWID()),
+        [DBNo]        INT              NOT NULL CONSTRAINT DF_Ticket_DBNo  DEFAULT (1),
+        [AppNo]       INT              NOT NULL CONSTRAINT DF_Ticket_AppNo DEFAULT (1),
+        ERM_TicketID            BIGINT          IDENTITY(1,1) NOT NULL,
+        TicketNumber        VARCHAR(30)     NOT NULL,      -- 'LS-ERM-TKT-260903-4'
 
         -- The occurrence the user was looking at when they pressed Report.
-        OccurrenceId        BIGINT          NULL,
+        ERM_ErrorOccurrenceID        BIGINT          NULL,
         -- The problem.  Repeat reports of the same problem attach here.
-        FingerprintId       BIGINT          NOT NULL,
+        ERM_ErrorFingerprintID       BIGINT          NOT NULL,
 
-        StatusId            TINYINT         NOT NULL,
-        SeverityId          TINYINT         NOT NULL,
-        QueueId             SMALLINT        NOT NULL,
-        SlaPolicyId         SMALLINT        NULL,
+        StatusID            TINYINT         NOT NULL,
+        SeverityID          TINYINT         NOT NULL,
+        ERM_TicketQueueID             SMALLINT        NOT NULL,
+        ERM_SlaPolicyID         SMALLINT        NULL,
 
         Title               NVARCHAR(400)   NOT NULL,
         -- What the user typed in the modal, if anything.
         UserDescription     NVARCHAR(MAX)   NULL,
 
-        ReportedByUserId    NVARCHAR(128)   NULL,
+        ReportedByUserID    NVARCHAR(128)   NULL,
         ReportedByUserName  NVARCHAR(200)   NULL,
         -- 'user' | 'auto_rule' | 'admin'
         CreatedVia          NVARCHAR(20)    NOT NULL CONSTRAINT DF_Ticket_CreatedVia DEFAULT (N'user'),
-        AssignedToUserId    NVARCHAR(128)   NULL,
+        AssignedToUserID    NVARCHAR(128)   NULL,
         AssignedToUserName  NVARCHAR(200)   NULL,
 
         ErpModule           NVARCHAR(100)   NULL,
@@ -290,108 +477,144 @@ BEGIN
 
         ResolutionCode      NVARCHAR(60)    NULL,
         ResolutionNotes     NVARCHAR(MAX)   NULL,
-
-        CONSTRAINT PK_Ticket PRIMARY KEY CLUSTERED (TicketId),
+        /* ---- standard LinkedScam audit / status columns ---- */
+        [IsActive]    BIT      NOT NULL CONSTRAINT DF_Ticket_IsActive  DEFAULT (1),
+        [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_Ticket_IsDeleted DEFAULT (0),
+        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_Ticket_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_Ticket_CreatedDate DEFAULT (GETUTCDATE()),
+        [UpdatedBy]   INT      NULL,
+        [UpdatedDate] DATETIME NULL,
+        CONSTRAINT PK_Ticket PRIMARY KEY CLUSTERED (ERM_TicketID),
         CONSTRAINT UQ_Ticket_Number UNIQUE (TicketNumber),
-        CONSTRAINT FK_Ticket_Occurrence  FOREIGN KEY (OccurrenceId)  REFERENCES erp_err.ErrorOccurrence (OccurrenceId),
-        CONSTRAINT FK_Ticket_Fingerprint FOREIGN KEY (FingerprintId) REFERENCES erp_err.ErrorFingerprint (FingerprintId),
-        CONSTRAINT FK_Ticket_Status      FOREIGN KEY (StatusId)      REFERENCES erp_err.TicketStatus (StatusId),
-        CONSTRAINT FK_Ticket_Severity    FOREIGN KEY (SeverityId)    REFERENCES erp_err.Severity (SeverityId),
-        CONSTRAINT FK_Ticket_Queue       FOREIGN KEY (QueueId)       REFERENCES erp_err.TicketQueue (QueueId),
-        CONSTRAINT FK_Ticket_Sla         FOREIGN KEY (SlaPolicyId)   REFERENCES erp_err.SlaPolicy (SlaPolicyId)
+        CONSTRAINT FK_Ticket_Occurrence  FOREIGN KEY (ERM_ErrorOccurrenceID)  REFERENCES ERM.ERM_ErrorOccurrence (ERM_ErrorOccurrenceID),
+        CONSTRAINT FK_Ticket_Fingerprint FOREIGN KEY (ERM_ErrorFingerprintID) REFERENCES ERM.ERM_ErrorFingerprint (ERM_ErrorFingerprintID),
+        CONSTRAINT FK_Ticket_Status      FOREIGN KEY (StatusID)      REFERENCES ERM.ERM_TicketStatus (StatusID),
+        CONSTRAINT FK_Ticket_Severity    FOREIGN KEY (SeverityID)    REFERENCES ERM.ERM_Severity (SeverityID),
+        CONSTRAINT FK_Ticket_Queue       FOREIGN KEY (ERM_TicketQueueID)       REFERENCES ERM.ERM_TicketQueue (ERM_TicketQueueID),
+        CONSTRAINT FK_Ticket_Sla         FOREIGN KEY (ERM_SlaPolicyID)   REFERENCES ERM.ERM_SlaPolicy (ERM_SlaPolicyID)
     );
 
-    CREATE INDEX IX_Ticket_Status      ON erp_err.Ticket (StatusId, CreatedUtc DESC) INCLUDE (QueueId, SeverityId, AssignedToUserName);
-    CREATE INDEX IX_Ticket_Queue       ON erp_err.Ticket (QueueId, StatusId, CreatedUtc DESC);
-    CREATE INDEX IX_Ticket_Reporter    ON erp_err.Ticket (ReportedByUserName, CreatedUtc DESC);
-    CREATE INDEX IX_Ticket_Assignee    ON erp_err.Ticket (AssignedToUserName, StatusId);
-    CREATE INDEX IX_Ticket_Fingerprint ON erp_err.Ticket (FingerprintId, StatusId);
+    CREATE INDEX IX_Ticket_Status      ON ERM.ERM_Ticket (StatusID, CreatedUtc DESC) INCLUDE (ERM_TicketQueueID, SeverityID, AssignedToUserName);
+    CREATE INDEX IX_Ticket_Queue       ON ERM.ERM_Ticket (ERM_TicketQueueID, StatusID, CreatedUtc DESC);
+    CREATE INDEX IX_Ticket_Reporter    ON ERM.ERM_Ticket (ReportedByUserName, CreatedUtc DESC);
+    CREATE INDEX IX_Ticket_Assignee    ON ERM.ERM_Ticket (AssignedToUserName, StatusID);
+    CREATE INDEX IX_Ticket_Fingerprint ON ERM.ERM_Ticket (ERM_ErrorFingerprintID, StatusID);
 END
 GO
 
 /* FK from occurrence -> ticket added after Ticket exists (circular reference). */
-IF OBJECT_ID(N'erp_err.Ticket', N'U') IS NOT NULL
+IF OBJECT_ID(N'ERM.ERM_Ticket', N'U') IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = N'FK_Occurrence_Ticket')
-    ALTER TABLE erp_err.ErrorOccurrence WITH CHECK
-        ADD CONSTRAINT FK_Occurrence_Ticket FOREIGN KEY (TicketId) REFERENCES erp_err.Ticket (TicketId);
+    ALTER TABLE ERM.ERM_ErrorOccurrence WITH CHECK
+        ADD CONSTRAINT FK_Occurrence_Ticket FOREIGN KEY (ERM_TicketID) REFERENCES ERM.ERM_Ticket (ERM_TicketID);
 GO
-IF OBJECT_ID(N'erp_err.Ticket', N'U') IS NOT NULL
+IF OBJECT_ID(N'ERM.ERM_Ticket', N'U') IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = N'FK_Fingerprint_OpenTicket')
-    ALTER TABLE erp_err.ErrorFingerprint WITH CHECK
-        ADD CONSTRAINT FK_Fingerprint_OpenTicket FOREIGN KEY (OpenTicketId) REFERENCES erp_err.Ticket (TicketId);
+    ALTER TABLE ERM.ERM_ErrorFingerprint WITH CHECK
+        ADD CONSTRAINT FK_Fingerprint_OpenTicket FOREIGN KEY (OpenTicketID) REFERENCES ERM.ERM_Ticket (ERM_TicketID);
 GO
 
 /* =============================================================================
    TicketStatusHistory - the audit trail the brief specified, verbatim
    ============================================================================= */
-IF OBJECT_ID(N'erp_err.TicketStatusHistory', N'U') IS NULL
+IF OBJECT_ID(N'ERM.ERM_TicketStatusHistory', N'U') IS NULL
 BEGIN
-    CREATE TABLE erp_err.TicketStatusHistory
+    CREATE TABLE ERM.ERM_TicketStatusHistory
     (
-        HistoryId           BIGINT          IDENTITY(1,1) NOT NULL,
-        TicketId            BIGINT          NOT NULL,
+        [ROWID]       UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_TicketStatusHistory_ROWID DEFAULT (NEWID()),
+        [DBNo]        INT              NOT NULL CONSTRAINT DF_TicketStatusHistory_DBNo  DEFAULT (1),
+        [AppNo]       INT              NOT NULL CONSTRAINT DF_TicketStatusHistory_AppNo DEFAULT (1),
+        ERM_TicketStatusHistoryID           BIGINT          IDENTITY(1,1) NOT NULL,
+        ERM_TicketID            BIGINT          NOT NULL,
         SequenceNo          INT             NOT NULL,      -- 1-based, gapless per ticket
-        FromStatusId        TINYINT         NULL,          -- NULL on creation
-        ToStatusId          TINYINT         NOT NULL,
-        ChangedByUserId     NVARCHAR(128)   NULL,
+        FromStatusID        TINYINT         NULL,          -- NULL on creation
+        ToStatusID          TINYINT         NOT NULL,
+        ChangedByUserID     NVARCHAR(128)   NULL,
         ChangedByUserName   NVARCHAR(200)   NULL,
         ChangedUtc          DATETIME2(3)    NOT NULL CONSTRAINT DF_TSH_ChangedUtc DEFAULT (SYSUTCDATETIME()),
-        -- Minutes the ticket spent in FromStatusId before this change.  This is
+        -- Minutes the ticket spent in FromStatusID before this change.  This is
         -- the column that answers "time spent in each status" without a window
         -- function over the whole history at report time.
         MinutesInFromStatus INT             NULL,
         Comments            NVARCHAR(MAX)   NULL,
         -- Visible to the end user, or internal-only?
         IsCustomerVisible   BIT             NOT NULL CONSTRAINT DF_TSH_Visible DEFAULT (1),
-        CONSTRAINT PK_TicketStatusHistory PRIMARY KEY CLUSTERED (TicketId, SequenceNo),
-        CONSTRAINT UQ_TicketStatusHistory_Id UNIQUE (HistoryId),
-        CONSTRAINT FK_TSH_Ticket FOREIGN KEY (TicketId) REFERENCES erp_err.Ticket (TicketId) ON DELETE CASCADE,
-        CONSTRAINT FK_TSH_From   FOREIGN KEY (FromStatusId) REFERENCES erp_err.TicketStatus (StatusId),
-        CONSTRAINT FK_TSH_To     FOREIGN KEY (ToStatusId)   REFERENCES erp_err.TicketStatus (StatusId)
+        /* ---- standard LinkedScam audit / status columns ---- */
+        [IsActive]    BIT      NOT NULL CONSTRAINT DF_TicketStatusHistory_IsActive  DEFAULT (1),
+        [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_TicketStatusHistory_IsDeleted DEFAULT (0),
+        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_TicketStatusHistory_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_TicketStatusHistory_CreatedDate DEFAULT (GETUTCDATE()),
+        [UpdatedBy]   INT      NULL,
+        [UpdatedDate] DATETIME NULL,
+        CONSTRAINT PK_TicketStatusHistory PRIMARY KEY CLUSTERED (ERM_TicketID, SequenceNo),
+        CONSTRAINT UQ_TicketStatusHistory_Id UNIQUE (ERM_TicketStatusHistoryID),
+        CONSTRAINT FK_TSH_Ticket FOREIGN KEY (ERM_TicketID) REFERENCES ERM.ERM_Ticket (ERM_TicketID) ON DELETE CASCADE,
+        CONSTRAINT FK_TSH_From   FOREIGN KEY (FromStatusID) REFERENCES ERM.ERM_TicketStatus (StatusID),
+        CONSTRAINT FK_TSH_To     FOREIGN KEY (ToStatusID)   REFERENCES ERM.ERM_TicketStatus (StatusID)
     );
-    CREATE INDEX IX_TSH_ChangedUtc ON erp_err.TicketStatusHistory (ChangedUtc DESC);
+    CREATE INDEX IX_TSH_ChangedUtc ON ERM.ERM_TicketStatusHistory (ChangedUtc DESC);
 END
 GO
 
 /* Free-text conversation on a ticket, separate from status changes so the
    history stays a clean state machine log.                                    */
-IF OBJECT_ID(N'erp_err.TicketComment', N'U') IS NULL
+IF OBJECT_ID(N'ERM.ERM_TicketComment', N'U') IS NULL
 BEGIN
-    CREATE TABLE erp_err.TicketComment
+    CREATE TABLE ERM.ERM_TicketComment
     (
-        CommentId           BIGINT          IDENTITY(1,1) NOT NULL,
-        TicketId            BIGINT          NOT NULL,
-        AuthorUserId        NVARCHAR(128)   NULL,
+        [ROWID]       UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_TicketComment_ROWID DEFAULT (NEWID()),
+        [DBNo]        INT              NOT NULL CONSTRAINT DF_TicketComment_DBNo  DEFAULT (1),
+        [AppNo]       INT              NOT NULL CONSTRAINT DF_TicketComment_AppNo DEFAULT (1),
+        ERM_TicketCommentID           BIGINT          IDENTITY(1,1) NOT NULL,
+        ERM_TicketID            BIGINT          NOT NULL,
+        AuthorUserID        NVARCHAR(128)   NULL,
         AuthorUserName      NVARCHAR(200)   NULL,
         -- 'reporter' | 'support' | 'system'
         AuthorRole          NVARCHAR(20)    NOT NULL CONSTRAINT DF_TC_Role DEFAULT (N'support'),
         CommentText         NVARCHAR(MAX)   NOT NULL,
         IsCustomerVisible   BIT             NOT NULL CONSTRAINT DF_TC_Visible DEFAULT (1),
         CreatedUtc          DATETIME2(3)    NOT NULL CONSTRAINT DF_TC_CreatedUtc DEFAULT (SYSUTCDATETIME()),
-        CONSTRAINT PK_TicketComment PRIMARY KEY CLUSTERED (CommentId),
-        CONSTRAINT FK_TC_Ticket FOREIGN KEY (TicketId) REFERENCES erp_err.Ticket (TicketId) ON DELETE CASCADE
+        /* ---- standard LinkedScam audit / status columns ---- */
+        [IsActive]    BIT      NOT NULL CONSTRAINT DF_TicketComment_IsActive  DEFAULT (1),
+        [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_TicketComment_IsDeleted DEFAULT (0),
+        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_TicketComment_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_TicketComment_CreatedDate DEFAULT (GETUTCDATE()),
+        [UpdatedBy]   INT      NULL,
+        [UpdatedDate] DATETIME NULL,
+        CONSTRAINT PK_TicketComment PRIMARY KEY CLUSTERED (ERM_TicketCommentID),
+        CONSTRAINT FK_TC_Ticket FOREIGN KEY (ERM_TicketID) REFERENCES ERM.ERM_Ticket (ERM_TicketID) ON DELETE CASCADE
     );
-    CREATE INDEX IX_TC_Ticket ON erp_err.TicketComment (TicketId, CreatedUtc);
+    CREATE INDEX IX_TC_Ticket ON ERM.ERM_TicketComment (ERM_TicketID, CreatedUtc);
 END
 GO
 
 /* Links every additional occurrence that arrived while a ticket was open, so
    "this ticket represents 812 failures across 43 users" is a query, not a
    guess.                                                                       */
-IF OBJECT_ID(N'erp_err.TicketOccurrenceLink', N'U') IS NULL
+IF OBJECT_ID(N'ERM.ERM_TicketOccurrenceLink', N'U') IS NULL
 BEGIN
-    CREATE TABLE erp_err.TicketOccurrenceLink
+    CREATE TABLE ERM.ERM_TicketOccurrenceLink
     (
-        TicketId        BIGINT          NOT NULL,
-        OccurrenceId    BIGINT          NOT NULL,
+        [ROWID]       UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_TicketOccurrenceLink_ROWID DEFAULT (NEWID()),
+        [DBNo]        INT              NOT NULL CONSTRAINT DF_TicketOccurrenceLink_DBNo  DEFAULT (1),
+        [AppNo]       INT              NOT NULL CONSTRAINT DF_TicketOccurrenceLink_AppNo DEFAULT (1),
+        ERM_TicketID        BIGINT          NOT NULL,
+        ERM_ErrorOccurrenceID    BIGINT          NOT NULL,
         LinkedUtc       DATETIME2(3)    NOT NULL CONSTRAINT DF_TOL_LinkedUtc DEFAULT (SYSUTCDATETIME()),
         -- 'primary' (the one the user reported) | 'deduplicated' | 'manual'
         LinkReason      NVARCHAR(20)    NOT NULL CONSTRAINT DF_TOL_Reason DEFAULT (N'deduplicated'),
-        CONSTRAINT PK_TicketOccurrenceLink PRIMARY KEY CLUSTERED (TicketId, OccurrenceId),
-        CONSTRAINT FK_TOL_Ticket     FOREIGN KEY (TicketId)     REFERENCES erp_err.Ticket (TicketId) ON DELETE CASCADE,
-        CONSTRAINT FK_TOL_Occurrence FOREIGN KEY (OccurrenceId) REFERENCES erp_err.ErrorOccurrence (OccurrenceId)
+        /* ---- standard LinkedScam audit / status columns ---- */
+        [IsActive]    BIT      NOT NULL CONSTRAINT DF_TicketOccurrenceLink_IsActive  DEFAULT (1),
+        [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_TicketOccurrenceLink_IsDeleted DEFAULT (0),
+        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_TicketOccurrenceLink_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_TicketOccurrenceLink_CreatedDate DEFAULT (GETUTCDATE()),
+        [UpdatedBy]   INT      NULL,
+        [UpdatedDate] DATETIME NULL,
+        CONSTRAINT PK_TicketOccurrenceLink PRIMARY KEY CLUSTERED (ERM_TicketID, ERM_ErrorOccurrenceID),
+        CONSTRAINT FK_TOL_Ticket     FOREIGN KEY (ERM_TicketID)     REFERENCES ERM.ERM_Ticket (ERM_TicketID) ON DELETE CASCADE,
+        CONSTRAINT FK_TOL_Occurrence FOREIGN KEY (ERM_ErrorOccurrenceID) REFERENCES ERM.ERM_ErrorOccurrence (ERM_ErrorOccurrenceID)
     );
-    CREATE INDEX IX_TOL_Occurrence ON erp_err.TicketOccurrenceLink (OccurrenceId);
+    CREATE INDEX IX_TOL_Occurrence ON ERM.ERM_TicketOccurrenceLink (ERM_ErrorOccurrenceID);
 END
 GO
 
@@ -400,11 +623,14 @@ GO
    -----------------------------------------------------------------------------
    Who changed a configuration row, and when.  Kept deliberately generic.
    ============================================================================= */
-IF OBJECT_ID(N'erp_err.ConfigAudit', N'U') IS NULL
+IF OBJECT_ID(N'ERM.ERM_ConfigAudit', N'U') IS NULL
 BEGIN
-    CREATE TABLE erp_err.ConfigAudit
+    CREATE TABLE ERM.ERM_ConfigAudit
     (
-        AuditId         BIGINT          IDENTITY(1,1) NOT NULL,
+        [ROWID]       UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_ConfigAudit_ROWID DEFAULT (NEWID()),
+        [DBNo]        INT              NOT NULL CONSTRAINT DF_ConfigAudit_DBNo  DEFAULT (1),
+        [AppNo]       INT              NOT NULL CONSTRAINT DF_ConfigAudit_AppNo DEFAULT (1),
+        ERM_ConfigAuditID         BIGINT          IDENTITY(1,1) NOT NULL,
         TableName       NVARCHAR(128)   NOT NULL,
         KeyValue        NVARCHAR(200)   NOT NULL,
         Operation       VARCHAR(10)     NOT NULL,     -- INSERT | UPDATE | DELETE
@@ -412,9 +638,16 @@ BEGIN
         NewValuesJson   NVARCHAR(MAX)   NULL,
         ChangedByUserName NVARCHAR(200) NULL,
         ChangedUtc      DATETIME2(3)    NOT NULL CONSTRAINT DF_ConfigAudit_ChangedUtc DEFAULT (SYSUTCDATETIME()),
-        CONSTRAINT PK_ConfigAudit PRIMARY KEY CLUSTERED (AuditId)
+        /* ---- standard LinkedScam audit / status columns ---- */
+        [IsActive]    BIT      NOT NULL CONSTRAINT DF_ConfigAudit_IsActive  DEFAULT (1),
+        [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_ConfigAudit_IsDeleted DEFAULT (0),
+        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_ConfigAudit_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_ConfigAudit_CreatedDate DEFAULT (GETUTCDATE()),
+        [UpdatedBy]   INT      NULL,
+        [UpdatedDate] DATETIME NULL,
+        CONSTRAINT PK_ConfigAudit PRIMARY KEY CLUSTERED (ERM_ConfigAuditID)
     );
-    CREATE INDEX IX_ConfigAudit_Table ON erp_err.ConfigAudit (TableName, ChangedUtc DESC);
+    CREATE INDEX IX_ConfigAudit_Table ON ERM.ERM_ConfigAudit (TableName, ChangedUtc DESC);
 END
 GO
 
@@ -427,21 +660,31 @@ GO
    bubbling up.  Nothing reads this table at runtime; it exists so a silent
    capture failure is still discoverable.
    ============================================================================= */
-IF OBJECT_ID(N'erp_err.DeadLetter', N'U') IS NULL
+IF OBJECT_ID(N'ERM.ERM_DeadLetter', N'U') IS NULL
 BEGIN
-    CREATE TABLE erp_err.DeadLetter
+    CREATE TABLE ERM.ERM_DeadLetter
     (
-        DeadLetterId    BIGINT          IDENTITY(1,1) NOT NULL,
+        [ROWID]       UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_DeadLetter_ROWID DEFAULT (NEWID()),
+        [DBNo]        INT              NOT NULL CONSTRAINT DF_DeadLetter_DBNo  DEFAULT (1),
+        [AppNo]       INT              NOT NULL CONSTRAINT DF_DeadLetter_AppNo DEFAULT (1),
+        ERM_DeadLetterID    BIGINT          IDENTITY(1,1) NOT NULL,
         ReceivedUtc     DATETIME2(3)    NOT NULL CONSTRAINT DF_DeadLetter_Received DEFAULT (SYSUTCDATETIME()),
         Source          NVARCHAR(60)    NULL,          -- 'angular' | 'webapi2' | 'aspnetcore' | 'sql'
         RawEnvelopeJson NVARCHAR(MAX)   NULL,
         FailureReason   NVARCHAR(MAX)   NULL,
-        CONSTRAINT PK_DeadLetter PRIMARY KEY CLUSTERED (DeadLetterId)
+        /* ---- standard LinkedScam audit / status columns ---- */
+        [IsActive]    BIT      NOT NULL CONSTRAINT DF_DeadLetter_IsActive  DEFAULT (1),
+        [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_DeadLetter_IsDeleted DEFAULT (0),
+        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_DeadLetter_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_DeadLetter_CreatedDate DEFAULT (GETUTCDATE()),
+        [UpdatedBy]   INT      NULL,
+        [UpdatedDate] DATETIME NULL,
+        CONSTRAINT PK_DeadLetter PRIMARY KEY CLUSTERED (ERM_DeadLetterID)
     );
 END
 GO
 
-MERGE erp_err.SchemaVersion AS t
+MERGE ERM.ERM_SchemaVersion AS t
 USING (SELECT N'002_core_tables.sql' AS ScriptName) AS s
     ON t.ScriptName = s.ScriptName
 WHEN NOT MATCHED THEN

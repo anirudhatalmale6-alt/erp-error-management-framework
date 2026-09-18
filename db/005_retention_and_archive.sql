@@ -27,59 +27,62 @@ SET QUOTED_IDENTIFIER ON;
 GO
 
 /* ------------------------------------------------------- archive tables -- */
-IF OBJECT_ID(N'erp_err.ErrorOccurrence_Archive', N'U') IS NULL
+IF OBJECT_ID(N'ERM.ERM_ErrorOccurrence_Archive', N'U') IS NULL
 BEGIN
-    SELECT TOP 0 * INTO erp_err.ErrorOccurrence_Archive FROM erp_err.ErrorOccurrence;
-    ALTER TABLE erp_err.ErrorOccurrence_Archive ADD ArchivedUtc DATETIME2(3) NOT NULL
+    SELECT TOP 0 * INTO ERM.ERM_ErrorOccurrence_Archive FROM ERM.ERM_ErrorOccurrence;
+    ALTER TABLE ERM.ERM_ErrorOccurrence_Archive ADD ArchivedUtc DATETIME2(3) NOT NULL
         CONSTRAINT DF_OccArchive_ArchivedUtc DEFAULT (SYSUTCDATETIME());
-    CREATE CLUSTERED INDEX CX_OccArchive_OccurredUtc ON erp_err.ErrorOccurrence_Archive (OccurredUtc);
-    CREATE NONCLUSTERED INDEX IX_OccArchive_Reference ON erp_err.ErrorOccurrence_Archive (ErrorReference);
+    CREATE CLUSTERED INDEX CX_OccArchive_OccurredUtc ON ERM.ERM_ErrorOccurrence_Archive (OccurredUtc);
+    CREATE NONCLUSTERED INDEX IX_OccArchive_Reference ON ERM.ERM_ErrorOccurrence_Archive (ErrorReference);
 END
 GO
 
-IF OBJECT_ID(N'erp_err.ErrorOccurrenceDetail_Archive', N'U') IS NULL
+IF OBJECT_ID(N'ERM.ERM_ErrorOccurrenceDetail_Archive', N'U') IS NULL
 BEGIN
-    SELECT TOP 0 * INTO erp_err.ErrorOccurrenceDetail_Archive FROM erp_err.ErrorOccurrenceDetail;
-    ALTER TABLE erp_err.ErrorOccurrenceDetail_Archive ADD ArchivedUtc DATETIME2(3) NOT NULL
+    SELECT TOP 0 * INTO ERM.ERM_ErrorOccurrenceDetail_Archive FROM ERM.ERM_ErrorOccurrenceDetail;
+    ALTER TABLE ERM.ERM_ErrorOccurrenceDetail_Archive ADD ArchivedUtc DATETIME2(3) NOT NULL
         CONSTRAINT DF_DetailArchive_ArchivedUtc DEFAULT (SYSUTCDATETIME());
-    CREATE CLUSTERED INDEX CX_DetailArchive_OccurrenceId ON erp_err.ErrorOccurrenceDetail_Archive (OccurrenceId);
+    CREATE CLUSTERED INDEX CX_DetailArchive_OccurrenceId ON ERM.ERM_ErrorOccurrenceDetail_Archive (ERM_ErrorOccurrenceID);
 END
 GO
 
-IF OBJECT_ID(N'erp_err.Ticket_Archive', N'U') IS NULL
+IF OBJECT_ID(N'ERM.ERM_Ticket_Archive', N'U') IS NULL
 BEGIN
-    SELECT TOP 0 * INTO erp_err.Ticket_Archive FROM erp_err.Ticket;
-    ALTER TABLE erp_err.Ticket_Archive ADD ArchivedUtc DATETIME2(3) NOT NULL
+    SELECT TOP 0 * INTO ERM.ERM_Ticket_Archive FROM ERM.ERM_Ticket;
+    ALTER TABLE ERM.ERM_Ticket_Archive ADD ArchivedUtc DATETIME2(3) NOT NULL
         CONSTRAINT DF_TicketArchive_ArchivedUtc DEFAULT (SYSUTCDATETIME());
-    CREATE CLUSTERED INDEX CX_TicketArchive_ClosedUtc ON erp_err.Ticket_Archive (ClosedUtc);
-    CREATE NONCLUSTERED INDEX IX_TicketArchive_Number ON erp_err.Ticket_Archive (TicketNumber);
+    CREATE CLUSTERED INDEX CX_TicketArchive_ClosedUtc ON ERM.ERM_Ticket_Archive (ClosedUtc);
+    CREATE NONCLUSTERED INDEX IX_TicketArchive_Number ON ERM.ERM_Ticket_Archive (TicketNumber);
 END
 GO
 
-IF OBJECT_ID(N'erp_err.TicketStatusHistory_Archive', N'U') IS NULL
+IF OBJECT_ID(N'ERM.ERM_TicketStatusHistory_Archive', N'U') IS NULL
 BEGIN
-    SELECT TOP 0 * INTO erp_err.TicketStatusHistory_Archive FROM erp_err.TicketStatusHistory;
-    ALTER TABLE erp_err.TicketStatusHistory_Archive ADD ArchivedUtc DATETIME2(3) NOT NULL
+    SELECT TOP 0 * INTO ERM.ERM_TicketStatusHistory_Archive FROM ERM.ERM_TicketStatusHistory;
+    ALTER TABLE ERM.ERM_TicketStatusHistory_Archive ADD ArchivedUtc DATETIME2(3) NOT NULL
         CONSTRAINT DF_TSHArchive_ArchivedUtc DEFAULT (SYSUTCDATETIME());
-    CREATE CLUSTERED INDEX CX_TSHArchive_Ticket ON erp_err.TicketStatusHistory_Archive (TicketId, SequenceNo);
+    CREATE CLUSTERED INDEX CX_TSHArchive_Ticket ON ERM.ERM_TicketStatusHistory_Archive (ERM_TicketID, SequenceNo);
 END
 GO
 
-IF OBJECT_ID(N'erp_err.TicketComment_Archive', N'U') IS NULL
+IF OBJECT_ID(N'ERM.ERM_TicketComment_Archive', N'U') IS NULL
 BEGIN
-    SELECT TOP 0 * INTO erp_err.TicketComment_Archive FROM erp_err.TicketComment;
-    ALTER TABLE erp_err.TicketComment_Archive ADD ArchivedUtc DATETIME2(3) NOT NULL
+    SELECT TOP 0 * INTO ERM.ERM_TicketComment_Archive FROM ERM.ERM_TicketComment;
+    ALTER TABLE ERM.ERM_TicketComment_Archive ADD ArchivedUtc DATETIME2(3) NOT NULL
         CONSTRAINT DF_TCArchive_ArchivedUtc DEFAULT (SYSUTCDATETIME());
-    CREATE CLUSTERED INDEX CX_TCArchive_Ticket ON erp_err.TicketComment_Archive (TicketId, CommentId);
+    CREATE CLUSTERED INDEX CX_TCArchive_Ticket ON ERM.ERM_TicketComment_Archive (ERM_TicketID, ERM_TicketCommentID);
 END
 GO
 
 /* ------------------------------------------------------------- run log --- */
-IF OBJECT_ID(N'erp_err.RetentionRunLog', N'U') IS NULL
+IF OBJECT_ID(N'ERM.ERM_RetentionRunLog', N'U') IS NULL
 BEGIN
-    CREATE TABLE erp_err.RetentionRunLog
+    CREATE TABLE ERM.ERM_RetentionRunLog
     (
-        RunId           BIGINT          IDENTITY(1,1) NOT NULL,
+        [ROWID]       UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_RetentionRunLog_ROWID DEFAULT (NEWID()),
+        [DBNo]        INT              NOT NULL CONSTRAINT DF_RetentionRunLog_DBNo  DEFAULT (1),
+        [AppNo]       INT              NOT NULL CONSTRAINT DF_RetentionRunLog_AppNo DEFAULT (1),
+        ERM_RetentionRunLogID           BIGINT          IDENTITY(1,1) NOT NULL,
         StartedUtc      DATETIME2(3)    NOT NULL CONSTRAINT DF_RetentionRun_Started DEFAULT (SYSUTCDATETIME()),
         FinishedUtc     DATETIME2(3)    NULL,
         DataSet         NVARCHAR(40)    NOT NULL,
@@ -87,7 +90,14 @@ BEGIN
         RowsPurged      BIGINT          NOT NULL CONSTRAINT DF_RetentionRun_Purged   DEFAULT (0),
         Succeeded       BIT             NOT NULL CONSTRAINT DF_RetentionRun_Succeeded DEFAULT (0),
         ErrorMessage    NVARCHAR(MAX)   NULL,
-        CONSTRAINT PK_RetentionRunLog PRIMARY KEY CLUSTERED (RunId)
+        /* ---- standard LinkedScam audit / status columns ---- */
+        [IsActive]    BIT      NOT NULL CONSTRAINT DF_RetentionRunLog_IsActive  DEFAULT (1),
+        [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_RetentionRunLog_IsDeleted DEFAULT (0),
+        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_RetentionRunLog_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_RetentionRunLog_CreatedDate DEFAULT (GETUTCDATE()),
+        [UpdatedBy]   INT      NULL,
+        [UpdatedDate] DATETIME NULL,
+        CONSTRAINT PK_RetentionRunLog PRIMARY KEY CLUSTERED (ERM_RetentionRunLogID)
     );
 END
 GO
@@ -99,7 +109,7 @@ GO
    available on your edition).  @WhatIf = 1 reports what would move and changes
    nothing - run that first on production.
    ============================================================================= */
-CREATE OR ALTER PROCEDURE erp_err.usp_Retention_Apply
+CREATE OR ALTER PROCEDURE ERM.usp_Retention_Apply
 (
     @DataSet        NVARCHAR(40) = NULL,   -- NULL = every active policy
     @WhatIf         BIT = 0,
@@ -115,17 +125,17 @@ BEGIN
     DECLARE @policies TABLE (DataSet NVARCHAR(40), ArchiveAfterDays INT, PurgeAfterDays INT, BatchSize INT);
     INSERT @policies
     SELECT DataSet, ArchiveAfterDays, PurgeAfterDays, BatchSize
-    FROM erp_err.RetentionPolicy
+    FROM ERM.ERM_RetentionPolicy
     WHERE IsActive = 1 AND (@DataSet IS NULL OR DataSet = @DataSet);
 
     DECLARE @ds NVARCHAR(40), @archDays INT, @purgeDays INT, @batch INT;
     DECLARE @cutoff DATETIME2(3), @purgeCutoff DATETIME2(3);
-    DECLARE @rows INT, @totalArchived BIGINT, @totalPurged BIGINT, @batches INT, @RunId BIGINT;
+    DECLARE @rows INT, @totalArchived BIGINT, @totalPurged BIGINT, @batches INT, @ERM_RetentionRunLogID BIGINT;
 
     /* Declared here, not inside the loops: T-SQL DECLARE is batch-scoped, so a
        DECLARE that executes a second time raises "variable already declared". */
-    DECLARE @moving  TABLE (OccurrenceId BIGINT PRIMARY KEY);
-    DECLARE @movingT TABLE (TicketId     BIGINT PRIMARY KEY);
+    DECLARE @moving  TABLE (ERM_ErrorOccurrenceID BIGINT PRIMARY KEY);
+    DECLARE @movingT TABLE (ERM_TicketID     BIGINT PRIMARY KEY);
 
     DECLARE cur CURSOR LOCAL FAST_FORWARD FOR SELECT DataSet, ArchiveAfterDays, PurgeAfterDays, BatchSize FROM @policies;
     OPEN cur;
@@ -137,8 +147,8 @@ BEGIN
         SET @cutoff      = CASE WHEN @archDays  > 0 THEN DATEADD(DAY, -@archDays,  @Now) END;
         SET @purgeCutoff = CASE WHEN @purgeDays > 0 THEN DATEADD(DAY, -@purgeDays, @Now) END;
 
-        INSERT erp_err.RetentionRunLog (DataSet) VALUES (@ds);
-        SET @RunId = SCOPE_IDENTITY();
+        INSERT ERM.ERM_RetentionRunLog (DataSet) VALUES (@ds);
+        SET @ERM_RetentionRunLogID = SCOPE_IDENTITY();
 
         BEGIN TRY
             /* ============================ occurrence_detail ================ */
@@ -147,8 +157,8 @@ BEGIN
                 IF @WhatIf = 1
                 BEGIN
                     SELECT @ds AS DataSet, COUNT_BIG(*) AS RowsThatWouldArchive
-                    FROM erp_err.ErrorOccurrenceDetail d
-                    JOIN erp_err.ErrorOccurrence o ON o.OccurrenceId = d.OccurrenceId
+                    FROM ERM.ERM_ErrorOccurrenceDetail d
+                    JOIN ERM.ERM_ErrorOccurrence o ON o.ERM_ErrorOccurrenceID = d.ERM_ErrorOccurrenceID
                     WHERE o.OccurredUtc < @cutoff;
                 END
                 ELSE
@@ -161,17 +171,17 @@ BEGIN
                                no window where a row exists in both tables, and
                                no second read of the NVARCHAR(MAX) payloads. */
                             DELETE TOP (@batch) d
-                            OUTPUT deleted.OccurrenceId, deleted.StackTrace, deleted.InnerExceptionChain,
+                            OUTPUT deleted.ERM_ErrorOccurrenceID, deleted.StackTrace, deleted.InnerExceptionChain,
                                    deleted.RequestPayloadJson, deleted.ResponsePayloadJson,
                                    deleted.ValidationErrorsJson, deleted.BreadcrumbsJson,
                                    deleted.CustomDataJson, deleted.SqlStatementText, @Now
-                            INTO erp_err.ErrorOccurrenceDetail_Archive
-                                 (OccurrenceId, StackTrace, InnerExceptionChain, RequestPayloadJson,
+                            INTO ERM.ERM_ErrorOccurrenceDetail_Archive
+                                 (ERM_ErrorOccurrenceID, StackTrace, InnerExceptionChain, RequestPayloadJson,
                                   ResponsePayloadJson, ValidationErrorsJson, BreadcrumbsJson,
                                   CustomDataJson, SqlStatementText, ArchivedUtc)
-                            FROM erp_err.ErrorOccurrenceDetail d
-                            WHERE EXISTS (SELECT 1 FROM erp_err.ErrorOccurrence o
-                                          WHERE o.OccurrenceId = d.OccurrenceId AND o.OccurredUtc < @cutoff);
+                            FROM ERM.ERM_ErrorOccurrenceDetail d
+                            WHERE EXISTS (SELECT 1 FROM ERM.ERM_ErrorOccurrence o
+                                          WHERE o.ERM_ErrorOccurrenceID = d.ERM_ErrorOccurrenceID AND o.OccurredUtc < @cutoff);
                             SET @rows = @@ROWCOUNT;
                         COMMIT TRANSACTION;
                         SET @totalArchived += @rows;
@@ -184,7 +194,7 @@ BEGIN
                     SET @rows = 1; SET @batches = 0;
                     WHILE @rows > 0 AND @batches < @MaxBatches
                     BEGIN
-                        DELETE TOP (@batch) FROM erp_err.ErrorOccurrenceDetail_Archive
+                        DELETE TOP (@batch) FROM ERM.ERM_ErrorOccurrenceDetail_Archive
                         WHERE ArchivedUtc < @purgeCutoff;
                         SET @rows = @@ROWCOUNT; SET @totalPurged += @rows; SET @batches += 1;
                     END
@@ -199,8 +209,8 @@ BEGIN
                 IF @WhatIf = 1
                 BEGIN
                     SELECT @ds AS DataSet, COUNT_BIG(*) AS RowsThatWouldArchive
-                    FROM erp_err.ErrorOccurrence o
-                    WHERE o.OccurredUtc < @cutoff AND o.TicketId IS NULL;
+                    FROM ERM.ERM_ErrorOccurrence o
+                    WHERE o.OccurredUtc < @cutoff AND o.ERM_TicketID IS NULL;
                 END
                 ELSE
                 BEGIN
@@ -210,34 +220,34 @@ BEGIN
                         BEGIN TRANSACTION;
                             DELETE @moving;
 
-                            INSERT @moving (OccurrenceId)
-                            SELECT TOP (@batch) o.OccurrenceId
-                            FROM erp_err.ErrorOccurrence o
+                            INSERT @moving (ERM_ErrorOccurrenceID)
+                            SELECT TOP (@batch) o.ERM_ErrorOccurrenceID
+                            FROM ERM.ERM_ErrorOccurrence o
                             WHERE o.OccurredUtc < @cutoff
                               /* An occurrence attached to a ticket is evidence.
                                  It ages out with its ticket, not on its own. */
-                              AND o.TicketId IS NULL
+                              AND o.ERM_TicketID IS NULL
                               /* Never orphan a child that is still hot. */
-                              AND NOT EXISTS (SELECT 1 FROM erp_err.ErrorOccurrence ch
-                                              WHERE ch.ParentOccurrenceId = o.OccurrenceId)
+                              AND NOT EXISTS (SELECT 1 FROM ERM.ERM_ErrorOccurrence ch
+                                              WHERE ch.ParentOccurrenceID = o.ERM_ErrorOccurrenceID)
                             ORDER BY o.OccurredUtc;
 
                             SET @rows = @@ROWCOUNT;
 
                             IF @rows > 0
                             BEGIN
-                                DELETE d FROM erp_err.ErrorOccurrenceDetail d
-                                JOIN @moving m ON m.OccurrenceId = d.OccurrenceId;
+                                DELETE d FROM ERM.ERM_ErrorOccurrenceDetail d
+                                JOIN @moving m ON m.ERM_ErrorOccurrenceID = d.ERM_ErrorOccurrenceID;
 
-                                DELETE li FROM erp_err.TicketOccurrenceLink li
-                                JOIN @moving m ON m.OccurrenceId = li.OccurrenceId;
+                                DELETE li FROM ERM.ERM_TicketOccurrenceLink li
+                                JOIN @moving m ON m.ERM_ErrorOccurrenceID = li.ERM_ErrorOccurrenceID;
 
-                                INSERT erp_err.ErrorOccurrence_Archive
-                                SELECT o.*, @Now FROM erp_err.ErrorOccurrence o
-                                JOIN @moving m ON m.OccurrenceId = o.OccurrenceId;
+                                INSERT ERM.ERM_ErrorOccurrence_Archive
+                                SELECT o.*, @Now FROM ERM.ERM_ErrorOccurrence o
+                                JOIN @moving m ON m.ERM_ErrorOccurrenceID = o.ERM_ErrorOccurrenceID;
 
-                                DELETE o FROM erp_err.ErrorOccurrence o
-                                JOIN @moving m ON m.OccurrenceId = o.OccurrenceId;
+                                DELETE o FROM ERM.ERM_ErrorOccurrence o
+                                JOIN @moving m ON m.ERM_ErrorOccurrenceID = o.ERM_ErrorOccurrenceID;
                             END
                         COMMIT TRANSACTION;
                         SET @totalArchived += @rows;
@@ -250,7 +260,7 @@ BEGIN
                     SET @rows = 1; SET @batches = 0;
                     WHILE @rows > 0 AND @batches < @MaxBatches
                     BEGIN
-                        DELETE TOP (@batch) FROM erp_err.ErrorOccurrence_Archive WHERE OccurredUtc < @purgeCutoff;
+                        DELETE TOP (@batch) FROM ERM.ERM_ErrorOccurrence_Archive WHERE OccurredUtc < @purgeCutoff;
                         SET @rows = @@ROWCOUNT; SET @totalPurged += @rows; SET @batches += 1;
                     END
                 END
@@ -265,10 +275,10 @@ BEGIN
                     BEGIN TRANSACTION;
                         DELETE @movingT;
 
-                        INSERT @movingT (TicketId)
-                        SELECT TOP (@batch) t.TicketId
-                        FROM erp_err.Ticket t
-                        JOIN erp_err.TicketStatus s ON s.StatusId = t.StatusId
+                        INSERT @movingT (ERM_TicketID)
+                        SELECT TOP (@batch) t.ERM_TicketID
+                        FROM ERM.ERM_Ticket t
+                        JOIN ERM.ERM_TicketStatus s ON s.StatusID = t.StatusID
                         WHERE s.IsTerminal = 1 AND t.ClosedUtc IS NOT NULL AND t.ClosedUtc < @cutoff
                         ORDER BY t.ClosedUtc;
 
@@ -276,32 +286,32 @@ BEGIN
 
                         IF @rows > 0
                         BEGIN
-                            INSERT erp_err.TicketStatusHistory_Archive
-                            SELECT h.*, @Now FROM erp_err.TicketStatusHistory h
-                            JOIN @movingT m ON m.TicketId = h.TicketId;
+                            INSERT ERM.ERM_TicketStatusHistory_Archive
+                            SELECT h.*, @Now FROM ERM.ERM_TicketStatusHistory h
+                            JOIN @movingT m ON m.ERM_TicketID = h.ERM_TicketID;
 
-                            INSERT erp_err.TicketComment_Archive
-                            SELECT c.*, @Now FROM erp_err.TicketComment c
-                            JOIN @movingT m ON m.TicketId = c.TicketId;
+                            INSERT ERM.ERM_TicketComment_Archive
+                            SELECT c.*, @Now FROM ERM.ERM_TicketComment c
+                            JOIN @movingT m ON m.ERM_TicketID = c.ERM_TicketID;
 
-                            INSERT erp_err.Ticket_Archive
-                            SELECT t.*, @Now FROM erp_err.Ticket t
-                            JOIN @movingT m ON m.TicketId = t.TicketId;
+                            INSERT ERM.ERM_Ticket_Archive
+                            SELECT t.*, @Now FROM ERM.ERM_Ticket t
+                            JOIN @movingT m ON m.ERM_TicketID = t.ERM_TicketID;
 
                             /* Release every reference before deleting the ticket. */
-                            UPDATE o SET TicketId = NULL
-                            FROM erp_err.ErrorOccurrence o
-                            JOIN @movingT m ON m.TicketId = o.TicketId;
+                            UPDATE o SET ERM_TicketID = NULL
+                            FROM ERM.ERM_ErrorOccurrence o
+                            JOIN @movingT m ON m.ERM_TicketID = o.ERM_TicketID;
 
-                            UPDATE f SET OpenTicketId = NULL
-                            FROM erp_err.ErrorFingerprint f
-                            JOIN @movingT m ON m.TicketId = f.OpenTicketId;
+                            UPDATE f SET OpenTicketID = NULL
+                            FROM ERM.ERM_ErrorFingerprint f
+                            JOIN @movingT m ON m.ERM_TicketID = f.OpenTicketID;
 
-                            DELETE li FROM erp_err.TicketOccurrenceLink li
-                            JOIN @movingT m ON m.TicketId = li.TicketId;
+                            DELETE li FROM ERM.ERM_TicketOccurrenceLink li
+                            JOIN @movingT m ON m.ERM_TicketID = li.ERM_TicketID;
 
                             /* TicketStatusHistory and TicketComment cascade. */
-                            DELETE t FROM erp_err.Ticket t JOIN @movingT m ON m.TicketId = t.TicketId;
+                            DELETE t FROM ERM.ERM_Ticket t JOIN @movingT m ON m.ERM_TicketID = t.ERM_TicketID;
                         END
                     COMMIT TRANSACTION;
                     SET @totalArchived += @rows;
@@ -315,28 +325,28 @@ BEGIN
                 SET @rows = 1;
                 WHILE @rows > 0 AND @batches < @MaxBatches
                 BEGIN
-                    DELETE TOP (@batch) FROM erp_err.ConfigAudit WHERE ChangedUtc < @cutoff;
+                    DELETE TOP (@batch) FROM ERM.ERM_ConfigAudit WHERE ChangedUtc < @cutoff;
                     SET @rows = @@ROWCOUNT; SET @totalPurged += @rows; SET @batches += 1;
                 END
                 SET @rows = 1; SET @batches = 0;
                 WHILE @rows > 0 AND @batches < @MaxBatches
                 BEGIN
-                    DELETE TOP (@batch) FROM erp_err.DeadLetter WHERE ReceivedUtc < @cutoff;
+                    DELETE TOP (@batch) FROM ERM.ERM_DeadLetter WHERE ReceivedUtc < @cutoff;
                     SET @rows = @@ROWCOUNT; SET @totalPurged += @rows; SET @batches += 1;
                 END
             END
 
-            UPDATE erp_err.RetentionRunLog
+            UPDATE ERM.ERM_RetentionRunLog
                SET FinishedUtc = SYSUTCDATETIME(), RowsArchived = @totalArchived,
                    RowsPurged = @totalPurged, Succeeded = 1
-             WHERE RunId = @RunId;
+             WHERE ERM_RetentionRunLogID = @ERM_RetentionRunLogID;
         END TRY
         BEGIN CATCH
             IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
-            UPDATE erp_err.RetentionRunLog
+            UPDATE ERM.ERM_RetentionRunLog
                SET FinishedUtc = SYSUTCDATETIME(), RowsArchived = @totalArchived,
                    RowsPurged = @totalPurged, Succeeded = 0, ErrorMessage = ERROR_MESSAGE()
-             WHERE RunId = @RunId;
+             WHERE ERM_RetentionRunLogID = @ERM_RetentionRunLogID;
         END CATCH
 
         FETCH NEXT FROM cur INTO @ds, @archDays, @purgeDays, @batch;
@@ -344,27 +354,27 @@ BEGIN
     CLOSE cur; DEALLOCATE cur;
 
     SELECT DataSet, StartedUtc, FinishedUtc, RowsArchived, RowsPurged, Succeeded, ErrorMessage
-    FROM erp_err.RetentionRunLog
+    FROM ERM.ERM_RetentionRunLog
     WHERE StartedUtc >= @Now
-    ORDER BY RunId;
+    ORDER BY ERM_RetentionRunLogID;
 END
 GO
 
 /* Unified read across hot + archive, for the rare "find that error from last
    year" case.  Deliberately a view and not the default search path.          */
-CREATE OR ALTER VIEW erp_err.vw_ErrorOccurrence_All
+CREATE OR ALTER VIEW ERM.vw_ErrorOccurrence_All
 AS
-    SELECT CONVERT(BIT,0) AS IsArchived, o.OccurrenceId, o.ErrorReference, o.FingerprintId,
-           o.OccurredUtc, o.LayerId, o.CategoryId, o.SeverityId, o.ExceptionType, o.Message,
+    SELECT CONVERT(BIT,0) AS IsArchived, o.ERM_ErrorOccurrenceID, o.ErrorReference, o.ERM_ErrorFingerprintID,
+           o.OccurredUtc, o.LayerID, o.CategoryID, o.SeverityID, o.ExceptionType, o.Message,
            o.ErpModule, o.Screen, o.Component, o.ApiEndpoint, o.SqlErrorNumber, o.SqlObjectName,
-           o.UserName, o.CorrelationId, o.Environment, o.TicketId
-    FROM erp_err.ErrorOccurrence o
+           o.UserName, o.CorrelationID, o.Environment, o.ERM_TicketID
+    FROM ERM.ERM_ErrorOccurrence o
     UNION ALL
-    SELECT CONVERT(BIT,1) AS IsArchived, a.OccurrenceId, a.ErrorReference, a.FingerprintId,
-           a.OccurredUtc, a.LayerId, a.CategoryId, a.SeverityId, a.ExceptionType, a.Message,
+    SELECT CONVERT(BIT,1) AS IsArchived, a.ERM_ErrorOccurrenceID, a.ErrorReference, a.ERM_ErrorFingerprintID,
+           a.OccurredUtc, a.LayerID, a.CategoryID, a.SeverityID, a.ExceptionType, a.Message,
            a.ErpModule, a.Screen, a.Component, a.ApiEndpoint, a.SqlErrorNumber, a.SqlObjectName,
-           a.UserName, a.CorrelationId, a.Environment, a.TicketId
-    FROM erp_err.ErrorOccurrence_Archive a;
+           a.UserName, a.CorrelationID, a.Environment, a.ERM_TicketID
+    FROM ERM.ERM_ErrorOccurrence_Archive a;
 GO
 
 /* -----------------------------------------------------------------------------
@@ -379,7 +389,7 @@ GO
             SIZE = 512MB, FILEGROWTH = 256MB) TO FILEGROUP FG_ErrArchive;
 
        CREATE CLUSTERED INDEX CX_OccArchive_OccurredUtc
-           ON erp_err.ErrorOccurrence_Archive (OccurredUtc)
+           ON ERM.ERM_ErrorOccurrence_Archive (OccurredUtc)
            WITH (DROP_EXISTING = ON, ONLINE = ON) ON FG_ErrArchive;
 
    On Enterprise/Developer edition the hot ErrorOccurrence table is a good
@@ -397,7 +407,7 @@ GO
             @step_name = N'Apply retention policies',
             @subsystem = N'TSQL',
             @database_name = N'YourErpDb',
-            @command = N'EXEC erp_err.usp_Retention_Apply;';
+            @command = N'EXEC ERM.usp_Retention_Apply;';
        EXEC msdb.dbo.sp_add_jobschedule
             @job_name = N'ERP Error Mgmt - Retention',
             @name = N'Nightly 02:15',
@@ -405,7 +415,7 @@ GO
        EXEC msdb.dbo.sp_add_jobserver @job_name = N'ERP Error Mgmt - Retention';
    ----------------------------------------------------------------------------- */
 
-MERGE erp_err.SchemaVersion AS t
+MERGE ERM.ERM_SchemaVersion AS t
 USING (SELECT N'005_retention_and_archive.sql' AS ScriptName) AS s
     ON t.ScriptName = s.ScriptName
 WHEN NOT MATCHED THEN

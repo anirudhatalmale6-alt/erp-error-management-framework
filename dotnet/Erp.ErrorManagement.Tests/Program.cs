@@ -45,6 +45,7 @@ namespace Erp.ErrorManagement.Tests
             RunEndUserSqlChecks(Path.Combine(repoRoot, "db"));
             RunDynamicSqlChecks(Path.Combine(repoRoot, "db"));
             RunSupportAccessChecks(Path.Combine(repoRoot, "db"), repoRoot);
+            RunLinkedScamStandardsChecks(Path.Combine(repoRoot, "db"));
 
             Console.WriteLine();
             Console.WriteLine(_failures == 0
@@ -470,13 +471,13 @@ namespace Erp.ErrorManagement.Tests
 
             Check("ownership predicate exists", sql.Contains("fn_UserOwnsTicket"), true);
 
-            var ownsFn = Section(sql, "FUNCTION erp_err.fn_UserOwnsTicket");
+            var ownsFn = Section(sql, "FUNCTION ERM.fn_UserOwnsTicket");
             Check("an anonymous caller owns nothing",
-                ownsFn.Contains("@UserId IS NULL AND @UserName IS NULL") && ownsFn.Contains("RETURN 0"),
+                ownsFn.Contains("@UserID IS NULL AND @UserName IS NULL") && ownsFn.Contains("RETURN 0"),
                 true);
 
-            var getForUser = Section(sql, "PROCEDURE erp_err.usp_Ticket_GetForUser");
-            var addComment = Section(sql, "PROCEDURE erp_err.usp_Ticket_AddUserComment");
+            var getForUser = Section(sql, "PROCEDURE ERM.usp_Ticket_GetForUser");
+            var addComment = Section(sql, "PROCEDURE ERM.usp_Ticket_AddUserComment");
 
             Check("usp_Ticket_GetForUser gates on the ownership check",
                 getForUser.Contains("fn_UserOwnsTicket"), true);
@@ -538,9 +539,9 @@ namespace Erp.ErrorManagement.Tests
 
             var procs = new[]
             {
-                "PROCEDURE erp_err.usp_Error_Search",
-                "PROCEDURE erp_err.usp_Ticket_Search",
-                "PROCEDURE erp_err.usp_Error_RecurringProblems",
+                "PROCEDURE ERM.usp_Error_Search",
+                "PROCEDURE ERM.usp_Ticket_Search",
+                "PROCEDURE ERM.usp_Error_RecurringProblems",
             };
 
             var totalVariants = 0;
@@ -582,7 +583,7 @@ namespace Erp.ErrorManagement.Tests
 
             // The security property of the whole approach: the caller's sort
             // value must never reach the SQL text. It is a lookup key only.
-            var searchBody = Section(sql, "PROCEDURE erp_err.usp_Error_Search");
+            var searchBody = Section(sql, "PROCEDURE ERM.usp_Error_Search");
             Check("@SortBy is never concatenated into the SQL text",
                 searchBody.Contains("+ @SortBy") || searchBody.Contains("@SortBy +"), false);
             Check("...it is resolved through the whitelist instead",
@@ -593,14 +594,14 @@ namespace Erp.ErrorManagement.Tests
                 searchBody.Contains("sp_executesql") && searchBody.Contains("@SearchText NVARCHAR(200)"), true);
 
             // The defect this script exists to fix: no per-row correlated count.
-            var recurring = Section(sql, "PROCEDURE erp_err.usp_Error_RecurringProblems");
+            var recurring = Section(sql, "PROCEDURE ERM.usp_Error_RecurringProblems");
             Check("recurring problems no longer counts per fingerprint row",
                 recurring.Contains("CROSS APPLY"), false);
             Check("...it aggregates the window once, with HAVING",
-                recurring.Contains("GROUP BY o.FingerprintId") && recurring.Contains("HAVING COUNT_BIG(*)"), true);
+                recurring.Contains("GROUP BY o.ERM_ErrorFingerprintID") && recurring.Contains("HAVING COUNT_BIG(*)"), true);
 
             // Bounded reads.
-            var trail = Section(sql, "PROCEDURE erp_err.usp_Error_GetCorrelationTrail");
+            var trail = Section(sql, "PROCEDURE ERM.usp_Error_GetCorrelationTrail");
             Check("correlation trail is bounded by TOP (@MaxRows)",
                 trail.Contains("TOP (@MaxRows)"), true);
             Check("...and reports the true total so truncation is visible",
@@ -614,7 +615,8 @@ namespace Erp.ErrorManagement.Tests
                 whitelistBlock, @"N'((?:o|t|f|w|sv|st|q|l)\.[^']*)'");
             var noTiebreak = clauses
                 .Select(m => m.Groups[1].Value)
-                .Where(c => !c.Contains("OccurrenceId") && !c.Contains("TicketId") && !c.Contains("FingerprintId"))
+                .Where(c => !c.Contains("ERM_ErrorOccurrenceID") && !c.Contains("ERM_TicketID")
+                         && !c.Contains("ERM_ErrorFingerprintID"))
                 .ToList();
             Check("every whitelisted sort ends with a unique tiebreaker",
                 noTiebreak.Count == 0 ? "none missing" : string.Join(" | ", noTiebreak),
@@ -623,6 +625,118 @@ namespace Erp.ErrorManagement.Tests
         }
 
         /* ======================== support access / manual tickets ======= */
+
+        /* ================== LinkedScam ERP standards compliance ========= */
+
+        /// <summary>
+        /// Enforce the three LinkedScam standards documents against every
+        /// object the framework creates.
+        ///
+        /// A rename is only worth doing if it stays done. These checks fail the
+        /// build the moment a new table is added that forgets the standard
+        /// columns, or is named the old way - which is exactly the mistake
+        /// somebody makes six months from now when adding one more table.
+        /// </summary>
+        private static void RunLinkedScamStandardsChecks(string dbFolder)
+        {
+            Console.WriteLine("\n=== LinkedScam ERP database standards ===");
+
+            var all = string.Join("\n", Directory.GetFiles(dbFolder, "*.sql").OrderBy(f => f)
+                .Select(f => StripSqlComments(File.ReadAllText(f))));
+
+            // --- naming convention -------------------------------------------
+            Check("the old erp_err schema is gone from every script",
+                all.Contains("erp_err"), false);
+            Check("the schema is ERM", all.Contains("CREATE SCHEMA [ERM]"), true);
+
+            var creates = System.Text.RegularExpressions.Regex.Matches(all, @"CREATE TABLE\s+([\[\]\w.]+)")
+                .Select(m => m.Groups[1].Value.Replace("[", "").Replace("]", ""))
+                .Where(n => !n.StartsWith("#"))
+                .ToList();
+
+            Check("there are tables to check", creates.Count > 0, true);
+
+            var misnamed = creates.Where(n => !n.StartsWith("ERM.ERM_")).ToList();
+            Check("every table is ERM.ERM_TableName",
+                misnamed.Count == 0 ? "all conform" : string.Join(", ", misnamed), "all conform");
+
+            // --- table structure ---------------------------------------------
+            var missingStd = new List<string>();
+            var wrongOrder = new List<string>();
+
+            foreach (var m in System.Text.RegularExpressions.Regex.Matches(
+                         all, @"CREATE TABLE\s+ERM\.(ERM_\w+)\s*\n\s*\(").Cast<System.Text.RegularExpressions.Match>())
+            {
+                var name = m.Groups[1].Value;
+
+                // Archive tables are created by SELECT TOP 0 * INTO elsewhere;
+                // these are the ones declared column by column.
+                var depth = 1;
+                var i = m.Index + m.Length;
+                while (i < all.Length && depth > 0)
+                {
+                    if (all[i] == '(') depth++;
+                    else if (all[i] == ')') depth--;
+                    i++;
+                }
+                var body = all.Substring(m.Index + m.Length, i - 1 - (m.Index + m.Length));
+
+                foreach (var col in new[] { "ROWID", "DBNo", "AppNo", "IsActive", "IsDeleted",
+                                            "CreatedBy", "CreatedDate", "UpdatedBy", "UpdatedDate" })
+                {
+                    if (!System.Text.RegularExpressions.Regex.IsMatch(body, @"\[" + col + @"\]"))
+                        missingStd.Add($"{name}.{col}");
+                }
+
+                // Order: ROWID/DBNo/AppNo lead, the audit block trails.
+                var iRow = body.IndexOf("[ROWID]", StringComparison.Ordinal);
+                var iApp = body.IndexOf("[AppNo]", StringComparison.Ordinal);
+                var iAct = body.IndexOf("[IsActive]", StringComparison.Ordinal);
+                var iUpd = body.IndexOf("[UpdatedDate]", StringComparison.Ordinal);
+                if (iRow < 0 || iApp < iRow || iAct < iApp || iUpd < iAct) wrongOrder.Add(name);
+            }
+
+            Check("every declared table carries all nine standard columns",
+                missingStd.Count == 0 ? "all present" : string.Join(", ", missingStd.Take(6)), "all present");
+            Check("standard columns are in the prescribed order",
+                wrongOrder.Count == 0 ? "correct" : string.Join(", ", wrongOrder), "correct");
+
+            Check("CreatedBy has a system-user default, so framework rows satisfy NOT NULL",
+                all.Contains("DEFAULT (ERM.fn_SystemUserID())"), true);
+            Check("the system user id is a constant, not a per-row table read",
+                System.Text.RegularExpressions.Regex.IsMatch(all, @"fn_SystemUserID[\s\S]{0,400}?RETURN 0;"), true);
+            Check("timestamps use the UTC standard",
+                all.Contains("DEFAULT (GETUTCDATE())"), true);
+
+            // --- reference code format ---------------------------------------
+            var refgen = Section(all, "PROCEDURE ERM.usp_NextReference");
+            Check("the reference generator exists", refgen.Length > 0, true);
+            Check("format is LS-ERM-<TYPE>-YYMMDD-<n>",
+                refgen.Contains("'LS-ERM-'") && refgen.Contains("FORMAT(@Today, 'yyMMdd')"), true);
+            Check("ticket and error counters are separate (keyed by type)",
+                refgen.Contains("RefType = @RefType"), true);
+            Check("the counter is per calendar day",
+                refgen.Contains("RefDate = @Today"), true);
+            Check("the date is UTC, matching every other timestamp",
+                refgen.Contains("CONVERT(DATE, GETUTCDATE())"), true);
+
+            // The concurrency requirement, asserted as SHAPE: increment and
+            // return in ONE statement, never read-then-write.
+            Check("increments atomically with UPDATE ... OUTPUT",
+                refgen.Contains("OUTPUT inserted.LastValue"), true);
+            Check("does NOT use SELECT MAX(...)+1, which races",
+                refgen.Contains("MAX(LastValue)") || refgen.Contains("SELECT MAX"), false);
+            Check("handles the first-of-day insert race by duplicate-key retry",
+                refgen.Contains("2627") && refgen.Contains("2601"), true);
+            Check("the old daily-incapable SEQUENCE is gone",
+                all.Contains("NEXT VALUE FOR"), false);
+
+            // POSITIVE CONTROL: the scanner really is reading the scripts.
+            Check("positive control: a table that does not exist is not found",
+                creates.Contains("ERM.ERM_NoSuchTable"), false);
+            Check("positive control: a known table IS found",
+                creates.Contains("ERM.ERM_Ticket"), true);
+        }
 
         /// <summary>
         /// Structural guarantees for admin access and manual tickets.
@@ -643,23 +757,23 @@ namespace Erp.ErrorManagement.Tests
             var sql = StripSqlComments(File.ReadAllText(path));
 
             // --- authorisation fails closed --------------------------------
-            var cap = Section(sql, "FUNCTION erp_err.fn_SupportCapability");
+            var cap = Section(sql, "FUNCTION ERM.fn_SupportCapability");
             Check("capability check exists", cap.Length > 0, true);
             Check("no identity -> no capability (fails closed)",
-                cap.Contains("@UserId IS NULL AND @UserName IS NULL") && cap.Contains("RETURN 0"), true);
+                cap.Contains("@UserID IS NULL AND @UserName IS NULL") && cap.Contains("RETURN 0"), true);
             Check("an unknown capability name grants nothing",
                 cap.Contains("ELSE CONVERT(BIT, 0)"), true);
             Check("only ACTIVE roster rows and ACTIVE roles count",
                 cap.Contains("su.IsActive = 1") && cap.Contains("r.IsActive = 1"), true);
 
             // --- assignment is validated and audited ----------------------
-            var assign = Section(sql, "PROCEDURE erp_err.usp_Ticket_Assign");
+            var assign = Section(sql, "PROCEDURE ERM.usp_Ticket_Assign");
             Check("assignment requires the 'manage' capability",
                 assign.Contains("fn_SupportCapability") && assign.Contains("N'manage'"), true);
             Check("the assignee is validated against the roster",
                 assign.Contains("CanBeAssigned = 1"), true);
             Check("assignment writes a history row",
-                assign.Contains("INSERT erp_err.TicketStatusHistory"), true);
+                assign.Contains("INSERT ERM.ERM_TicketStatusHistory"), true);
             Check("...recording WHO it was assigned to",
                 assign.Contains("@targetName"), true);
             Check("...and who it was taken FROM, so reassignment is auditable",
@@ -669,12 +783,12 @@ namespace Erp.ErrorManagement.Tests
             // A reassignment is not a status change, so it must not be recorded
             // as one - that would corrupt the minutes-in-status accounting.
             Check("the assignment row does NOT fabricate a status transition",
-                assign.Contains("@StatusId, @StatusId"), true);
+                assign.Contains("@StatusID, @StatusID"), true);
             Check("assignment detail is internal, not shown to the end user",
                 assign.Contains("N'assignment')"), true);
 
             // --- manual tickets -------------------------------------------
-            var manual = Section(sql, "PROCEDURE erp_err.usp_Ticket_CreateManual");
+            var manual = Section(sql, "PROCEDURE ERM.usp_Ticket_CreateManual");
             // Asserted on the VALUES list, not on the inline comment next to it -
             // StripSqlComments removes the comment, so matching "1 /*new*/"
             // could never succeed. OccurrenceId and FingerprintId are both NULL.
@@ -683,11 +797,11 @@ namespace Erp.ErrorManagement.Tests
             Check("a manual ticket must have an owner",
                 manual.Contains("A manual ticket must have an owner"), true);
             Check("severity comes from the CATEGORY, not the caller's wish",
-                manual.Contains("DefaultSeverityId FROM erp_err.RequestCategory"), true);
+                manual.Contains("DefaultSeverityID FROM ERM.ERM_RequestCategory"), true);
             Check("manual tickets are marked as such", manual.Contains("N'manual'"), true);
 
             Check("Ticket.FingerprintId is relaxed to NULL for manual tickets",
-                sql.Contains("ALTER COLUMN FingerprintId BIGINT NULL"), true);
+                sql.Contains("ALTER COLUMN ERM_ErrorFingerprintID BIGINT NULL"), true);
             Check("a CHECK constraint stops a ticket being neither error nor manual",
                 sql.Contains("CK_Ticket_SourceIntegrity"), true);
 

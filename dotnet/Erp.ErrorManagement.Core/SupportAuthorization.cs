@@ -89,7 +89,7 @@ namespace Erp.ErrorManagement
     }
 
     /// <summary>
-    /// Resolves support identity from the erp_err roster.
+    /// Resolves support identity from the ERM roster.
     ///
     /// DESIGN NOTE - why the roster and not just the JWT role claim.
     ///
@@ -127,7 +127,7 @@ namespace Erp.ErrorManagement
             try
             {
                 using (var connection = new SqlConnection(_options.ConnectionString))
-                using (var command = new SqlCommand("erp_err.usp_Support_WhoAmI", connection))
+                using (var command = new SqlCommand("ERM.usp_Support_WhoAmI", connection))
                 {
                     command.CommandType = CommandType.StoredProcedure;
                     command.CommandTimeout = _options.CommandTimeoutSeconds;
@@ -190,7 +190,7 @@ namespace Erp.ErrorManagement
             try
             {
                 using (var connection = new SqlConnection(_options.ConnectionString))
-                using (var command = new SqlCommand("erp_err.usp_SupportUser_ListAssignable", connection))
+                using (var command = new SqlCommand("ERM.usp_SupportUser_ListAssignable", connection))
                 {
                     command.CommandType = CommandType.StoredProcedure;
                     command.CommandTimeout = _options.CommandTimeoutSeconds;

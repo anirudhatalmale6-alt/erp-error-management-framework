@@ -37,7 +37,7 @@
    Creates an Extended Events session on `error_reported`, which fires when SQL
    Server RAISES the error - before any TRY/CATCH gets the chance to absorb it.
    A scheduled procedure then reads the session's ring buffer and writes what it
-   finds into erp_err as database-layer occurrences.
+   finds into ERM as database-layer occurrences.
 
    WHAT IT COSTS, HONESTLY
    -----------------------
@@ -74,11 +74,14 @@ SET QUOTED_IDENTIFIER ON;
 GO
 
 /* --------------------------------------------------------- landing table -- */
-IF OBJECT_ID(N'erp_err.SwallowedSqlError', N'U') IS NULL
+IF OBJECT_ID(N'ERM.ERM_SwallowedSqlError', N'U') IS NULL
 BEGIN
-    CREATE TABLE erp_err.SwallowedSqlError
+    CREATE TABLE ERM.ERM_SwallowedSqlError
     (
-        SwallowedId     BIGINT          IDENTITY(1,1) NOT NULL,
+        [ROWID]       UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SwallowedSqlError_ROWID DEFAULT (NEWID()),
+        [DBNo]        INT              NOT NULL CONSTRAINT DF_SwallowedSqlError_DBNo  DEFAULT (1),
+        [AppNo]       INT              NOT NULL CONSTRAINT DF_SwallowedSqlError_AppNo DEFAULT (1),
+        ERM_SwallowedSqlErrorID     BIGINT          IDENTITY(1,1) NOT NULL,
         /* The timestamp from the event itself, not from the collector. */
         RaisedUtc       DATETIME2(3)    NOT NULL,
         CollectedUtc    DATETIME2(3)    NOT NULL CONSTRAINT DF_Swallowed_Collected DEFAULT (SYSUTCDATETIME()),
@@ -87,22 +90,29 @@ BEGIN
         ErrorState      TINYINT         NULL,
         Message         NVARCHAR(2000)  NULL,
         DatabaseName    NVARCHAR(128)   NULL,
-        SessionId       INT             NULL,   -- SPID
+        SessionID       INT             NULL,   -- SPID
         ClientHostName  NVARCHAR(128)   NULL,
         ClientAppName   NVARCHAR(256)   NULL,
         SqlText         NVARCHAR(MAX)   NULL,
         /* Set once the row has been promoted into ErrorOccurrence, so the
            collector is idempotent and can be re-run safely. */
-        PromotedOccurrenceId BIGINT     NULL,
-        CONSTRAINT PK_SwallowedSqlError PRIMARY KEY CLUSTERED (SwallowedId)
+        PromotedOccurrenceID BIGINT     NULL,
+        /* ---- standard LinkedScam audit / status columns ---- */
+        [IsActive]    BIT      NOT NULL CONSTRAINT DF_SwallowedSqlError_IsActive  DEFAULT (1),
+        [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_SwallowedSqlError_IsDeleted DEFAULT (0),
+        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_SwallowedSqlError_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_SwallowedSqlError_CreatedDate DEFAULT (GETUTCDATE()),
+        [UpdatedBy]   INT      NULL,
+        [UpdatedDate] DATETIME NULL,
+        CONSTRAINT PK_SwallowedSqlError PRIMARY KEY CLUSTERED (ERM_SwallowedSqlErrorID)
     );
 
-    CREATE INDEX IX_Swallowed_RaisedUtc ON erp_err.SwallowedSqlError (RaisedUtc DESC);
+    CREATE INDEX IX_Swallowed_RaisedUtc ON ERM.ERM_SwallowedSqlError (RaisedUtc DESC);
 
     /* Dedupe key for the collector: the same event read twice from an
        overlapping ring-buffer window must not become two rows. */
     CREATE UNIQUE INDEX UX_Swallowed_Event
-        ON erp_err.SwallowedSqlError (RaisedUtc, SessionId, ErrorNumber)
+        ON ERM.ERM_SwallowedSqlError (RaisedUtc, SessionID, ErrorNumber)
         WHERE ErrorNumber IS NOT NULL;
 END
 GO
@@ -117,11 +127,11 @@ GO
                          errors from every database on the instance including
                          msdb's own housekeeping.
 */
-IF NOT EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'erp_err_swallowed')
+IF NOT EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'ERM_swallowed')
 BEGIN
     DECLARE @dbid INT = DB_ID();   -- the database this script is run in
     DECLARE @sql NVARCHAR(MAX) = N'
-    CREATE EVENT SESSION [erp_err_swallowed] ON SERVER
+    CREATE EVENT SESSION [ERM_swallowed] ON SERVER
     ADD EVENT sqlserver.error_reported
     (
         ACTION
@@ -167,16 +177,16 @@ BEGIN
     );';
 
     EXEC sp_executesql @sql;
-    PRINT N'Created event session [erp_err_swallowed] filtered to database_id ' + CONVERT(NVARCHAR(20), @dbid);
+    PRINT N'Created event session [ERM_swallowed] filtered to database_id ' + CONVERT(NVARCHAR(20), @dbid);
 END
 ELSE
-    PRINT N'Event session [erp_err_swallowed] already exists - left untouched.';
+    PRINT N'Event session [ERM_swallowed] already exists - left untouched.';
 GO
 
-IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'erp_err_swallowed')
-   AND NOT EXISTS (SELECT 1 FROM sys.dm_xe_sessions WHERE name = N'erp_err_swallowed')
+IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'ERM_swallowed')
+   AND NOT EXISTS (SELECT 1 FROM sys.dm_xe_sessions WHERE name = N'ERM_swallowed')
 BEGIN
-    ALTER EVENT SESSION [erp_err_swallowed] ON SERVER STATE = START;
+    ALTER EVENT SESSION [ERM_swallowed] ON SERVER STATE = START;
     PRINT N'Event session started.';
 END
 GO
@@ -184,7 +194,7 @@ GO
 /* =============================================================================
    usp_Swallowed_Collect
    -----------------------------------------------------------------------------
-   Shreds the ring buffer into erp_err.SwallowedSqlError, then optionally
+   Shreds the ring buffer into ERM.ERM_SwallowedSqlError, then optionally
    promotes the rows into ErrorOccurrence so they appear in the normal console
    alongside everything else.
 
@@ -192,7 +202,7 @@ GO
    ring-buffer capacity and you WILL lose events - which is a documented
    trade-off of this approach, not a bug.
    ============================================================================= */
-CREATE OR ALTER PROCEDURE erp_err.usp_Swallowed_Collect
+CREATE OR ALTER PROCEDURE ERM.usp_Swallowed_Collect
 (
     @PromoteToOccurrence BIT = 1,
     /* Only promote errors seen at least this many times in the window, so a
@@ -205,12 +215,12 @@ BEGIN
     SET NOCOUNT ON;
 
     BEGIN TRY
-        IF NOT EXISTS (SELECT 1 FROM sys.dm_xe_sessions WHERE name = N'erp_err_swallowed')
+        IF NOT EXISTS (SELECT 1 FROM sys.dm_xe_sessions WHERE name = N'ERM_swallowed')
         BEGIN
             /* Session not running: say so rather than silently collecting
                nothing for six months. */
-            INSERT erp_err.DeadLetter (Source, FailureReason)
-            VALUES (N'xevents', N'Event session [erp_err_swallowed] is not running.');
+            INSERT ERM.ERM_DeadLetter (Source, FailureReason)
+            VALUES (N'xevents', N'Event session [ERM_swallowed] is not running.');
             RETURN;
         END
 
@@ -219,7 +229,7 @@ BEGIN
             SELECT CONVERT(XML, t.target_data)
             FROM sys.dm_xe_sessions s
             JOIN sys.dm_xe_session_targets t ON t.event_session_address = s.address
-            WHERE s.name = N'erp_err_swallowed' AND t.target_name = N'ring_buffer'
+            WHERE s.name = N'ERM_swallowed' AND t.target_name = N'ring_buffer'
         );
 
         IF @xml IS NULL RETURN;
@@ -234,25 +244,25 @@ BEGIN
                 x.value('(data[@name="state"]/value)[1]', 'TINYINT')                    AS ErrorState,
                 x.value('(data[@name="message"]/value)[1]', 'NVARCHAR(2000)')           AS Message,
                 x.value('(action[@name="database_name"]/value)[1]', 'NVARCHAR(128)')    AS DatabaseName,
-                x.value('(action[@name="session_id"]/value)[1]', 'INT')                 AS SessionId,
+                x.value('(action[@name="session_id"]/value)[1]', 'INT')                 AS SessionID,
                 x.value('(action[@name="client_hostname"]/value)[1]', 'NVARCHAR(128)')  AS ClientHostName,
                 x.value('(action[@name="client_app_name"]/value)[1]', 'NVARCHAR(256)')  AS ClientAppName,
                 x.value('(action[@name="sql_text"]/value)[1]', 'NVARCHAR(MAX)')         AS SqlText
             FROM @xml.nodes('//RingBufferTarget/event') AS e(x)
         )
-        INSERT erp_err.SwallowedSqlError
+        INSERT ERM.ERM_SwallowedSqlError
             (RaisedUtc, ErrorNumber, ErrorSeverity, ErrorState, Message,
-             DatabaseName, SessionId, ClientHostName, ClientAppName, SqlText)
+             DatabaseName, SessionID, ClientHostName, ClientAppName, SqlText)
         SELECT e.RaisedUtc, e.ErrorNumber, e.ErrorSeverity, e.ErrorState, e.Message,
-               e.DatabaseName, e.SessionId, e.ClientHostName, e.ClientAppName, e.SqlText
+               e.DatabaseName, e.SessionID, e.ClientHostName, e.ClientAppName, e.SqlText
         FROM events e
         WHERE e.ErrorNumber IS NOT NULL
           /* The ring buffer is re-read on every run, so the same event is seen
              repeatedly until it ages out.  This is the dedupe. */
           AND NOT EXISTS (
-                SELECT 1 FROM erp_err.SwallowedSqlError x
+                SELECT 1 FROM ERM.ERM_SwallowedSqlError x
                 WHERE x.RaisedUtc = e.RaisedUtc
-                  AND x.SessionId = e.SessionId
+                  AND x.SessionID = e.SessionID
                   AND x.ErrorNumber = e.ErrorNumber);
 
         IF @PromoteToOccurrence = 0 RETURN;
@@ -262,37 +272,37 @@ BEGIN
 
         DECLARE @promote TABLE
         (
-            SwallowedId BIGINT, RaisedUtc DATETIME2(3), ErrorNumber INT,
+            ERM_SwallowedSqlErrorID BIGINT, RaisedUtc DATETIME2(3), ErrorNumber INT,
             ErrorSeverity TINYINT, ErrorState TINYINT, Message NVARCHAR(2000),
             DatabaseName NVARCHAR(128), SqlText NVARCHAR(MAX), ObjectName NVARCHAR(256)
         );
 
         INSERT @promote
-        SELECT s.SwallowedId, s.RaisedUtc, s.ErrorNumber, s.ErrorSeverity, s.ErrorState,
+        SELECT s.ERM_SwallowedSqlErrorID, s.RaisedUtc, s.ErrorNumber, s.ErrorSeverity, s.ErrorState,
                s.Message, s.DatabaseName, s.SqlText,
                /* Best effort at a procedure name from the captured statement.
                   XE gives the statement, not the enclosing object, so this is a
                   heuristic and is left NULL when it cannot be determined -
                   a wrong object name would fingerprint two faults together. */
                CASE WHEN s.SqlText LIKE N'%[Pp][Rr][Oo][Cc]%' THEN NULL ELSE NULL END
-        FROM erp_err.SwallowedSqlError s
-        WHERE s.PromotedOccurrenceId IS NULL
+        FROM ERM.ERM_SwallowedSqlError s
+        WHERE s.PromotedOccurrenceID IS NULL
           AND s.RaisedUtc >= @Cutoff
           AND @PromoteMinOccurrences <= (
-                SELECT COUNT_BIG(*) FROM erp_err.SwallowedSqlError c
+                SELECT COUNT_BIG(*) FROM ERM.ERM_SwallowedSqlError c
                 WHERE c.ErrorNumber = s.ErrorNumber AND c.RaisedUtc >= @Cutoff);
 
-        DECLARE @SwallowedId BIGINT, @RaisedUtc DATETIME2(3), @ErrorNumber INT,
+        DECLARE @ERM_SwallowedSqlErrorID BIGINT, @RaisedUtc DATETIME2(3), @ErrorNumber INT,
                 @ErrorSeverity TINYINT, @ErrorState TINYINT, @Message NVARCHAR(2000),
                 @DatabaseName NVARCHAR(128), @SqlText NVARCHAR(MAX), @ObjectName NVARCHAR(256);
 
         DECLARE promote_cur CURSOR LOCAL FAST_FORWARD FOR
-            SELECT SwallowedId, RaisedUtc, ErrorNumber, ErrorSeverity, ErrorState,
+            SELECT ERM_SwallowedSqlErrorID, RaisedUtc, ErrorNumber, ErrorSeverity, ErrorState,
                    Message, DatabaseName, SqlText, ObjectName
             FROM @promote;
 
         OPEN promote_cur;
-        FETCH NEXT FROM promote_cur INTO @SwallowedId, @RaisedUtc, @ErrorNumber,
+        FETCH NEXT FROM promote_cur INTO @ERM_SwallowedSqlErrorID, @RaisedUtc, @ErrorNumber,
             @ErrorSeverity, @ErrorState, @Message, @DatabaseName, @SqlText, @ObjectName;
 
         WHILE @@FETCH_STATUS = 0
@@ -352,19 +362,19 @@ BEGIN
 
             DECLARE @results TABLE
             (
-                ErrorReference VARCHAR(24), OccurrenceId BIGINT, FingerprintId BIGINT,
-                ShouldNotifyUser BIT, AutoTicketNumber VARCHAR(24), IsKnownIssue BIT
+                ErrorReference VARCHAR(30), ERM_ErrorOccurrenceID BIGINT, ERM_ErrorFingerprintID BIGINT,
+                ShouldNotifyUser BIT, AutoTicketNumber VARCHAR(30), IsKnownIssue BIT
             );
             DELETE @results;
 
             INSERT @results
-            EXEC erp_err.usp_Error_Capture @EnvelopeJson = @Envelope, @Source = N'sql-xevents';
+            EXEC ERM.usp_Error_Capture @EnvelopeJson = @Envelope, @Source = N'sql-xevents';
 
-            UPDATE erp_err.SwallowedSqlError
-               SET PromotedOccurrenceId = (SELECT TOP 1 OccurrenceId FROM @results)
-             WHERE SwallowedId = @SwallowedId;
+            UPDATE ERM.ERM_SwallowedSqlError
+               SET PromotedOccurrenceID = (SELECT TOP 1 ERM_ErrorOccurrenceID FROM @results)
+             WHERE ERM_SwallowedSqlErrorID = @ERM_SwallowedSqlErrorID;
 
-            FETCH NEXT FROM promote_cur INTO @SwallowedId, @RaisedUtc, @ErrorNumber,
+            FETCH NEXT FROM promote_cur INTO @ERM_SwallowedSqlErrorID, @RaisedUtc, @ErrorNumber,
                 @ErrorSeverity, @ErrorState, @Message, @DatabaseName, @SqlText, @ObjectName;
         END
 
@@ -375,7 +385,7 @@ BEGIN
         /* Same rule as everywhere else: a collector failure is recorded, never
            raised.  This runs on a schedule against a production instance. */
         BEGIN TRY
-            INSERT erp_err.DeadLetter (Source, FailureReason)
+            INSERT ERM.ERM_DeadLetter (Source, FailureReason)
             VALUES (N'xevents', CONCAT(N'usp_Swallowed_Collect failed: Msg ', ERROR_NUMBER(),
                                        N', Line ', ERROR_LINE(), N': ', ERROR_MESSAGE()));
         END TRY
@@ -388,7 +398,7 @@ GO
 /* -----------------------------------------------------------------------------
    Retention for the landing table - it is the noisiest thing in the schema.
    ----------------------------------------------------------------------------- */
-MERGE erp_err.RetentionPolicy AS t
+MERGE ERM.ERM_RetentionPolicy AS t
 USING (SELECT N'swallowed_sql' AS DataSet, 14 AS ArchiveAfterDays, 30 AS PurgeAfterDays, 5000 AS BatchSize) AS s
     ON t.DataSet = s.DataSet
 WHEN NOT MATCHED THEN
@@ -399,10 +409,10 @@ GO
 /* -----------------------------------------------------------------------------
    TO REMOVE THIS ENTIRELY
    -----------------------------------------------------------------------------
-       DROP EVENT SESSION [erp_err_swallowed] ON SERVER;
-       DROP PROCEDURE erp_err.usp_Swallowed_Collect;
-       DROP TABLE erp_err.SwallowedSqlError;
-       DELETE erp_err.RetentionPolicy WHERE DataSet = N'swallowed_sql';
+       DROP EVENT SESSION [ERM_swallowed] ON SERVER;
+       DROP PROCEDURE ERM.usp_Swallowed_Collect;
+       DROP TABLE ERM.ERM_SwallowedSqlError;
+       DELETE ERM.ERM_RetentionPolicy WHERE DataSet = N'swallowed_sql';
 
    Nothing in 001-007 depends on any of it.
    ----------------------------------------------------------------------------- */
@@ -415,7 +425,7 @@ GO
             @job_name = N'ERP Error Mgmt - Collect swallowed SQL errors',
             @step_name = N'Collect', @subsystem = N'TSQL',
             @database_name = N'YourErpDb',
-            @command = N'EXEC erp_err.usp_Swallowed_Collect;';
+            @command = N'EXEC ERM.usp_Swallowed_Collect;';
        -- every 2 minutes
        EXEC msdb.dbo.sp_add_jobschedule
             @job_name = N'ERP Error Mgmt - Collect swallowed SQL errors',
@@ -424,7 +434,7 @@ GO
        EXEC msdb.dbo.sp_add_jobserver @job_name = N'ERP Error Mgmt - Collect swallowed SQL errors';
    ----------------------------------------------------------------------------- */
 
-MERGE erp_err.SchemaVersion AS t
+MERGE ERM.ERM_SchemaVersion AS t
 USING (SELECT N'008_optional_swallowed_sql_errors.sql' AS ScriptName) AS s
     ON t.ScriptName = s.ScriptName
 WHEN NOT MATCHED THEN

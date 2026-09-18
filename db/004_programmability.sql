@@ -15,39 +15,22 @@ SET QUOTED_IDENTIFIER ON;
 GO
 
 /* =============================================================================
-   Helper: reference-number formatting
-   ============================================================================= */
-CREATE OR ALTER FUNCTION erp_err.fn_FormatReference
-(
-    @Prefix     VARCHAR(8),
-    @Seq        BIGINT,
-    @WhenUtc    DATETIME2(3)
-)
-RETURNS VARCHAR(24)
-AS
-BEGIN
-    RETURN @Prefix + '-' + CONVERT(VARCHAR(4), DATEPART(YEAR, @WhenUtc)) + '-'
-         + RIGHT('00000000' + CONVERT(VARCHAR(20), @Seq), 8);
-END
-GO
-
-/* =============================================================================
    Helper: read a typed setting
    ============================================================================= */
-CREATE OR ALTER FUNCTION erp_err.fn_SettingInt (@Key NVARCHAR(100), @Default INT)
+CREATE OR ALTER FUNCTION ERM.fn_SettingInt (@Key NVARCHAR(100), @Default INT)
 RETURNS INT
 AS
 BEGIN
-    DECLARE @v NVARCHAR(400) = (SELECT SettingValue FROM erp_err.Setting WHERE SettingKey = @Key);
+    DECLARE @v NVARCHAR(400) = (SELECT SettingValue FROM ERM.ERM_Setting WHERE SettingKey = @Key);
     RETURN CASE WHEN @v IS NULL OR TRY_CONVERT(INT, @v) IS NULL THEN @Default ELSE CONVERT(INT, @v) END;
 END
 GO
 
-CREATE OR ALTER FUNCTION erp_err.fn_SettingBit (@Key NVARCHAR(100), @Default BIT)
+CREATE OR ALTER FUNCTION ERM.fn_SettingBit (@Key NVARCHAR(100), @Default BIT)
 RETURNS BIT
 AS
 BEGIN
-    DECLARE @v NVARCHAR(400) = (SELECT LOWER(SettingValue) FROM erp_err.Setting WHERE SettingKey = @Key);
+    DECLARE @v NVARCHAR(400) = (SELECT LOWER(SettingValue) FROM ERM.ERM_Setting WHERE SettingKey = @Key);
     RETURN CASE WHEN @v IN (N'true', N'1') THEN CONVERT(BIT,1)
                 WHEN @v IN (N'false', N'0') THEN CONVERT(BIT,0)
                 ELSE @Default END;
@@ -64,10 +47,10 @@ GO
    client needs in order to render the modal.
 
    Contract: this procedure NEVER raises to the caller for a data problem.  A
-   malformed or unexpected envelope goes to erp_err.DeadLetter and the procedure
+   malformed or unexpected envelope goes to ERM.ERM_DeadLetter and the procedure
    returns a NULL reference.  Capture must not be able to take down the ERP.
    ============================================================================= */
-CREATE OR ALTER PROCEDURE erp_err.usp_Error_Capture
+CREATE OR ALTER PROCEDURE ERM.usp_Error_Capture
 (
     @EnvelopeJson   NVARCHAR(MAX),
     @Source         NVARCHAR(60) = NULL     -- 'angular' | 'webapi2' | 'aspnetcore'
@@ -78,13 +61,13 @@ BEGIN
     SET XACT_ABORT ON;
 
     BEGIN TRY
-        IF erp_err.fn_SettingBit(N'capture.enabled', 1) = 0
+        IF ERM.fn_SettingBit(N'capture.enabled', 1) = 0
         BEGIN
-            SELECT CONVERT(VARCHAR(24), NULL) AS ErrorReference,
+            SELECT CONVERT(VARCHAR(30), NULL) AS ErrorReference,
                    CONVERT(BIGINT, NULL)      AS OccurrenceId,
                    CONVERT(BIGINT, NULL)      AS FingerprintId,
                    CONVERT(BIT, 0)            AS ShouldNotifyUser,
-                   CONVERT(VARCHAR(24), NULL) AS AutoTicketNumber,
+                   CONVERT(VARCHAR(30), NULL) AS AutoTicketNumber,
                    CONVERT(BIT, 0)            AS IsKnownIssue;
             RETURN;
         END
@@ -124,15 +107,15 @@ BEGIN
             SqlServerName     NVARCHAR(128),
             SqlDatabaseName   NVARCHAR(128),
             SqlSchemaName     NVARCHAR(128),
-            UserId            NVARCHAR(128),
+            UserID            NVARCHAR(128),
             UserName          NVARCHAR(200),
             UserDisplayName   NVARCHAR(200),
-            TenantId          NVARCHAR(64),
-            SessionId         NVARCHAR(100),
+            TenantID          NVARCHAR(64),
+            SessionID         NVARCHAR(100),
             ClientIp          NVARCHAR(64),
-            CorrelationId     UNIQUEIDENTIFIER,
-            RequestId         UNIQUEIDENTIFIER,
-            ParentErrorReference VARCHAR(24),
+            CorrelationID     UNIQUEIDENTIFIER,
+            RequestID         UNIQUEIDENTIFIER,
+            ParentErrorReference VARCHAR(30),
             Environment       NVARCHAR(40),
             AppVersion        NVARCHAR(60),
             MachineName       NVARCHAR(128),
@@ -188,15 +171,15 @@ BEGIN
             SqlServerName     NVARCHAR(128)   '$.sql.serverName',
             SqlDatabaseName   NVARCHAR(128)   '$.sql.databaseName',
             SqlSchemaName     NVARCHAR(128)   '$.sql.schemaName',
-            UserId            NVARCHAR(128)   '$.user.id',
+            UserID            NVARCHAR(128)   '$.user.id',
             UserName          NVARCHAR(200)   '$.user.name',
             UserDisplayName   NVARCHAR(200)   '$.user.displayName',
-            TenantId          NVARCHAR(64)    '$.user.tenantId',
-            SessionId         NVARCHAR(100)   '$.user.sessionId',
+            TenantID          NVARCHAR(64)    '$.user.tenantId',
+            SessionID         NVARCHAR(100)   '$.user.sessionId',
             ClientIp          NVARCHAR(64)    '$.user.clientIp',
-            CorrelationId     UNIQUEIDENTIFIER '$.correlationId',
-            RequestId         UNIQUEIDENTIFIER '$.requestId',
-            ParentErrorReference VARCHAR(24)  '$.parentErrorReference',
+            CorrelationID     UNIQUEIDENTIFIER '$.correlationId',
+            RequestID         UNIQUEIDENTIFIER '$.requestId',
+            ParentErrorReference VARCHAR(30)  '$.parentErrorReference',
             Environment       NVARCHAR(40)    '$.environment',
             AppVersion        NVARCHAR(60)    '$.appVersion',
             MachineName       NVARCHAR(128)   '$.machineName',
@@ -217,18 +200,18 @@ BEGIN
         );
 
         /* ---- resolve lookups, applying defaults where the caller was vague -- */
-        DECLARE @LayerId TINYINT, @CategoryId SMALLINT, @SeverityId TINYINT;
+        DECLARE @LayerID TINYINT, @CategoryID SMALLINT, @SeverityID TINYINT;
 
-        SELECT @LayerId = ISNULL((SELECT LayerId FROM erp_err.AppLayer l
+        SELECT @LayerID = ISNULL((SELECT LayerID FROM ERM.ERM_AppLayer l
                                   WHERE l.Code = (SELECT LayerCode FROM @e)), 8);
 
-        SELECT @CategoryId = ISNULL((SELECT CategoryId FROM erp_err.ErrorCategory c
+        SELECT @CategoryID = ISNULL((SELECT CategoryID FROM ERM.ERM_ErrorCategory c
                                      WHERE c.Code = (SELECT CategoryCode FROM @e) AND c.IsActive = 1), 99);
 
-        SELECT @SeverityId = COALESCE(
-                    (SELECT SeverityId FROM erp_err.Severity s
+        SELECT @SeverityID = COALESCE(
+                    (SELECT SeverityID FROM ERM.ERM_Severity s
                      WHERE s.Code = (SELECT SeverityCode FROM @e) AND s.IsActive = 1),
-                    (SELECT DefaultSeverityId FROM erp_err.ErrorCategory WHERE CategoryId = @CategoryId),
+                    (SELECT DefaultSeverityID FROM ERM.ERM_ErrorCategory WHERE CategoryID = @CategoryID),
                     3);
 
         DECLARE @Hash CHAR(64) = (SELECT FingerprintHash FROM @e);
@@ -237,12 +220,12 @@ BEGIN
             /* No usable fingerprint: refuse to guess, dead-letter and get out.
                A wrong fingerprint is worse than none - it silently merges two
                unrelated problems into one ticket. */
-            INSERT erp_err.DeadLetter (Source, RawEnvelopeJson, FailureReason)
+            INSERT ERM.ERM_DeadLetter (Source, RawEnvelopeJson, FailureReason)
             VALUES (@Source, @EnvelopeJson, N'Missing or malformed fingerprintHash');
 
-            SELECT CONVERT(VARCHAR(24), NULL) AS ErrorReference, CONVERT(BIGINT, NULL) AS OccurrenceId,
+            SELECT CONVERT(VARCHAR(30), NULL) AS ErrorReference, CONVERT(BIGINT, NULL) AS OccurrenceId,
                    CONVERT(BIGINT, NULL) AS FingerprintId, CONVERT(BIT, 1) AS ShouldNotifyUser,
-                   CONVERT(VARCHAR(24), NULL) AS AutoTicketNumber, CONVERT(BIT, 0) AS IsKnownIssue;
+                   CONVERT(VARCHAR(30), NULL) AS AutoTicketNumber, CONVERT(BIT, 0) AS IsKnownIssue;
             RETURN;
         END
 
@@ -254,13 +237,13 @@ BEGIN
         IF @OccurredUtc > DATEADD(MINUTE, 5, @Now) OR @OccurredUtc < DATEADD(YEAR, -1, @Now)
             SET @OccurredUtc = @Now;
 
-        DECLARE @FingerprintId BIGINT, @OccurrenceId BIGINT, @ErrorReference VARCHAR(24);
-        DECLARE @IsKnownIssue BIT = 0, @IsMuted BIT = 0, @OpenTicketId BIGINT = NULL;
+        DECLARE @ERM_ErrorFingerprintID BIGINT, @ERM_ErrorOccurrenceID BIGINT, @ErrorReference VARCHAR(30);
+        DECLARE @IsKnownIssue BIT = 0, @IsMuted BIT = 0, @OpenTicketID BIGINT = NULL;
 
         BEGIN TRANSACTION;
 
             /* ---- upsert the fingerprint -------------------------------- */
-            MERGE erp_err.ErrorFingerprint WITH (HOLDLOCK) AS t
+            MERGE ERM.ERM_ErrorFingerprint WITH (HOLDLOCK) AS t
             USING (SELECT @Hash AS FingerprintHash) AS s
                 ON t.FingerprintHash = s.FingerprintHash
             WHEN MATCHED THEN
@@ -268,88 +251,88 @@ BEGIN
                            OccurrenceCount = t.OccurrenceCount + 1,
                            -- Escalate, never de-escalate: if the same problem was
                            -- ever seen as critical, it stays critical.
-                           SeverityId      = CASE WHEN @SeverityId < t.SeverityId THEN @SeverityId ELSE t.SeverityId END
+                           SeverityID      = CASE WHEN @SeverityID < t.SeverityID THEN @SeverityID ELSE t.SeverityID END
             WHEN NOT MATCHED THEN
-                INSERT (FingerprintHash, SignatureText, LayerId, CategoryId, SeverityId,
+                INSERT (FingerprintHash, SignatureText, LayerID, CategoryID, SeverityID,
                         ExceptionType, NormalizedMessage, ErpModule, Screen, Component,
                         ApiEndpoint, SqlObjectName, FirstSeenUtc, LastSeenUtc, OccurrenceCount)
                 VALUES (@Hash,
                         ISNULL((SELECT SignatureText FROM @e), N'(no signature supplied)'),
-                        @LayerId, @CategoryId, @SeverityId,
+                        @LayerID, @CategoryID, @SeverityID,
                         (SELECT ExceptionType FROM @e),
                         (SELECT COALESCE(NormalizedMessage, Message) FROM @e),
                         (SELECT ErpModule FROM @e), (SELECT Screen FROM @e), (SELECT Component FROM @e),
                         (SELECT ApiEndpoint FROM @e), (SELECT SqlObjectName FROM @e),
                         @OccurredUtc, @OccurredUtc, 1);
 
-            SELECT @FingerprintId = FingerprintId,
+            SELECT @ERM_ErrorFingerprintID = ERM_ErrorFingerprintID,
                    @IsKnownIssue  = CASE WHEN TriageState IN (N'known_issue', N'muted') THEN 1 ELSE 0 END,
                    @IsMuted       = CASE WHEN TriageState = N'muted'
                                            OR (MutedUntilUtc IS NOT NULL AND MutedUntilUtc > @Now)
                                          THEN 1 ELSE 0 END,
-                   @OpenTicketId  = OpenTicketId
-            FROM erp_err.ErrorFingerprint
+                   @OpenTicketID  = OpenTicketID
+            FROM ERM.ERM_ErrorFingerprint
             WHERE FingerprintHash = @Hash;
 
             /* ---- sampling: high-volume info noise does not need every row -- */
-            DECLARE @InfoPct INT = erp_err.fn_SettingInt(N'capture.sampling.infoPercent', 10);
-            IF @SeverityId = 5 AND @InfoPct < 100
+            DECLARE @InfoPct INT = ERM.fn_SettingInt(N'capture.sampling.infoPercent', 10);
+            IF @SeverityID = 5 AND @InfoPct < 100
                AND (CONVERT(BIGINT, CONVERT(VARBINARY(4), SUBSTRING(@Hash, 1, 8), 2)) % 100) >= @InfoPct
             BEGIN
                 /* Counted on the fingerprint above, body not persisted. */
                 COMMIT TRANSACTION;
-                SELECT CONVERT(VARCHAR(24), NULL) AS ErrorReference, CONVERT(BIGINT, NULL) AS OccurrenceId,
-                       @FingerprintId AS FingerprintId, CONVERT(BIT, 0) AS ShouldNotifyUser,
-                       CONVERT(VARCHAR(24), NULL) AS AutoTicketNumber, @IsKnownIssue AS IsKnownIssue;
+                SELECT CONVERT(VARCHAR(30), NULL) AS ErrorReference, CONVERT(BIGINT, NULL) AS OccurrenceId,
+                       @ERM_ErrorFingerprintID AS FingerprintId, CONVERT(BIT, 0) AS ShouldNotifyUser,
+                       CONVERT(VARCHAR(30), NULL) AS AutoTicketNumber, @IsKnownIssue AS IsKnownIssue;
                 RETURN;
             END
 
             /* ---- reference number and occurrence row -------------------- */
-            SET @ErrorReference = erp_err.fn_FormatReference('ERR', NEXT VALUE FOR erp_err.ErrorNumberSeq, @Now);
+            EXEC ERM.usp_NextReference @RefType = 'ERR', @Reference = @ErrorReference OUTPUT;
 
-            DECLARE @ParentOccurrenceId BIGINT =
-                (SELECT o.OccurrenceId FROM erp_err.ErrorOccurrence o
+            DECLARE @ParentOccurrenceID BIGINT =
+                (SELECT o.ERM_ErrorOccurrenceID FROM ERM.ERM_ErrorOccurrence o
                  WHERE o.ErrorReference = (SELECT ParentErrorReference FROM @e));
 
-            INSERT erp_err.ErrorOccurrence
+            INSERT ERM.ERM_ErrorOccurrence
             (
-                ErrorReference, FingerprintId, OccurredUtc, OccurredLocal, ClientUtcOffsetMin,
-                LayerId, CategoryId, SeverityId, ExceptionType, Message,
+                ErrorReference, ERM_ErrorFingerprintID, OccurredUtc, OccurredLocal, ClientUtcOffsetMin,
+                LayerID, CategoryID, SeverityID, ExceptionType, Message,
                 ErpModule, Screen, RouteUrl, Component, ActionName, FormName, LovName,
                 ApiApplication, ApiController, ApiAction, ApiEndpoint, HttpMethod, HttpStatusCode, DurationMs,
                 SqlErrorNumber, SqlErrorSeverity, SqlErrorState, SqlObjectName, SqlLineNumber,
                 SqlServerName, SqlDatabaseName, SqlSchemaName,
-                UserId, UserName, UserDisplayName, TenantId, SessionId, ClientIp,
-                CorrelationId, RequestId, ParentOccurrenceId,
+                UserID, UserName, UserDisplayName, TenantID, SessionID, ClientIp,
+                CorrelationID, RequestID, ParentOccurrenceID,
                 Environment, AppVersion, MachineName,
                 BrowserName, BrowserVersion, OsName, DeviceType, ScreenResolution, Locale
             )
             SELECT
-                @ErrorReference, @FingerprintId, @OccurredUtc, e.OccurredLocal, e.ClientUtcOffsetMin,
-                @LayerId, @CategoryId, @SeverityId, e.ExceptionType, e.Message,
+                @ErrorReference, @ERM_ErrorFingerprintID, @OccurredUtc, e.OccurredLocal, e.ClientUtcOffsetMin,
+                @LayerID, @CategoryID, @SeverityID, e.ExceptionType, e.Message,
                 e.ErpModule, e.Screen, e.RouteUrl, e.Component, e.ActionName, e.FormName, e.LovName,
                 e.ApiApplication, e.ApiController, e.ApiAction, e.ApiEndpoint, e.HttpMethod, e.HttpStatusCode, e.DurationMs,
                 e.SqlErrorNumber, e.SqlErrorSeverity, e.SqlErrorState, e.SqlObjectName, e.SqlLineNumber,
                 e.SqlServerName, e.SqlDatabaseName, e.SqlSchemaName,
-                e.UserId, e.UserName, e.UserDisplayName, e.TenantId, e.SessionId, e.ClientIp,
-                ISNULL(e.CorrelationId, NEWID()), e.RequestId, @ParentOccurrenceId,
+                e.UserID, e.UserName, e.UserDisplayName, e.TenantID, e.SessionID, e.ClientIp,
+                ISNULL(e.CorrelationID, NEWID()), e.RequestID, @ParentOccurrenceID,
                 ISNULL(e.Environment, N'unknown'), e.AppVersion, e.MachineName,
                 e.BrowserName, e.BrowserVersion, e.OsName, e.DeviceType, e.ScreenResolution, e.Locale
             FROM @e e;
 
-            SET @OccurrenceId = SCOPE_IDENTITY();
+            SET @ERM_ErrorOccurrenceID = SCOPE_IDENTITY();
 
-            DECLARE @MaxStack INT = erp_err.fn_SettingInt(N'capture.maxStackTraceChars', 20000);
-            DECLARE @StoreReq BIT = erp_err.fn_SettingBit(N'capture.storeRequestBody', 1);
-            DECLARE @StoreRes BIT = erp_err.fn_SettingBit(N'capture.storeResponseBody', 0);
+            DECLARE @MaxStack INT = ERM.fn_SettingInt(N'capture.maxStackTraceChars', 20000);
+            DECLARE @StoreReq BIT = ERM.fn_SettingBit(N'capture.storeRequestBody', 1);
+            DECLARE @StoreRes BIT = ERM.fn_SettingBit(N'capture.storeResponseBody', 0);
 
-            INSERT erp_err.ErrorOccurrenceDetail
+            INSERT ERM.ERM_ErrorOccurrenceDetail
             (
-                OccurrenceId, StackTrace, InnerExceptionChain, RequestPayloadJson,
+                ERM_ErrorOccurrenceID, StackTrace, InnerExceptionChain, RequestPayloadJson,
                 ResponsePayloadJson, ValidationErrorsJson, BreadcrumbsJson, CustomDataJson, SqlStatementText
             )
             SELECT
-                @OccurrenceId,
+                @ERM_ErrorOccurrenceID,
                 CASE WHEN LEN(e.StackTrace) > @MaxStack
                      THEN LEFT(e.StackTrace, @MaxStack) + NCHAR(10) + N'... [truncated at ' + CONVERT(NVARCHAR(20), @MaxStack) + N' chars]'
                      ELSE e.StackTrace END,
@@ -363,28 +346,28 @@ BEGIN
                does not have to COUNT(DISTINCT) over a 50-million-row table. */
             IF EXISTS (SELECT 1 FROM @e WHERE UserName IS NOT NULL)
                AND NOT EXISTS (
-                    SELECT 1 FROM erp_err.ErrorOccurrence o
-                    WHERE o.FingerprintId = @FingerprintId
+                    SELECT 1 FROM ERM.ERM_ErrorOccurrence o
+                    WHERE o.ERM_ErrorFingerprintID = @ERM_ErrorFingerprintID
                       AND o.UserName = (SELECT UserName FROM @e)
-                      AND o.OccurrenceId <> @OccurrenceId)
-                UPDATE erp_err.ErrorFingerprint
+                      AND o.ERM_ErrorOccurrenceID <> @ERM_ErrorOccurrenceID)
+                UPDATE ERM.ERM_ErrorFingerprint
                    SET DistinctUserCount = DistinctUserCount + 1
-                 WHERE FingerprintId = @FingerprintId;
+                 WHERE ERM_ErrorFingerprintID = @ERM_ErrorFingerprintID;
 
             /* ---- attach to an already-open ticket for the same problem --- */
-            DECLARE @AutoTicketNumber VARCHAR(24) = NULL;
+            DECLARE @AutoTicketNumber VARCHAR(30) = NULL;
 
-            IF @OpenTicketId IS NOT NULL AND erp_err.fn_SettingBit(N'ticket.attachRecurrenceToOpen', 1) = 1
+            IF @OpenTicketID IS NOT NULL AND ERM.fn_SettingBit(N'ticket.attachRecurrenceToOpen', 1) = 1
             BEGIN
-                INSERT erp_err.TicketOccurrenceLink (TicketId, OccurrenceId, LinkReason)
-                VALUES (@OpenTicketId, @OccurrenceId, N'deduplicated');
+                INSERT ERM.ERM_TicketOccurrenceLink (ERM_TicketID, ERM_ErrorOccurrenceID, LinkReason)
+                VALUES (@OpenTicketID, @ERM_ErrorOccurrenceID, N'deduplicated');
 
-                UPDATE erp_err.Ticket
+                UPDATE ERM.ERM_Ticket
                    SET LinkedOccurrenceCount = LinkedOccurrenceCount + 1
-                 WHERE TicketId = @OpenTicketId;
+                 WHERE ERM_TicketID = @OpenTicketID;
 
-                UPDATE erp_err.ErrorOccurrence SET TicketId = @OpenTicketId WHERE OccurrenceId = @OccurrenceId;
-                SET @AutoTicketNumber = (SELECT TicketNumber FROM erp_err.Ticket WHERE TicketId = @OpenTicketId);
+                UPDATE ERM.ERM_ErrorOccurrence SET ERM_TicketID = @OpenTicketID WHERE ERM_ErrorOccurrenceID = @ERM_ErrorOccurrenceID;
+                SET @AutoTicketNumber = (SELECT TicketNumber FROM ERM.ERM_Ticket WHERE ERM_TicketID = @OpenTicketID);
             END
 
         COMMIT TRANSACTION;
@@ -395,39 +378,39 @@ BEGIN
         BEGIN
             DECLARE @WindowMin INT, @RuleQueueId SMALLINT, @RuleName NVARCHAR(100);
 
-            SELECT TOP 1 @WindowMin = r.WindowMinutes, @RuleQueueId = r.TargetQueueId, @RuleName = r.RuleName
-            FROM erp_err.AutoTicketRule r
-            CROSS APPLY (SELECT RankOrder FROM erp_err.Severity WHERE SeverityId = @SeverityId) sv
-            OUTER APPLY (SELECT RankOrder AS MinRank FROM erp_err.Severity WHERE SeverityId = r.MinSeverityId) mr
+            SELECT TOP 1 @WindowMin = r.WindowMinutes, @RuleQueueId = r.TargetQueueID, @RuleName = r.RuleName
+            FROM ERM.ERM_AutoTicketRule r
+            CROSS APPLY (SELECT RankOrder FROM ERM.ERM_Severity WHERE SeverityID = @SeverityID) sv
+            OUTER APPLY (SELECT RankOrder AS MinRank FROM ERM.ERM_Severity WHERE SeverityID = r.MinSeverityID) mr
             WHERE r.IsActive = 1
-              AND (r.MinSeverityId  IS NULL OR sv.RankOrder <= mr.MinRank)
-              AND (r.CategoryId     IS NULL OR r.CategoryId = @CategoryId)
-              AND (r.LayerId        IS NULL OR r.LayerId    = @LayerId)
+              AND (r.MinSeverityID  IS NULL OR sv.RankOrder <= mr.MinRank)
+              AND (r.CategoryID     IS NULL OR r.CategoryID = @CategoryID)
+              AND (r.LayerID        IS NULL OR r.LayerID    = @LayerID)
               AND (r.ErpModuleMatch IS NULL OR r.ErpModuleMatch = (SELECT ErpModule FROM @e))
               AND (r.EnvironmentMatch IS NULL OR r.EnvironmentMatch = (SELECT Environment FROM @e))
               AND r.MinOccurrences <= (
-                    SELECT COUNT_BIG(*) FROM erp_err.ErrorOccurrence o
-                    WHERE o.FingerprintId = @FingerprintId
+                    SELECT COUNT_BIG(*) FROM ERM.ERM_ErrorOccurrence o
+                    WHERE o.ERM_ErrorFingerprintID = @ERM_ErrorFingerprintID
                       AND o.OccurredUtc >= DATEADD(MINUTE, -r.WindowMinutes, @Now))
-            ORDER BY r.MinOccurrences DESC, r.RuleId;
+            ORDER BY r.MinOccurrences DESC, r.ERM_AutoTicketRuleID;
 
             IF @RuleName IS NOT NULL
             BEGIN
-                EXEC erp_err.usp_Ticket_Create
-                     @OccurrenceId      = @OccurrenceId,
+                EXEC ERM.usp_Ticket_Create
+                     @ERM_ErrorOccurrenceID      = @ERM_ErrorOccurrenceID,
                      @CreatedVia        = N'auto_rule',
                      @UserDescription   = NULL,
-                     @ReportedByUserId  = NULL,
+                     @ReportedByUserID  = NULL,
                      @ReportedByUserName= NULL,
-                     @QueueId           = @RuleQueueId,
+                     @ERM_TicketQueueID           = @RuleQueueId,
                      @TicketNumber      = @AutoTicketNumber OUTPUT;
             END
         END
 
         /* ---- what the caller should do next ------------------------------ */
         SELECT @ErrorReference AS ErrorReference,
-               @OccurrenceId   AS OccurrenceId,
-               @FingerprintId  AS FingerprintId,
+               @ERM_ErrorOccurrenceID   AS OccurrenceId,
+               @ERM_ErrorFingerprintID  AS FingerprintId,
                CASE WHEN @IsMuted = 1 THEN CONVERT(BIT,0) ELSE CONVERT(BIT,1) END AS ShouldNotifyUser,
                @AutoTicketNumber AS AutoTicketNumber,
                @IsKnownIssue   AS IsKnownIssue;
@@ -436,7 +419,7 @@ BEGIN
         IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
 
         BEGIN TRY
-            INSERT erp_err.DeadLetter (Source, RawEnvelopeJson, FailureReason)
+            INSERT ERM.ERM_DeadLetter (Source, RawEnvelopeJson, FailureReason)
             VALUES (@Source, @EnvelopeJson,
                     CONCAT(N'Msg ', ERROR_NUMBER(), N', Line ', ERROR_LINE(), N': ', ERROR_MESSAGE()));
         END TRY
@@ -445,9 +428,9 @@ BEGIN
                Swallow: the ERP transaction must survive regardless. */
         END CATCH
 
-        SELECT CONVERT(VARCHAR(24), NULL) AS ErrorReference, CONVERT(BIGINT, NULL) AS OccurrenceId,
+        SELECT CONVERT(VARCHAR(30), NULL) AS ErrorReference, CONVERT(BIGINT, NULL) AS OccurrenceId,
                CONVERT(BIGINT, NULL) AS FingerprintId, CONVERT(BIT, 1) AS ShouldNotifyUser,
-               CONVERT(VARCHAR(24), NULL) AS AutoTicketNumber, CONVERT(BIT, 0) AS IsKnownIssue;
+               CONVERT(VARCHAR(30), NULL) AS AutoTicketNumber, CONVERT(BIT, 0) AS IsKnownIssue;
     END CATCH
 END
 GO
@@ -460,132 +443,132 @@ GO
    NOT create a second one - it links the occurrence and returns the existing
    number.  That is the whole point of the fingerprint.
    ============================================================================= */
-CREATE OR ALTER PROCEDURE erp_err.usp_Ticket_Create
+CREATE OR ALTER PROCEDURE ERM.usp_Ticket_Create
 (
-    @OccurrenceId       BIGINT,
+    @ERM_ErrorOccurrenceID       BIGINT,
     @CreatedVia         NVARCHAR(20)   = N'user',
     @UserDescription    NVARCHAR(MAX)  = NULL,
-    @ReportedByUserId   NVARCHAR(128)  = NULL,
+    @ReportedByUserID   NVARCHAR(128)  = NULL,
     @ReportedByUserName NVARCHAR(200)  = NULL,
-    @QueueId            SMALLINT       = NULL,
-    @TicketNumber       VARCHAR(24)    OUTPUT
+    @ERM_TicketQueueID            SMALLINT       = NULL,
+    @TicketNumber       VARCHAR(30)    OUTPUT
 )
 AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
 
-    DECLARE @FingerprintId BIGINT, @SeverityId TINYINT, @ErpModule NVARCHAR(100),
+    DECLARE @ERM_ErrorFingerprintID BIGINT, @SeverityID TINYINT, @ErpModule NVARCHAR(100),
             @Environment NVARCHAR(40), @Message NVARCHAR(2000), @Screen NVARCHAR(200),
             @ExistingTicketId BIGINT, @Now DATETIME2(3) = SYSUTCDATETIME();
 
-    SELECT @FingerprintId = o.FingerprintId, @SeverityId = o.SeverityId,
+    SELECT @ERM_ErrorFingerprintID = o.ERM_ErrorFingerprintID, @SeverityID = o.SeverityID,
            @ErpModule = o.ErpModule, @Environment = o.Environment,
            @Message = o.Message, @Screen = o.Screen
-    FROM erp_err.ErrorOccurrence o
-    WHERE o.OccurrenceId = @OccurrenceId;
+    FROM ERM.ERM_ErrorOccurrence o
+    WHERE o.ERM_ErrorOccurrenceID = @ERM_ErrorOccurrenceID;
 
-    IF @FingerprintId IS NULL
+    IF @ERM_ErrorFingerprintID IS NULL
     BEGIN
         SET @TicketNumber = NULL;
         RETURN;
     END
 
     /* ---- already-open ticket for this problem? ------------------------- */
-    SELECT @ExistingTicketId = f.OpenTicketId
-    FROM erp_err.ErrorFingerprint f
-    WHERE f.FingerprintId = @FingerprintId
-      AND f.OpenTicketId IS NOT NULL
-      AND EXISTS (SELECT 1 FROM erp_err.Ticket tk
-                  JOIN erp_err.TicketStatus st ON st.StatusId = tk.StatusId
-                  WHERE tk.TicketId = f.OpenTicketId AND st.IsTerminal = 0);
+    SELECT @ExistingTicketId = f.OpenTicketID
+    FROM ERM.ERM_ErrorFingerprint f
+    WHERE f.ERM_ErrorFingerprintID = @ERM_ErrorFingerprintID
+      AND f.OpenTicketID IS NOT NULL
+      AND EXISTS (SELECT 1 FROM ERM.ERM_Ticket tk
+                  JOIN ERM.ERM_TicketStatus st ON st.StatusID = tk.StatusID
+                  WHERE tk.ERM_TicketID = f.OpenTicketID AND st.IsTerminal = 0);
 
     IF @ExistingTicketId IS NOT NULL
     BEGIN
         BEGIN TRANSACTION;
-            IF NOT EXISTS (SELECT 1 FROM erp_err.TicketOccurrenceLink
-                           WHERE TicketId = @ExistingTicketId AND OccurrenceId = @OccurrenceId)
+            IF NOT EXISTS (SELECT 1 FROM ERM.ERM_TicketOccurrenceLink
+                           WHERE ERM_TicketID = @ExistingTicketId AND ERM_ErrorOccurrenceID = @ERM_ErrorOccurrenceID)
             BEGIN
-                INSERT erp_err.TicketOccurrenceLink (TicketId, OccurrenceId, LinkReason)
-                VALUES (@ExistingTicketId, @OccurrenceId, N'deduplicated');
+                INSERT ERM.ERM_TicketOccurrenceLink (ERM_TicketID, ERM_ErrorOccurrenceID, LinkReason)
+                VALUES (@ExistingTicketId, @ERM_ErrorOccurrenceID, N'deduplicated');
 
-                UPDATE erp_err.Ticket
+                UPDATE ERM.ERM_Ticket
                    SET LinkedOccurrenceCount = LinkedOccurrenceCount + 1
-                 WHERE TicketId = @ExistingTicketId;
+                 WHERE ERM_TicketID = @ExistingTicketId;
             END
 
-            UPDATE erp_err.ErrorOccurrence SET TicketId = @ExistingTicketId WHERE OccurrenceId = @OccurrenceId;
+            UPDATE ERM.ERM_ErrorOccurrence SET ERM_TicketID = @ExistingTicketId WHERE ERM_ErrorOccurrenceID = @ERM_ErrorOccurrenceID;
 
             /* The user's own words are still worth keeping - as a comment on
                the existing ticket, not as a duplicate ticket. */
             IF @UserDescription IS NOT NULL AND LEN(LTRIM(RTRIM(@UserDescription))) > 0
-                INSERT erp_err.TicketComment (TicketId, AuthorUserId, AuthorUserName, AuthorRole, CommentText, IsCustomerVisible)
-                VALUES (@ExistingTicketId, @ReportedByUserId, @ReportedByUserName, N'reporter',
-                        CONCAT(N'Additional report (', @OccurrenceId, N'): ', @UserDescription), 1);
+                INSERT ERM.ERM_TicketComment (ERM_TicketID, AuthorUserID, AuthorUserName, AuthorRole, CommentText, IsCustomerVisible)
+                VALUES (@ExistingTicketId, @ReportedByUserID, @ReportedByUserName, N'reporter',
+                        CONCAT(N'Additional report (', @ERM_ErrorOccurrenceID, N'): ', @UserDescription), 1);
         COMMIT TRANSACTION;
 
-        SET @TicketNumber = (SELECT TicketNumber FROM erp_err.Ticket WHERE TicketId = @ExistingTicketId);
+        SET @TicketNumber = (SELECT TicketNumber FROM ERM.ERM_Ticket WHERE ERM_TicketID = @ExistingTicketId);
         SELECT @TicketNumber AS TicketNumber, @ExistingTicketId AS TicketId, CONVERT(BIT,1) AS WasDeduplicated;
         RETURN;
     END
 
     /* ---- routing ------------------------------------------------------- */
-    IF @QueueId IS NULL
-        SELECT TOP 1 @QueueId = QueueId FROM erp_err.TicketQueue
-        WHERE IsActive = 1 AND ErpModuleMatch = @ErpModule ORDER BY QueueId;
-    IF @QueueId IS NULL
-        SELECT TOP 1 @QueueId = QueueId FROM erp_err.TicketQueue
-        WHERE IsActive = 1 AND IsDefault = 1 ORDER BY QueueId;
-    IF @QueueId IS NULL
-        SELECT TOP 1 @QueueId = QueueId FROM erp_err.TicketQueue WHERE IsActive = 1 ORDER BY QueueId;
+    IF @ERM_TicketQueueID IS NULL
+        SELECT TOP 1 @ERM_TicketQueueID = ERM_TicketQueueID FROM ERM.ERM_TicketQueue
+        WHERE IsActive = 1 AND ErpModuleMatch = @ErpModule ORDER BY ERM_TicketQueueID;
+    IF @ERM_TicketQueueID IS NULL
+        SELECT TOP 1 @ERM_TicketQueueID = ERM_TicketQueueID FROM ERM.ERM_TicketQueue
+        WHERE IsActive = 1 AND IsDefault = 1 ORDER BY ERM_TicketQueueID;
+    IF @ERM_TicketQueueID IS NULL
+        SELECT TOP 1 @ERM_TicketQueueID = ERM_TicketQueueID FROM ERM.ERM_TicketQueue WHERE IsActive = 1 ORDER BY ERM_TicketQueueID;
 
-    DECLARE @SlaPolicyId SMALLINT =
-        COALESCE((SELECT TOP 1 SlaPolicyId FROM erp_err.SlaPolicy
-                  WHERE IsActive = 1 AND SeverityId = @SeverityId AND QueueId = @QueueId),
-                 (SELECT TOP 1 SlaPolicyId FROM erp_err.SlaPolicy
-                  WHERE IsActive = 1 AND SeverityId = @SeverityId AND QueueId IS NULL));
+    DECLARE @ERM_SlaPolicyID SMALLINT =
+        COALESCE((SELECT TOP 1 ERM_SlaPolicyID FROM ERM.ERM_SlaPolicy
+                  WHERE IsActive = 1 AND SeverityID = @SeverityID AND ERM_TicketQueueID = @ERM_TicketQueueID),
+                 (SELECT TOP 1 ERM_SlaPolicyID FROM ERM.ERM_SlaPolicy
+                  WHERE IsActive = 1 AND SeverityID = @SeverityID AND ERM_TicketQueueID IS NULL));
 
     DECLARE @NewTicketId BIGINT;
-    SET @TicketNumber = erp_err.fn_FormatReference('TKT', NEXT VALUE FOR erp_err.TicketNumberSeq, @Now);
+    EXEC ERM.usp_NextReference @RefType = 'TKT', @Reference = @TicketNumber OUTPUT;
 
     DECLARE @Title NVARCHAR(400) =
         LEFT(CONCAT(ISNULL(@ErpModule, N'ERP'), N' / ', ISNULL(@Screen, N'(unknown screen)'), N' - ',
                     ISNULL(@Message, N'Unexpected error')), 400);
 
     BEGIN TRANSACTION;
-        INSERT erp_err.Ticket
+        INSERT ERM.ERM_Ticket
         (
-            TicketNumber, OccurrenceId, FingerprintId, StatusId, SeverityId, QueueId, SlaPolicyId,
-            Title, UserDescription, ReportedByUserId, ReportedByUserName, CreatedVia,
+            TicketNumber, ERM_ErrorOccurrenceID, ERM_ErrorFingerprintID, StatusID, SeverityID, ERM_TicketQueueID, ERM_SlaPolicyID,
+            Title, UserDescription, ReportedByUserID, ReportedByUserName, CreatedVia,
             ErpModule, Environment, CreatedUtc, LastStatusChangeUtc, LinkedOccurrenceCount
         )
         VALUES
         (
-            @TicketNumber, @OccurrenceId, @FingerprintId, 1 /*new*/, @SeverityId, @QueueId, @SlaPolicyId,
-            @Title, @UserDescription, @ReportedByUserId, @ReportedByUserName, @CreatedVia,
+            @TicketNumber, @ERM_ErrorOccurrenceID, @ERM_ErrorFingerprintID, 1 /*new*/, @SeverityID, @ERM_TicketQueueID, @ERM_SlaPolicyID,
+            @Title, @UserDescription, @ReportedByUserID, @ReportedByUserName, @CreatedVia,
             @ErpModule, @Environment, @Now, @Now, 1
         );
 
         SET @NewTicketId = SCOPE_IDENTITY();
 
-        INSERT erp_err.TicketStatusHistory
-            (TicketId, SequenceNo, FromStatusId, ToStatusId, ChangedByUserId, ChangedByUserName,
+        INSERT ERM.ERM_TicketStatusHistory
+            (ERM_TicketID, SequenceNo, FromStatusID, ToStatusID, ChangedByUserID, ChangedByUserName,
              ChangedUtc, MinutesInFromStatus, Comments, IsCustomerVisible)
         VALUES
-            (@NewTicketId, 1, NULL, 1, @ReportedByUserId, @ReportedByUserName, @Now, NULL,
+            (@NewTicketId, 1, NULL, 1, @ReportedByUserID, @ReportedByUserName, @Now, NULL,
              CASE WHEN @CreatedVia = N'auto_rule'
                   THEN N'Ticket raised automatically by an error-management rule.'
                   ELSE N'Ticket raised by the user from the error dialog.' END, 1);
 
-        INSERT erp_err.TicketOccurrenceLink (TicketId, OccurrenceId, LinkReason)
-        VALUES (@NewTicketId, @OccurrenceId, N'primary');
+        INSERT ERM.ERM_TicketOccurrenceLink (ERM_TicketID, ERM_ErrorOccurrenceID, LinkReason)
+        VALUES (@NewTicketId, @ERM_ErrorOccurrenceID, N'primary');
 
-        UPDATE erp_err.ErrorOccurrence SET TicketId = @NewTicketId WHERE OccurrenceId = @OccurrenceId;
+        UPDATE ERM.ERM_ErrorOccurrence SET ERM_TicketID = @NewTicketId WHERE ERM_ErrorOccurrenceID = @ERM_ErrorOccurrenceID;
 
-        UPDATE erp_err.ErrorFingerprint
-           SET OpenTicketId = @NewTicketId,
+        UPDATE ERM.ERM_ErrorFingerprint
+           SET OpenTicketID = @NewTicketId,
                TriageState  = CASE WHEN TriageState = N'new' THEN N'acknowledged' ELSE TriageState END
-         WHERE FingerprintId = @FingerprintId;
+         WHERE ERM_ErrorFingerprintID = @ERM_ErrorFingerprintID;
     COMMIT TRANSACTION;
 
     SELECT @TicketNumber AS TicketNumber, @NewTicketId AS TicketId, CONVERT(BIT,0) AS WasDeduplicated;
@@ -600,14 +583,14 @@ GO
    brief listed - including "time spent in each status", which is recorded on
    the history row as it happens rather than re-derived at report time.
    ============================================================================= */
-CREATE OR ALTER PROCEDURE erp_err.usp_Ticket_ChangeStatus
+CREATE OR ALTER PROCEDURE ERM.usp_Ticket_ChangeStatus
 (
-    @TicketId           BIGINT,
-    @ToStatusId         TINYINT,
-    @ChangedByUserId    NVARCHAR(128) = NULL,
+    @ERM_TicketID           BIGINT,
+    @ToStatusID         TINYINT,
+    @ChangedByUserID    NVARCHAR(128) = NULL,
     @ChangedByUserName  NVARCHAR(200) = NULL,
     @Comments           NVARCHAR(MAX) = NULL,
-    @AssignToUserId     NVARCHAR(128) = NULL,
+    @AssignToUserID     NVARCHAR(128) = NULL,
     @AssignToUserName   NVARCHAR(200) = NULL,
     @IsCustomerVisible  BIT = 1,
     @ResolutionCode     NVARCHAR(60)  = NULL,
@@ -619,24 +602,24 @@ BEGIN
     SET XACT_ABORT ON;
 
     DECLARE @Now DATETIME2(3) = SYSUTCDATETIME();
-    DECLARE @FromStatusId TINYINT, @LastChangeUtc DATETIME2(3), @CreatedUtc DATETIME2(3),
-            @FingerprintId BIGINT, @SeqNo INT, @FromIsPaused BIT, @ToIsTerminal BIT,
+    DECLARE @FromStatusID TINYINT, @LastChangeUtc DATETIME2(3), @CreatedUtc DATETIME2(3),
+            @ERM_ErrorFingerprintID BIGINT, @SeqNo INT, @FromIsPaused BIT, @ToIsTerminal BIT,
             @ToIsOpen BIT, @FirstResponseUtc DATETIME2(3);
 
-    SELECT @FromStatusId   = t.StatusId,
+    SELECT @FromStatusID   = t.StatusID,
            @LastChangeUtc  = t.LastStatusChangeUtc,
            @CreatedUtc     = t.CreatedUtc,
-           @FingerprintId  = t.FingerprintId,
+           @ERM_ErrorFingerprintID  = t.ERM_ErrorFingerprintID,
            @FirstResponseUtc = t.FirstResponseUtc
-    FROM erp_err.Ticket t WHERE t.TicketId = @TicketId;
+    FROM ERM.ERM_Ticket t WHERE t.ERM_TicketID = @ERM_TicketID;
 
-    IF @FromStatusId IS NULL
+    IF @FromStatusID IS NULL
     BEGIN
-        RAISERROR (N'Ticket %I64d does not exist.', 16, 1, @TicketId);
+        RAISERROR (N'Ticket %I64d does not exist.', 16, 1, @ERM_TicketID);
         RETURN;
     END
 
-    IF @FromStatusId = @ToStatusId
+    IF @FromStatusID = @ToStatusID
     BEGIN
         RAISERROR (N'Ticket is already in that status.', 16, 1);
         RETURN;
@@ -645,13 +628,13 @@ BEGIN
     /* ---- is this move legal in the configured workflow? ---------------- */
     DECLARE @RequiresComment BIT, @RequiresAssignee BIT;
     SELECT @RequiresComment = RequiresComment, @RequiresAssignee = RequiresAssignee
-    FROM erp_err.TicketStatusTransition
-    WHERE FromStatusId = @FromStatusId AND ToStatusId = @ToStatusId AND IsActive = 1;
+    FROM ERM.ERM_TicketStatusTransition
+    WHERE FromStatusID = @FromStatusID AND ToStatusID = @ToStatusID AND IsActive = 1;
 
     IF @RequiresComment IS NULL
     BEGIN
-        DECLARE @fromName NVARCHAR(80) = (SELECT DisplayName FROM erp_err.TicketStatus WHERE StatusId = @FromStatusId);
-        DECLARE @toName   NVARCHAR(80) = (SELECT DisplayName FROM erp_err.TicketStatus WHERE StatusId = @ToStatusId);
+        DECLARE @fromName NVARCHAR(80) = (SELECT DisplayName FROM ERM.ERM_TicketStatus WHERE StatusID = @FromStatusID);
+        DECLARE @toName   NVARCHAR(80) = (SELECT DisplayName FROM ERM.ERM_TicketStatus WHERE StatusID = @ToStatusID);
         RAISERROR (N'Transition "%s" -> "%s" is not permitted by the configured workflow.', 16, 1, @fromName, @toName);
         RETURN;
     END
@@ -663,7 +646,7 @@ BEGIN
     END
 
     DECLARE @EffectiveAssigneeId NVARCHAR(128) =
-        COALESCE(@AssignToUserId, (SELECT AssignedToUserId FROM erp_err.Ticket WHERE TicketId = @TicketId));
+        COALESCE(@AssignToUserID, (SELECT AssignedToUserID FROM ERM.ERM_Ticket WHERE ERM_TicketID = @ERM_TicketID));
 
     IF @RequiresAssignee = 1 AND @EffectiveAssigneeId IS NULL
     BEGIN
@@ -671,47 +654,47 @@ BEGIN
         RETURN;
     END
 
-    SELECT @FromIsPaused = IsPaused FROM erp_err.TicketStatus WHERE StatusId = @FromStatusId;
-    SELECT @ToIsTerminal = IsTerminal, @ToIsOpen = IsOpen FROM erp_err.TicketStatus WHERE StatusId = @ToStatusId;
+    SELECT @FromIsPaused = IsPaused FROM ERM.ERM_TicketStatus WHERE StatusID = @FromStatusID;
+    SELECT @ToIsTerminal = IsTerminal, @ToIsOpen = IsOpen FROM ERM.ERM_TicketStatus WHERE StatusID = @ToStatusID;
 
     DECLARE @MinutesInFrom INT = DATEDIFF(MINUTE, @LastChangeUtc, @Now);
 
     BEGIN TRANSACTION;
 
         SELECT @SeqNo = ISNULL(MAX(SequenceNo), 0) + 1
-        FROM erp_err.TicketStatusHistory WITH (UPDLOCK, HOLDLOCK)
-        WHERE TicketId = @TicketId;
+        FROM ERM.ERM_TicketStatusHistory WITH (UPDLOCK, HOLDLOCK)
+        WHERE ERM_TicketID = @ERM_TicketID;
 
-        INSERT erp_err.TicketStatusHistory
-            (TicketId, SequenceNo, FromStatusId, ToStatusId, ChangedByUserId, ChangedByUserName,
+        INSERT ERM.ERM_TicketStatusHistory
+            (ERM_TicketID, SequenceNo, FromStatusID, ToStatusID, ChangedByUserID, ChangedByUserName,
              ChangedUtc, MinutesInFromStatus, Comments, IsCustomerVisible)
         VALUES
-            (@TicketId, @SeqNo, @FromStatusId, @ToStatusId, @ChangedByUserId, @ChangedByUserName,
+            (@ERM_TicketID, @SeqNo, @FromStatusID, @ToStatusID, @ChangedByUserID, @ChangedByUserName,
              @Now, @MinutesInFrom, @Comments, @IsCustomerVisible);
 
         UPDATE t
-           SET t.StatusId            = @ToStatusId,
+           SET t.StatusID            = @ToStatusID,
                t.LastStatusChangeUtc = @Now,
 
                /* First response: the first time anybody who is not the reporter
                   acts on the ticket.  Set once, never overwritten. */
                t.FirstResponseUtc = COALESCE(t.FirstResponseUtc,
-                                        CASE WHEN @ChangedByUserId IS NULL
-                                               OR @ChangedByUserId <> ISNULL(t.ReportedByUserId, N'~')
+                                        CASE WHEN @ChangedByUserID IS NULL
+                                               OR @ChangedByUserID <> ISNULL(t.ReportedByUserID, N'~')
                                              THEN @Now END),
 
-               t.AssignedUtc      = CASE WHEN @ToStatusId = 2 AND t.AssignedUtc IS NULL THEN @Now ELSE t.AssignedUtc END,
-               t.ResolvedUtc      = CASE WHEN @ToStatusId = 5 THEN @Now
-                                         WHEN @ToStatusId = 8 THEN NULL   -- reopened: clear it
+               t.AssignedUtc      = CASE WHEN @ToStatusID = 2 AND t.AssignedUtc IS NULL THEN @Now ELSE t.AssignedUtc END,
+               t.ResolvedUtc      = CASE WHEN @ToStatusID = 5 THEN @Now
+                                         WHEN @ToStatusID = 8 THEN NULL   -- reopened: clear it
                                          ELSE t.ResolvedUtc END,
                t.ClosedUtc        = CASE WHEN @ToIsTerminal = 1 THEN @Now
-                                         WHEN @ToStatusId = 8 THEN NULL
+                                         WHEN @ToStatusID = 8 THEN NULL
                                          ELSE t.ClosedUtc END,
 
-               t.AssignedToUserId   = COALESCE(@AssignToUserId, t.AssignedToUserId),
+               t.AssignedToUserID   = COALESCE(@AssignToUserID, t.AssignedToUserID),
                t.AssignedToUserName = COALESCE(@AssignToUserName, t.AssignedToUserName),
 
-               t.ReopenCount      = t.ReopenCount + CASE WHEN @ToStatusId = 8 THEN 1 ELSE 0 END,
+               t.ReopenCount      = t.ReopenCount + CASE WHEN @ToStatusID = 8 THEN 1 ELSE 0 END,
 
                t.ResolutionCode   = COALESCE(@ResolutionCode, t.ResolutionCode),
                t.ResolutionNotes  = COALESCE(@ResolutionNotes, t.ResolutionNotes),
@@ -725,12 +708,12 @@ BEGIN
                t.ActiveProcessingMinutes =
                     DATEDIFF(MINUTE, t.CreatedUtc, @Now)
                   - ISNULL((SELECT SUM(h.MinutesInFromStatus)
-                            FROM erp_err.TicketStatusHistory h
-                            JOIN erp_err.TicketStatus s ON s.StatusId = h.FromStatusId
-                            WHERE h.TicketId = @TicketId AND s.IsPaused = 1), 0)
+                            FROM ERM.ERM_TicketStatusHistory h
+                            JOIN ERM.ERM_TicketStatus s ON s.StatusID = h.FromStatusID
+                            WHERE h.ERM_TicketID = @ERM_TicketID AND s.IsPaused = 1), 0)
                   - CASE WHEN @FromIsPaused = 1 THEN @MinutesInFrom ELSE 0 END
-          FROM erp_err.Ticket t
-         WHERE t.TicketId = @TicketId;
+          FROM ERM.ERM_Ticket t
+         WHERE t.ERM_TicketID = @ERM_TicketID;
 
         /* SLA evaluation against the policy attached at creation time. */
         UPDATE t
@@ -744,25 +727,25 @@ BEGIN
                           AND t.ResolvedUtc IS NOT NULL
                           AND ISNULL(t.ActiveProcessingMinutes, DATEDIFF(MINUTE, t.CreatedUtc, t.ResolvedUtc)) > p.ResolutionMinutes
                          THEN 1 ELSE t.SlaResolutionBreached END
-          FROM erp_err.Ticket t
-          JOIN erp_err.SlaPolicy p ON p.SlaPolicyId = t.SlaPolicyId
-         WHERE t.TicketId = @TicketId;
+          FROM ERM.ERM_Ticket t
+          JOIN ERM.ERM_SlaPolicy p ON p.ERM_SlaPolicyID = t.ERM_SlaPolicyID
+         WHERE t.ERM_TicketID = @ERM_TicketID;
 
         /* The problem stops pointing at this ticket once it is closed, so a
            future occurrence opens a fresh one instead of reviving a dead ticket. */
         IF @ToIsTerminal = 1
-            UPDATE erp_err.ErrorFingerprint
-               SET OpenTicketId = NULL,
+            UPDATE ERM.ERM_ErrorFingerprint
+               SET OpenTicketID = NULL,
                    TriageState  = CASE WHEN TriageState IN (N'new', N'acknowledged') THEN N'resolved' ELSE TriageState END
-             WHERE FingerprintId = @FingerprintId AND OpenTicketId = @TicketId;
-        ELSE IF @ToStatusId = 8   -- reopened
-            UPDATE erp_err.ErrorFingerprint
-               SET OpenTicketId = @TicketId, TriageState = N'acknowledged'
-             WHERE FingerprintId = @FingerprintId;
+             WHERE ERM_ErrorFingerprintID = @ERM_ErrorFingerprintID AND OpenTicketID = @ERM_TicketID;
+        ELSE IF @ToStatusID = 8   -- reopened
+            UPDATE ERM.ERM_ErrorFingerprint
+               SET OpenTicketID = @ERM_TicketID, TriageState = N'acknowledged'
+             WHERE ERM_ErrorFingerprintID = @ERM_ErrorFingerprintID;
 
     COMMIT TRANSACTION;
 
-    SELECT @TicketId AS TicketId, @FromStatusId AS FromStatusId, @ToStatusId AS ToStatusId,
+    SELECT @ERM_TicketID AS TicketId, @FromStatusID AS FromStatusID, @ToStatusID AS ToStatusID,
            @SeqNo AS SequenceNo, @MinutesInFrom AS MinutesInPreviousStatus;
 END
 GO
@@ -770,10 +753,10 @@ GO
 /* =============================================================================
    usp_Ticket_AddComment
    ============================================================================= */
-CREATE OR ALTER PROCEDURE erp_err.usp_Ticket_AddComment
+CREATE OR ALTER PROCEDURE ERM.usp_Ticket_AddComment
 (
-    @TicketId           BIGINT,
-    @AuthorUserId       NVARCHAR(128) = NULL,
+    @ERM_TicketID           BIGINT,
+    @AuthorUserID       NVARCHAR(128) = NULL,
     @AuthorUserName     NVARCHAR(200) = NULL,
     @AuthorRole         NVARCHAR(20)  = N'support',
     @CommentText        NVARCHAR(MAX),
@@ -783,20 +766,20 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    IF NOT EXISTS (SELECT 1 FROM erp_err.Ticket WHERE TicketId = @TicketId)
+    IF NOT EXISTS (SELECT 1 FROM ERM.ERM_Ticket WHERE ERM_TicketID = @ERM_TicketID)
     BEGIN
-        RAISERROR (N'Ticket %I64d does not exist.', 16, 1, @TicketId);
+        RAISERROR (N'Ticket %I64d does not exist.', 16, 1, @ERM_TicketID);
         RETURN;
     END
 
-    INSERT erp_err.TicketComment (TicketId, AuthorUserId, AuthorUserName, AuthorRole, CommentText, IsCustomerVisible)
-    VALUES (@TicketId, @AuthorUserId, @AuthorUserName, @AuthorRole, @CommentText, @IsCustomerVisible);
+    INSERT ERM.ERM_TicketComment (ERM_TicketID, AuthorUserID, AuthorUserName, AuthorRole, CommentText, IsCustomerVisible)
+    VALUES (@ERM_TicketID, @AuthorUserID, @AuthorUserName, @AuthorRole, @CommentText, @IsCustomerVisible);
 
     /* A support reply counts as the first response even without a status move. */
     IF @AuthorRole = N'support'
-        UPDATE erp_err.Ticket
+        UPDATE ERM.ERM_Ticket
            SET FirstResponseUtc = ISNULL(FirstResponseUtc, SYSUTCDATETIME())
-         WHERE TicketId = @TicketId;
+         WHERE ERM_TicketID = @ERM_TicketID;
 
     SELECT SCOPE_IDENTITY() AS CommentId;
 END
@@ -805,10 +788,10 @@ GO
 /* =============================================================================
    Search / reporting procedures
    ============================================================================= */
-CREATE OR ALTER PROCEDURE erp_err.usp_Error_Search
+CREATE OR ALTER PROCEDURE ERM.usp_Error_Search
 (
-    @ErrorReference VARCHAR(24)   = NULL,
-    @TicketNumber   VARCHAR(24)   = NULL,
+    @ErrorReference VARCHAR(30)   = NULL,
+    @TicketNumber   VARCHAR(30)   = NULL,
     @UserName       NVARCHAR(200) = NULL,
     @ErpModule      NVARCHAR(100) = NULL,
     @Screen         NVARCHAR(200) = NULL,
@@ -820,8 +803,8 @@ CREATE OR ALTER PROCEDURE erp_err.usp_Error_Search
     @SeverityCode   NVARCHAR(20)  = NULL,
     @LayerCode      NVARCHAR(30)  = NULL,
     @Environment    NVARCHAR(40)  = NULL,
-    @CorrelationId  UNIQUEIDENTIFIER = NULL,
-    @FingerprintId  BIGINT        = NULL,
+    @CorrelationID  UNIQUEIDENTIFIER = NULL,
+    @ERM_ErrorFingerprintID  BIGINT        = NULL,
     @FromUtc        DATETIME2(3)  = NULL,
     @ToUtc          DATETIME2(3)  = NULL,
     @SearchText     NVARCHAR(200) = NULL,
@@ -838,11 +821,11 @@ BEGIN
 
     /* Default to the last 30 days rather than scanning history: an unbounded
        default here is how a support console takes the ERP's SQL Server down. */
-    IF @FromUtc IS NULL AND @ErrorReference IS NULL AND @TicketNumber IS NULL AND @CorrelationId IS NULL
+    IF @FromUtc IS NULL AND @ErrorReference IS NULL AND @TicketNumber IS NULL AND @CorrelationID IS NULL
         SET @FromUtc = DATEADD(DAY, -30, SYSUTCDATETIME());
 
     SELECT
-        o.OccurrenceId, o.ErrorReference, o.OccurredUtc, o.OccurredLocal,
+        o.ERM_ErrorOccurrenceID AS OccurrenceId, o.ErrorReference, o.OccurredUtc, o.OccurredLocal,
         l.Code AS LayerCode, l.DisplayName AS LayerName,
         c.Code AS CategoryCode, c.DisplayName AS CategoryName,
         sv.Code AS SeverityCode, sv.DisplayName AS SeverityName, sv.RankOrder AS SeverityRank,
@@ -852,18 +835,18 @@ BEGIN
         o.SqlErrorNumber, o.SqlObjectName, o.SqlLineNumber,
         o.UserName, o.UserDisplayName, o.Environment, o.AppVersion,
         o.BrowserName, o.BrowserVersion, o.OsName,
-        o.CorrelationId, o.RequestId,
-        o.FingerprintId, f.FingerprintHash, f.OccurrenceCount AS FingerprintOccurrenceCount,
+        o.CorrelationID, o.RequestID,
+        o.ERM_ErrorFingerprintID AS FingerprintId, f.FingerprintHash, f.OccurrenceCount AS FingerprintOccurrenceCount,
         f.DistinctUserCount, f.FirstSeenUtc, f.LastSeenUtc, f.TriageState,
-        o.TicketId, tk.TicketNumber, ts.Code AS TicketStatusCode, ts.DisplayName AS TicketStatusName,
+        o.ERM_TicketID AS TicketId, tk.TicketNumber, ts.Code AS TicketStatusCode, ts.DisplayName AS TicketStatusName,
         COUNT(*) OVER () AS TotalRowCount
-    FROM erp_err.ErrorOccurrence o
-    JOIN erp_err.ErrorFingerprint f ON f.FingerprintId = o.FingerprintId
-    JOIN erp_err.AppLayer       l  ON l.LayerId    = o.LayerId
-    JOIN erp_err.ErrorCategory  c  ON c.CategoryId = o.CategoryId
-    JOIN erp_err.Severity       sv ON sv.SeverityId = o.SeverityId
-    LEFT JOIN erp_err.Ticket        tk ON tk.TicketId = o.TicketId
-    LEFT JOIN erp_err.TicketStatus  ts ON ts.StatusId = tk.StatusId
+    FROM ERM.ERM_ErrorOccurrence o
+    JOIN ERM.ERM_ErrorFingerprint f ON f.ERM_ErrorFingerprintID = o.ERM_ErrorFingerprintID
+    JOIN ERM.ERM_AppLayer       l  ON l.LayerID    = o.LayerID
+    JOIN ERM.ERM_ErrorCategory  c  ON c.CategoryID = o.CategoryID
+    JOIN ERM.ERM_Severity       sv ON sv.SeverityID = o.SeverityID
+    LEFT JOIN ERM.ERM_Ticket        tk ON tk.ERM_TicketID = o.ERM_TicketID
+    LEFT JOIN ERM.ERM_TicketStatus  ts ON ts.StatusID = tk.StatusID
     WHERE (@ErrorReference IS NULL OR o.ErrorReference = @ErrorReference)
       AND (@TicketNumber   IS NULL OR tk.TicketNumber  = @TicketNumber)
       AND (@UserName       IS NULL OR o.UserName       = @UserName)
@@ -877,15 +860,15 @@ BEGIN
       AND (@SeverityCode   IS NULL OR sv.Code = @SeverityCode)
       AND (@LayerCode      IS NULL OR l.Code  = @LayerCode)
       AND (@Environment    IS NULL OR o.Environment   = @Environment)
-      AND (@CorrelationId  IS NULL OR o.CorrelationId = @CorrelationId)
-      AND (@FingerprintId  IS NULL OR o.FingerprintId = @FingerprintId)
+      AND (@CorrelationID  IS NULL OR o.CorrelationID = @CorrelationID)
+      AND (@ERM_ErrorFingerprintID  IS NULL OR o.ERM_ErrorFingerprintID = @ERM_ErrorFingerprintID)
       AND (@FromUtc        IS NULL OR o.OccurredUtc  >= @FromUtc)
       AND (@ToUtc          IS NULL OR o.OccurredUtc  <= @ToUtc)
       AND (@MinOccurrences IS NULL OR f.OccurrenceCount >= @MinOccurrences)
       AND (@SearchText     IS NULL OR o.Message LIKE N'%' + @SearchText + N'%'
                                    OR o.ExceptionType LIKE N'%' + @SearchText + N'%'
                                    OR o.Screen LIKE N'%' + @SearchText + N'%')
-    ORDER BY o.OccurredUtc DESC, o.OccurrenceId DESC
+    ORDER BY o.OccurredUtc DESC, o.ERM_ErrorOccurrenceID DESC
     OFFSET (@PageNumber - 1) * @PageSize ROWS FETCH NEXT @PageSize ROWS ONLY
     OPTION (RECOMPILE);   -- widely varying predicates; a cached plan here is a trap
 END
@@ -893,7 +876,7 @@ GO
 
 /* Recurring-problem report: the "frequently occurring problems that should be
    permanently resolved" list the brief asked for.                             */
-CREATE OR ALTER PROCEDURE erp_err.usp_Error_RecurringProblems
+CREATE OR ALTER PROCEDURE ERM.usp_Error_RecurringProblems
 (
     @FromUtc        DATETIME2(3) = NULL,
     @MinOccurrences INT = 5,
@@ -905,7 +888,7 @@ BEGIN
     IF @FromUtc IS NULL SET @FromUtc = DATEADD(DAY, -7, SYSUTCDATETIME());
 
     SELECT TOP (@TopN)
-        f.FingerprintId, f.FingerprintHash, f.SignatureText,
+        f.ERM_ErrorFingerprintID AS FingerprintId, f.FingerprintHash, f.SignatureText,
         sv.Code AS SeverityCode, sv.DisplayName AS SeverityName,
         c.Code  AS CategoryCode, l.Code AS LayerCode,
         f.ExceptionType, f.NormalizedMessage,
@@ -913,16 +896,16 @@ BEGIN
         f.FirstSeenUtc, f.LastSeenUtc, f.TriageState,
         f.OccurrenceCount AS LifetimeOccurrences,
         w.WindowOccurrences, w.WindowDistinctUsers,
-        f.OpenTicketId, tk.TicketNumber AS OpenTicketNumber
-    FROM erp_err.ErrorFingerprint f
-    JOIN erp_err.Severity      sv ON sv.SeverityId = f.SeverityId
-    JOIN erp_err.ErrorCategory c  ON c.CategoryId  = f.CategoryId
-    JOIN erp_err.AppLayer      l  ON l.LayerId     = f.LayerId
-    LEFT JOIN erp_err.Ticket   tk ON tk.TicketId   = f.OpenTicketId
+        f.OpenTicketID, tk.TicketNumber AS OpenTicketNumber
+    FROM ERM.ERM_ErrorFingerprint f
+    JOIN ERM.ERM_Severity      sv ON sv.SeverityID = f.SeverityID
+    JOIN ERM.ERM_ErrorCategory c  ON c.CategoryID  = f.CategoryID
+    JOIN ERM.ERM_AppLayer      l  ON l.LayerID     = f.LayerID
+    LEFT JOIN ERM.ERM_Ticket   tk ON tk.ERM_TicketID   = f.OpenTicketID
     CROSS APPLY (
         SELECT COUNT_BIG(*) AS WindowOccurrences, COUNT(DISTINCT o.UserName) AS WindowDistinctUsers
-        FROM erp_err.ErrorOccurrence o
-        WHERE o.FingerprintId = f.FingerprintId AND o.OccurredUtc >= @FromUtc
+        FROM ERM.ERM_ErrorOccurrence o
+        WHERE o.ERM_ErrorFingerprintID = f.ERM_ErrorFingerprintID AND o.OccurredUtc >= @FromUtc
     ) w
     WHERE w.WindowOccurrences >= @MinOccurrences
       AND f.TriageState <> N'muted'
@@ -934,34 +917,34 @@ GO
    order.  This is the view that turns "the save button failed" into "Angular
    caught an HTTP 500, which was this .NET exception, which was this deadlock
    in usp_PostJournal".                                                         */
-CREATE OR ALTER PROCEDURE erp_err.usp_Error_GetCorrelationTrail
+CREATE OR ALTER PROCEDURE ERM.usp_Error_GetCorrelationTrail
 (
-    @CorrelationId UNIQUEIDENTIFIER
+    @CorrelationID UNIQUEIDENTIFIER
 )
 AS
 BEGIN
     SET NOCOUNT ON;
-    SELECT o.OccurrenceId, o.ErrorReference, o.OccurredUtc, o.ReceivedUtc,
-           l.Code AS LayerCode, l.DisplayName AS LayerName, l.LayerId,
+    SELECT o.ERM_ErrorOccurrenceID, o.ErrorReference, o.OccurredUtc, o.ReceivedUtc,
+           l.Code AS LayerCode, l.DisplayName AS LayerName, l.LayerID,
            c.Code AS CategoryCode, sv.Code AS SeverityCode,
            o.ExceptionType, o.Message,
            o.Component, o.Screen, o.ApiController, o.ApiAction, o.HttpStatusCode,
            o.SqlErrorNumber, o.SqlObjectName, o.SqlLineNumber,
-           o.ParentOccurrenceId, o.RequestId,
+           o.ParentOccurrenceID, o.RequestID,
            d.StackTrace, d.InnerExceptionChain, d.SqlStatementText
-    FROM erp_err.ErrorOccurrence o
-    JOIN erp_err.AppLayer      l  ON l.LayerId     = o.LayerId
-    JOIN erp_err.ErrorCategory c  ON c.CategoryId  = o.CategoryId
-    JOIN erp_err.Severity      sv ON sv.SeverityId = o.SeverityId
-    LEFT JOIN erp_err.ErrorOccurrenceDetail d ON d.OccurrenceId = o.OccurrenceId
-    WHERE o.CorrelationId = @CorrelationId
-    ORDER BY l.LayerId DESC, o.OccurredUtc ASC;   -- deepest layer first: the cause, then the symptom
+    FROM ERM.ERM_ErrorOccurrence o
+    JOIN ERM.ERM_AppLayer      l  ON l.LayerID     = o.LayerID
+    JOIN ERM.ERM_ErrorCategory c  ON c.CategoryID  = o.CategoryID
+    JOIN ERM.ERM_Severity      sv ON sv.SeverityID = o.SeverityID
+    LEFT JOIN ERM.ERM_ErrorOccurrenceDetail d ON d.ERM_ErrorOccurrenceID = o.ERM_ErrorOccurrenceID
+    WHERE o.CorrelationID = @CorrelationID
+    ORDER BY l.LayerID DESC, o.OccurredUtc ASC;   -- deepest layer first: the cause, then the symptom
 END
 GO
 
-CREATE OR ALTER PROCEDURE erp_err.usp_Ticket_Search
+CREATE OR ALTER PROCEDURE ERM.usp_Ticket_Search
 (
-    @TicketNumber   VARCHAR(24)   = NULL,
+    @TicketNumber   VARCHAR(30)   = NULL,
     @StatusCode     NVARCHAR(40)  = NULL,
     @OnlyOpen       BIT           = NULL,
     @QueueCode      NVARCHAR(40)  = NULL,
@@ -985,7 +968,7 @@ BEGIN
     IF @PageNumber IS NULL OR @PageNumber < 1 SET @PageNumber = 1;
 
     SELECT
-        t.TicketId, t.TicketNumber, t.Title, t.CreatedVia,
+        t.ERM_TicketID AS TicketId, t.TicketNumber, t.Title, t.CreatedVia,
         st.Code AS StatusCode, st.DisplayName AS StatusName, st.IsOpen, st.IsTerminal,
         sv.Code AS SeverityCode, sv.DisplayName AS SeverityName, sv.RankOrder AS SeverityRank,
         q.Code  AS QueueCode,  q.DisplayName AS QueueName,
@@ -999,23 +982,23 @@ BEGIN
         CASE WHEN st.IsTerminal = 1 THEN t.ActiveProcessingMinutes
              ELSE DATEDIFF(MINUTE, t.CreatedUtc, SYSUTCDATETIME())
                   - ISNULL((SELECT SUM(h.MinutesInFromStatus)
-                            FROM erp_err.TicketStatusHistory h
-                            JOIN erp_err.TicketStatus s2 ON s2.StatusId = h.FromStatusId
-                            WHERE h.TicketId = t.TicketId AND s2.IsPaused = 1), 0)
+                            FROM ERM.ERM_TicketStatusHistory h
+                            JOIN ERM.ERM_TicketStatus s2 ON s2.StatusID = h.FromStatusID
+                            WHERE h.ERM_TicketID = t.ERM_TicketID AND s2.IsPaused = 1), 0)
                   - CASE WHEN st.IsPaused = 1 THEN DATEDIFF(MINUTE, t.LastStatusChangeUtc, SYSUTCDATETIME()) ELSE 0 END
         END AS ActiveProcessingMinutes,
         t.SlaFirstResponseBreached, t.SlaResolutionBreached,
         p.FirstResponseMinutes AS SlaFirstResponseTargetMinutes,
         p.ResolutionMinutes    AS SlaResolutionTargetMinutes,
         t.ReopenCount, t.LinkedOccurrenceCount,
-        t.FingerprintId, o.ErrorReference AS PrimaryErrorReference,
+        t.ERM_ErrorFingerprintID AS FingerprintId, o.ErrorReference AS PrimaryErrorReference,
         COUNT(*) OVER () AS TotalRowCount
-    FROM erp_err.Ticket t
-    JOIN erp_err.TicketStatus st ON st.StatusId = t.StatusId
-    JOIN erp_err.Severity     sv ON sv.SeverityId = t.SeverityId
-    JOIN erp_err.TicketQueue  q  ON q.QueueId     = t.QueueId
-    LEFT JOIN erp_err.SlaPolicy p ON p.SlaPolicyId = t.SlaPolicyId
-    LEFT JOIN erp_err.ErrorOccurrence o ON o.OccurrenceId = t.OccurrenceId
+    FROM ERM.ERM_Ticket t
+    JOIN ERM.ERM_TicketStatus st ON st.StatusID = t.StatusID
+    JOIN ERM.ERM_Severity     sv ON sv.SeverityID = t.SeverityID
+    JOIN ERM.ERM_TicketQueue  q  ON q.ERM_TicketQueueID     = t.ERM_TicketQueueID
+    LEFT JOIN ERM.ERM_SlaPolicy p ON p.ERM_SlaPolicyID = t.ERM_SlaPolicyID
+    LEFT JOIN ERM.ERM_ErrorOccurrence o ON o.ERM_ErrorOccurrenceID = t.ERM_ErrorOccurrenceID
     WHERE (@TicketNumber IS NULL OR t.TicketNumber = @TicketNumber)
       AND (@StatusCode   IS NULL OR st.Code = @StatusCode)
       AND (@OnlyOpen     IS NULL OR st.IsOpen = @OnlyOpen)
@@ -1041,20 +1024,20 @@ GO
 /* Full ticket view for the admin panel and for the end user's "track my
    ticket" screen.  @ForEndUser=1 filters to customer-visible history only and
    drops every diagnostic field.                                               */
-CREATE OR ALTER PROCEDURE erp_err.usp_Ticket_GetDetail
+CREATE OR ALTER PROCEDURE ERM.usp_Ticket_GetDetail
 (
-    @TicketNumber VARCHAR(24),
+    @TicketNumber VARCHAR(30),
     @ForEndUser   BIT = 0
 )
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @TicketId BIGINT = (SELECT TicketId FROM erp_err.Ticket WHERE TicketNumber = @TicketNumber);
-    IF @TicketId IS NULL RETURN;
+    DECLARE @ERM_TicketID BIGINT = (SELECT ERM_TicketID AS TicketId FROM ERM.ERM_Ticket WHERE TicketNumber = @TicketNumber);
+    IF @ERM_TicketID IS NULL RETURN;
 
     /* 1: header */
-    SELECT t.TicketId, t.TicketNumber, t.Title,
+    SELECT t.ERM_TicketID, t.TicketNumber, t.Title,
            CASE WHEN @ForEndUser = 1 THEN NULL ELSE t.UserDescription END AS UserDescription,
            st.Code AS StatusCode, st.DisplayName AS StatusName, st.IsOpen, st.IsTerminal,
            sv.Code AS SeverityCode, sv.DisplayName AS SeverityName,
@@ -1073,9 +1056,9 @@ BEGIN
            CASE WHEN st.IsTerminal = 1 THEN t.ActiveProcessingMinutes
                 ELSE DATEDIFF(MINUTE, t.CreatedUtc, SYSUTCDATETIME())
                      - ISNULL((SELECT SUM(h.MinutesInFromStatus)
-                               FROM erp_err.TicketStatusHistory h
-                               JOIN erp_err.TicketStatus s2 ON s2.StatusId = h.FromStatusId
-                               WHERE h.TicketId = t.TicketId AND s2.IsPaused = 1), 0)
+                               FROM ERM.ERM_TicketStatusHistory h
+                               JOIN ERM.ERM_TicketStatus s2 ON s2.StatusID = h.FromStatusID
+                               WHERE h.ERM_TicketID = t.ERM_TicketID AND s2.IsPaused = 1), 0)
                      - CASE WHEN st.IsPaused = 1
                             THEN DATEDIFF(MINUTE, t.LastStatusChangeUtc, SYSUTCDATETIME())
                             ELSE 0 END
@@ -1084,13 +1067,13 @@ BEGIN
            t.ReopenCount, t.LinkedOccurrenceCount,
            t.ResolutionCode, t.ResolutionNotes,
            o.ErrorReference AS PrimaryErrorReference,
-           CASE WHEN @ForEndUser = 1 THEN NULL ELSE t.FingerprintId END AS FingerprintId
-    FROM erp_err.Ticket t
-    JOIN erp_err.TicketStatus st ON st.StatusId = t.StatusId
-    JOIN erp_err.Severity     sv ON sv.SeverityId = t.SeverityId
-    JOIN erp_err.TicketQueue  q  ON q.QueueId = t.QueueId
-    LEFT JOIN erp_err.ErrorOccurrence o ON o.OccurrenceId = t.OccurrenceId
-    WHERE t.TicketId = @TicketId;
+           CASE WHEN @ForEndUser = 1 THEN NULL ELSE t.ERM_ErrorFingerprintID END AS FingerprintId
+    FROM ERM.ERM_Ticket t
+    JOIN ERM.ERM_TicketStatus st ON st.StatusID = t.StatusID
+    JOIN ERM.ERM_Severity     sv ON sv.SeverityID = t.SeverityID
+    JOIN ERM.ERM_TicketQueue  q  ON q.ERM_TicketQueueID = t.ERM_TicketQueueID
+    LEFT JOIN ERM.ERM_ErrorOccurrence o ON o.ERM_ErrorOccurrenceID = t.ERM_ErrorOccurrenceID
+    WHERE t.ERM_TicketID = @ERM_TicketID;
 
     /* 2: status history - the audit trail */
     SELECT h.SequenceNo,
@@ -1098,17 +1081,17 @@ BEGIN
            ts.Code AS ToStatusCode,   ts.DisplayName AS ToStatusName,
            CASE WHEN @ForEndUser = 1 THEN NULL ELSE h.ChangedByUserName END AS ChangedByUserName,
            h.ChangedUtc, h.MinutesInFromStatus, h.Comments
-    FROM erp_err.TicketStatusHistory h
-    LEFT JOIN erp_err.TicketStatus fs ON fs.StatusId = h.FromStatusId
-    JOIN erp_err.TicketStatus ts      ON ts.StatusId = h.ToStatusId
-    WHERE h.TicketId = @TicketId
+    FROM ERM.ERM_TicketStatusHistory h
+    LEFT JOIN ERM.ERM_TicketStatus fs ON fs.StatusID = h.FromStatusID
+    JOIN ERM.ERM_TicketStatus ts      ON ts.StatusID = h.ToStatusID
+    WHERE h.ERM_TicketID = @ERM_TicketID
       AND (@ForEndUser = 0 OR h.IsCustomerVisible = 1)
     ORDER BY h.SequenceNo;
 
     /* 3: comments */
-    SELECT c.CommentId, c.AuthorUserName, c.AuthorRole, c.CommentText, c.CreatedUtc
-    FROM erp_err.TicketComment c
-    WHERE c.TicketId = @TicketId
+    SELECT c.ERM_TicketCommentID, c.AuthorUserName, c.AuthorRole, c.CommentText, c.CreatedUtc
+    FROM ERM.ERM_TicketComment c
+    WHERE c.ERM_TicketID = @ERM_TicketID
       AND (@ForEndUser = 0 OR c.IsCustomerVisible = 1)
     ORDER BY c.CreatedUtc;
 
@@ -1116,28 +1099,28 @@ BEGIN
     SELECT s.Code AS StatusCode, s.DisplayName AS StatusName,
            SUM(h.MinutesInFromStatus) AS MinutesInStatus,
            COUNT(*) AS TimesEntered
-    FROM erp_err.TicketStatusHistory h
-    JOIN erp_err.TicketStatus s ON s.StatusId = h.FromStatusId
-    WHERE h.TicketId = @TicketId AND h.MinutesInFromStatus IS NOT NULL
+    FROM ERM.ERM_TicketStatusHistory h
+    JOIN ERM.ERM_TicketStatus s ON s.StatusID = h.FromStatusID
+    WHERE h.ERM_TicketID = @ERM_TicketID AND h.MinutesInFromStatus IS NOT NULL
     GROUP BY s.Code, s.DisplayName, s.RankOrder
     ORDER BY s.RankOrder;
 
     /* 5: linked occurrences - admin only */
     IF @ForEndUser = 0
-        SELECT TOP 200 o.OccurrenceId, o.ErrorReference, o.OccurredUtc, o.UserName,
+        SELECT TOP 200 o.ERM_ErrorOccurrenceID, o.ErrorReference, o.OccurredUtc, o.UserName,
                o.Screen, o.Component, o.Message, li.LinkReason
-        FROM erp_err.TicketOccurrenceLink li
-        JOIN erp_err.ErrorOccurrence o ON o.OccurrenceId = li.OccurrenceId
-        WHERE li.TicketId = @TicketId
+        FROM ERM.ERM_TicketOccurrenceLink li
+        JOIN ERM.ERM_ErrorOccurrence o ON o.ERM_ErrorOccurrenceID = li.ERM_ErrorOccurrenceID
+        WHERE li.ERM_TicketID = @ERM_TicketID
         ORDER BY o.OccurredUtc DESC;
 END
 GO
 
 /* Full diagnostic payload for one occurrence.  Admin only - the end user's
    modal never calls this.                                                     */
-CREATE OR ALTER PROCEDURE erp_err.usp_Error_GetDetail
+CREATE OR ALTER PROCEDURE ERM.usp_Error_GetDetail
 (
-    @ErrorReference VARCHAR(24)
+    @ErrorReference VARCHAR(30)
 )
 AS
 BEGIN
@@ -1148,19 +1131,19 @@ BEGIN
            f.FingerprintHash, f.SignatureText, f.OccurrenceCount, f.DistinctUserCount,
            f.FirstSeenUtc, f.LastSeenUtc, f.TriageState,
            tk.TicketNumber
-    FROM erp_err.ErrorOccurrence o
-    JOIN erp_err.AppLayer      l  ON l.LayerId     = o.LayerId
-    JOIN erp_err.ErrorCategory c  ON c.CategoryId  = o.CategoryId
-    JOIN erp_err.Severity      sv ON sv.SeverityId = o.SeverityId
-    JOIN erp_err.ErrorFingerprint f ON f.FingerprintId = o.FingerprintId
-    LEFT JOIN erp_err.ErrorOccurrenceDetail d ON d.OccurrenceId = o.OccurrenceId
-    LEFT JOIN erp_err.Ticket tk ON tk.TicketId = o.TicketId
+    FROM ERM.ERM_ErrorOccurrence o
+    JOIN ERM.ERM_AppLayer      l  ON l.LayerID     = o.LayerID
+    JOIN ERM.ERM_ErrorCategory c  ON c.CategoryID  = o.CategoryID
+    JOIN ERM.ERM_Severity      sv ON sv.SeverityID = o.SeverityID
+    JOIN ERM.ERM_ErrorFingerprint f ON f.ERM_ErrorFingerprintID = o.ERM_ErrorFingerprintID
+    LEFT JOIN ERM.ERM_ErrorOccurrenceDetail d ON d.ERM_ErrorOccurrenceID = o.ERM_ErrorOccurrenceID
+    LEFT JOIN ERM.ERM_Ticket tk ON tk.ERM_TicketID = o.ERM_TicketID
     WHERE o.ErrorReference = @ErrorReference;
 END
 GO
 
 /* Dashboard counters for the admin landing page. */
-CREATE OR ALTER PROCEDURE erp_err.usp_Dashboard_Summary
+CREATE OR ALTER PROCEDURE ERM.usp_Dashboard_Summary
 (
     @FromUtc DATETIME2(3) = NULL
 )
@@ -1170,38 +1153,38 @@ BEGIN
     IF @FromUtc IS NULL SET @FromUtc = DATEADD(DAY, -7, SYSUTCDATETIME());
 
     SELECT
-        (SELECT COUNT_BIG(*) FROM erp_err.ErrorOccurrence WHERE OccurredUtc >= @FromUtc)       AS ErrorsInPeriod,
-        (SELECT COUNT_BIG(*) FROM erp_err.ErrorFingerprint WHERE LastSeenUtc >= @FromUtc)      AS DistinctProblemsInPeriod,
-        (SELECT COUNT_BIG(*) FROM erp_err.Ticket t JOIN erp_err.TicketStatus s ON s.StatusId = t.StatusId
+        (SELECT COUNT_BIG(*) FROM ERM.ERM_ErrorOccurrence WHERE OccurredUtc >= @FromUtc)       AS ErrorsInPeriod,
+        (SELECT COUNT_BIG(*) FROM ERM.ERM_ErrorFingerprint WHERE LastSeenUtc >= @FromUtc)      AS DistinctProblemsInPeriod,
+        (SELECT COUNT_BIG(*) FROM ERM.ERM_Ticket t JOIN ERM.ERM_TicketStatus s ON s.StatusID = t.StatusID
           WHERE s.IsOpen = 1)                                                                  AS OpenTickets,
-        (SELECT COUNT_BIG(*) FROM erp_err.Ticket t JOIN erp_err.TicketStatus s ON s.StatusId = t.StatusId
+        (SELECT COUNT_BIG(*) FROM ERM.ERM_Ticket t JOIN ERM.ERM_TicketStatus s ON s.StatusID = t.StatusID
           WHERE s.IsOpen = 1 AND (t.SlaFirstResponseBreached = 1 OR t.SlaResolutionBreached = 1)) AS OpenTicketsBreachingSla,
-        (SELECT COUNT_BIG(*) FROM erp_err.Ticket WHERE CreatedUtc >= @FromUtc)                 AS TicketsCreatedInPeriod,
-        (SELECT COUNT_BIG(*) FROM erp_err.DeadLetter WHERE ReceivedUtc >= @FromUtc)            AS CaptureFailuresInPeriod;
+        (SELECT COUNT_BIG(*) FROM ERM.ERM_Ticket WHERE CreatedUtc >= @FromUtc)                 AS TicketsCreatedInPeriod,
+        (SELECT COUNT_BIG(*) FROM ERM.ERM_DeadLetter WHERE ReceivedUtc >= @FromUtc)            AS CaptureFailuresInPeriod;
 
     /* Errors by layer */
     SELECT l.Code AS LayerCode, l.DisplayName AS LayerName, COUNT_BIG(*) AS ErrorCount
-    FROM erp_err.ErrorOccurrence o JOIN erp_err.AppLayer l ON l.LayerId = o.LayerId
+    FROM ERM.ERM_ErrorOccurrence o JOIN ERM.ERM_AppLayer l ON l.LayerID = o.LayerID
     WHERE o.OccurredUtc >= @FromUtc
-    GROUP BY l.Code, l.DisplayName, l.LayerId ORDER BY l.LayerId;
+    GROUP BY l.Code, l.DisplayName, l.LayerID ORDER BY l.LayerID;
 
     /* Errors by severity */
     SELECT sv.Code AS SeverityCode, sv.DisplayName AS SeverityName, COUNT_BIG(*) AS ErrorCount
-    FROM erp_err.ErrorOccurrence o JOIN erp_err.Severity sv ON sv.SeverityId = o.SeverityId
+    FROM ERM.ERM_ErrorOccurrence o JOIN ERM.ERM_Severity sv ON sv.SeverityID = o.SeverityID
     WHERE o.OccurredUtc >= @FromUtc
     GROUP BY sv.Code, sv.DisplayName, sv.RankOrder ORDER BY sv.RankOrder;
 
     /* Top modules */
     SELECT TOP 10 ISNULL(o.ErpModule, N'(unknown)') AS ErpModule, COUNT_BIG(*) AS ErrorCount
-    FROM erp_err.ErrorOccurrence o WHERE o.OccurredUtc >= @FromUtc
+    FROM ERM.ERM_ErrorOccurrence o WHERE o.OccurredUtc >= @FromUtc
     GROUP BY o.ErpModule ORDER BY COUNT_BIG(*) DESC;
 END
 GO
 
 /* Triage a problem: acknowledge, mark as known, mute the noise, add a note. */
-CREATE OR ALTER PROCEDURE erp_err.usp_Fingerprint_Triage
+CREATE OR ALTER PROCEDURE ERM.usp_Fingerprint_Triage
 (
-    @FingerprintId  BIGINT,
+    @ERM_ErrorFingerprintID  BIGINT,
     @TriageState    NVARCHAR(20) = NULL,
     @MuteMinutes    INT = NULL,
     @Notes          NVARCHAR(MAX) = NULL,
@@ -1219,29 +1202,29 @@ BEGIN
     END
 
     DECLARE @OldJson NVARCHAR(MAX) =
-        (SELECT TriageState, MutedUntilUtc, Notes FROM erp_err.ErrorFingerprint
-         WHERE FingerprintId = @FingerprintId FOR JSON PATH, WITHOUT_ARRAY_WRAPPER);
+        (SELECT TriageState, MutedUntilUtc, Notes FROM ERM.ERM_ErrorFingerprint
+         WHERE ERM_ErrorFingerprintID = @ERM_ErrorFingerprintID FOR JSON PATH, WITHOUT_ARRAY_WRAPPER);
 
-    UPDATE erp_err.ErrorFingerprint
+    UPDATE ERM.ERM_ErrorFingerprint
        SET TriageState   = COALESCE(@TriageState, TriageState),
            MutedUntilUtc = CASE WHEN @MuteMinutes IS NULL THEN MutedUntilUtc
                                 WHEN @MuteMinutes <= 0 THEN NULL
                                 ELSE DATEADD(MINUTE, @MuteMinutes, SYSUTCDATETIME()) END,
            Notes         = COALESCE(@Notes, Notes)
-     WHERE FingerprintId = @FingerprintId;
+     WHERE ERM_ErrorFingerprintID = @ERM_ErrorFingerprintID;
 
-    INSERT erp_err.ConfigAudit (TableName, KeyValue, Operation, OldValuesJson, NewValuesJson, ChangedByUserName)
-    SELECT N'ErrorFingerprint', CONVERT(NVARCHAR(200), @FingerprintId), 'UPDATE', @OldJson,
-           (SELECT TriageState, MutedUntilUtc, Notes FROM erp_err.ErrorFingerprint
-            WHERE FingerprintId = @FingerprintId FOR JSON PATH, WITHOUT_ARRAY_WRAPPER),
+    INSERT ERM.ERM_ConfigAudit (TableName, KeyValue, Operation, OldValuesJson, NewValuesJson, ChangedByUserName)
+    SELECT N'ErrorFingerprint', CONVERT(NVARCHAR(200), @ERM_ErrorFingerprintID), 'UPDATE', @OldJson,
+           (SELECT TriageState, MutedUntilUtc, Notes FROM ERM.ERM_ErrorFingerprint
+            WHERE ERM_ErrorFingerprintID = @ERM_ErrorFingerprintID FOR JSON PATH, WITHOUT_ARRAY_WRAPPER),
            @ChangedByUserName;
 END
 GO
 
 /* What a given user is allowed to see about their own tickets. */
-CREATE OR ALTER PROCEDURE erp_err.usp_Ticket_ListForUser
+CREATE OR ALTER PROCEDURE ERM.usp_Ticket_ListForUser
 (
-    @UserId     NVARCHAR(128) = NULL,
+    @UserID     NVARCHAR(128) = NULL,
     @UserName   NVARCHAR(200) = NULL,
     @OnlyOpen   BIT = 0,
     @PageNumber INT = 1,
@@ -1254,21 +1237,21 @@ BEGIN
     IF @PageSize > 200 SET @PageSize = 200;
     IF @PageNumber IS NULL OR @PageNumber < 1 SET @PageNumber = 1;
 
-    IF @UserId IS NULL AND @UserName IS NULL RETURN;
+    IF @UserID IS NULL AND @UserName IS NULL RETURN;
 
     SELECT t.TicketNumber, t.Title,
            st.Code AS StatusCode, st.DisplayName AS StatusName, st.IsOpen,
            sv.DisplayName AS SeverityName,
            t.CreatedUtc, t.ResolvedUtc, t.ClosedUtc,
            t.ErpModule,
-           (SELECT TOP 1 h.Comments FROM erp_err.TicketStatusHistory h
-            WHERE h.TicketId = t.TicketId AND h.IsCustomerVisible = 1
+           (SELECT TOP 1 h.Comments FROM ERM.ERM_TicketStatusHistory h
+            WHERE h.ERM_TicketID = t.ERM_TicketID AND h.IsCustomerVisible = 1
             ORDER BY h.SequenceNo DESC) AS LatestUpdate,
            COUNT(*) OVER () AS TotalRowCount
-    FROM erp_err.Ticket t
-    JOIN erp_err.TicketStatus st ON st.StatusId = t.StatusId
-    JOIN erp_err.Severity     sv ON sv.SeverityId = t.SeverityId
-    WHERE ((@UserId   IS NOT NULL AND t.ReportedByUserId   = @UserId)
+    FROM ERM.ERM_Ticket t
+    JOIN ERM.ERM_TicketStatus st ON st.StatusID = t.StatusID
+    JOIN ERM.ERM_Severity     sv ON sv.SeverityID = t.SeverityID
+    WHERE ((@UserID   IS NOT NULL AND t.ReportedByUserID   = @UserID)
         OR (@UserName IS NOT NULL AND t.ReportedByUserName = @UserName))
       AND (@OnlyOpen = 0 OR st.IsOpen = 1)
     ORDER BY t.CreatedUtc DESC
@@ -1277,24 +1260,24 @@ END
 GO
 
 /* Configuration read by the API at startup / on cache expiry. */
-CREATE OR ALTER PROCEDURE erp_err.usp_Config_Get
+CREATE OR ALTER PROCEDURE ERM.usp_Config_Get
 AS
 BEGIN
     SET NOCOUNT ON;
-    SELECT SettingKey, SettingValue, DataType FROM erp_err.Setting;
-    SELECT Scope, KeyName FROM erp_err.RedactionAllowList WHERE IsActive = 1;
-    SELECT SeverityId, Code, DisplayName, RankOrder FROM erp_err.Severity WHERE IsActive = 1;
-    SELECT CategoryId, Code, DisplayName, DefaultSeverityId FROM erp_err.ErrorCategory WHERE IsActive = 1;
-    SELECT LayerId, Code, DisplayName FROM erp_err.AppLayer;
-    SELECT StatusId, Code, DisplayName, RankOrder, IsOpen, IsTerminal, IsPaused
-      FROM erp_err.TicketStatus WHERE IsActive = 1;
-    SELECT FromStatusId, ToStatusId, RequiresComment, RequiresAssignee
-      FROM erp_err.TicketStatusTransition WHERE IsActive = 1;
-    SELECT QueueId, Code, DisplayName, ErpModuleMatch, IsDefault FROM erp_err.TicketQueue WHERE IsActive = 1;
+    SELECT SettingKey, SettingValue, DataType FROM ERM.ERM_Setting;
+    SELECT Scope, KeyName FROM ERM.ERM_RedactionAllowList WHERE IsActive = 1;
+    SELECT SeverityID, Code, DisplayName, RankOrder FROM ERM.ERM_Severity WHERE IsActive = 1;
+    SELECT CategoryID, Code, DisplayName, DefaultSeverityID FROM ERM.ERM_ErrorCategory WHERE IsActive = 1;
+    SELECT LayerID, Code, DisplayName FROM ERM.ERM_AppLayer;
+    SELECT StatusID, Code, DisplayName, RankOrder, IsOpen, IsTerminal, IsPaused
+      FROM ERM.ERM_TicketStatus WHERE IsActive = 1;
+    SELECT FromStatusID, ToStatusID, RequiresComment, RequiresAssignee
+      FROM ERM.ERM_TicketStatusTransition WHERE IsActive = 1;
+    SELECT ERM_TicketQueueID, Code, DisplayName, ErpModuleMatch, IsDefault FROM ERM.ERM_TicketQueue WHERE IsActive = 1;
 END
 GO
 
-MERGE erp_err.SchemaVersion AS t
+MERGE ERM.ERM_SchemaVersion AS t
 USING (SELECT N'004_programmability.sql' AS ScriptName) AS s
     ON t.ScriptName = s.ScriptName
 WHEN NOT MATCHED THEN

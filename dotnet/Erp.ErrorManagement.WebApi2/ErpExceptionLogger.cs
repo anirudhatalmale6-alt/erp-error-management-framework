@@ -73,8 +73,8 @@ namespace Erp.ErrorManagement.WebApi2
             }
         }
 
-        public const string ErrorReferenceKey = "erp_err.ErrorReference";
-        public const string CaptureResultKey = "erp_err.CaptureResult";
+        public const string ErrorReferenceKey = "ERM.ErrorReference";
+        public const string CaptureResultKey = "ERM.CaptureResult";
 
         /// <summary>
         /// Fill in the controller and action, which the message handler could

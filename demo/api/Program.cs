@@ -16,7 +16,7 @@
 //      validation, the audit trail and the SLA/elapsed metrics
 //
 //  What is NOT real here:
-//    - the storage.  Production persists through erp_err.usp_Error_Capture on
+//    - the storage.  Production persists through ERM.usp_Error_Capture on
 //      SQL Server (db/004_programmability.sql).  This demo re-implements the
 //      same logic over SQLite so it needs no database server.  The SQLite code
 //      below is a MIRROR of the T-SQL, not a substitute for it - the T-SQL is

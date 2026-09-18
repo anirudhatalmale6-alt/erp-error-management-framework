@@ -12,21 +12,21 @@ SET QUOTED_IDENTIFIER ON;
 GO
 
 /* ------------------------------------------------------------- severity -- */
-MERGE erp_err.Severity AS t
+MERGE ERM.ERM_Severity AS t
 USING (VALUES
     (1, N'critical', N'Critical', 1),
     (2, N'high',     N'High',     2),
     (3, N'medium',   N'Medium',   3),
     (4, N'low',      N'Low',      4),
     (5, N'info',     N'Information', 5)
-) AS s (SeverityId, Code, DisplayName, RankOrder)
-    ON t.SeverityId = s.SeverityId
+) AS s (SeverityID, Code, DisplayName, RankOrder)
+    ON t.SeverityID = s.SeverityID
 WHEN NOT MATCHED THEN
-    INSERT (SeverityId, Code, DisplayName, RankOrder) VALUES (s.SeverityId, s.Code, s.DisplayName, s.RankOrder);
+    INSERT (SeverityID, Code, DisplayName, RankOrder) VALUES (s.SeverityID, s.Code, s.DisplayName, s.RankOrder);
 GO
 
 /* ---------------------------------------------------------------- layer -- */
-MERGE erp_err.AppLayer AS t
+MERGE ERM.ERM_AppLayer AS t
 USING (VALUES
     (1, N'angular',       N'Angular / front end'),
     (2, N'http',          N'HTTP / API transport'),
@@ -36,16 +36,16 @@ USING (VALUES
     (6, N'database',      N'SQL Server'),
     (7, N'integration',   N'External integration'),
     (8, N'infrastructure',N'Infrastructure / hosting')
-) AS s (LayerId, Code, DisplayName)
-    ON t.LayerId = s.LayerId
+) AS s (LayerID, Code, DisplayName)
+    ON t.LayerID = s.LayerID
 WHEN NOT MATCHED THEN
-    INSERT (LayerId, Code, DisplayName) VALUES (s.LayerId, s.Code, s.DisplayName);
+    INSERT (LayerID, Code, DisplayName) VALUES (s.LayerID, s.Code, s.DisplayName);
 GO
 
 /* ------------------------------------------------------------- category -- */
-/* These map 1:1 onto the error list in the brief.  DefaultSeverityId is what
+/* These map 1:1 onto the error list in the brief.  DefaultSeverityID is what
    the classifier assigns when nothing more specific is known.                 */
-MERGE erp_err.ErrorCategory AS t
+MERGE ERM.ERM_ErrorCategory AS t
 USING (VALUES
     (10, N'angular_runtime',   N'Angular runtime error',            2),
     (11, N'angular_render',    N'Template / rendering error',       2),
@@ -71,15 +71,15 @@ USING (VALUES
     (50, N'integration',       N'External service failure',         2),
     (60, N'configuration',     N'Configuration error',              2),
     (99, N'unclassified',      N'Unclassified',                     3)
-) AS s (CategoryId, Code, DisplayName, DefaultSeverityId)
-    ON t.CategoryId = s.CategoryId
+) AS s (CategoryID, Code, DisplayName, DefaultSeverityID)
+    ON t.CategoryID = s.CategoryID
 WHEN NOT MATCHED THEN
-    INSERT (CategoryId, Code, DisplayName, DefaultSeverityId)
-    VALUES (s.CategoryId, s.Code, s.DisplayName, s.DefaultSeverityId);
+    INSERT (CategoryID, Code, DisplayName, DefaultSeverityID)
+    VALUES (s.CategoryID, s.Code, s.DisplayName, s.DefaultSeverityID);
 GO
 
 /* -------------------------------------------------------- ticket status -- */
-MERGE erp_err.TicketStatus AS t
+MERGE ERM.ERM_TicketStatus AS t
 USING (VALUES
     (1, N'new',         N'New',                     1, 1, 0, 0),
     (2, N'assigned',    N'Assigned',                2, 1, 0, 0),
@@ -89,18 +89,18 @@ USING (VALUES
     (6, N'closed',      N'Closed',                  6, 0, 1, 0),
     (7, N'cancelled',   N'Cancelled',               7, 0, 1, 0),
     (8, N'reopened',    N'Reopened',                8, 1, 0, 0)
-) AS s (StatusId, Code, DisplayName, RankOrder, IsOpen, IsTerminal, IsPaused)
-    ON t.StatusId = s.StatusId
+) AS s (StatusID, Code, DisplayName, RankOrder, IsOpen, IsTerminal, IsPaused)
+    ON t.StatusID = s.StatusID
 WHEN NOT MATCHED THEN
-    INSERT (StatusId, Code, DisplayName, RankOrder, IsOpen, IsTerminal, IsPaused)
-    VALUES (s.StatusId, s.Code, s.DisplayName, s.RankOrder, s.IsOpen, s.IsTerminal, s.IsPaused);
+    INSERT (StatusID, Code, DisplayName, RankOrder, IsOpen, IsTerminal, IsPaused)
+    VALUES (s.StatusID, s.Code, s.DisplayName, s.RankOrder, s.IsOpen, s.IsTerminal, s.IsPaused);
 GO
 
 /* ---------------------------------------------------------- transitions -- */
 /* New -> Assigned -> In Progress -> Waiting for Information -> Resolved -> Closed,
    plus the realistic side paths (cancel, reopen, resolve straight from In
    Progress, bounce back out of Waiting).                                      */
-MERGE erp_err.TicketStatusTransition AS t
+MERGE ERM.ERM_TicketStatusTransition AS t
 USING (VALUES
     (1, 2, 0, 1),  (1, 3, 0, 1),  (1, 7, 1, 0),
     (2, 3, 0, 0),  (2, 4, 1, 0),  (2, 1, 1, 0),  (2, 7, 1, 0),
@@ -109,44 +109,44 @@ USING (VALUES
     (5, 6, 0, 0),  (5, 8, 1, 0),
     (6, 8, 1, 0),
     (8, 2, 0, 1),  (8, 3, 0, 1),  (8, 5, 1, 0)
-) AS s (FromStatusId, ToStatusId, RequiresComment, RequiresAssignee)
-    ON t.FromStatusId = s.FromStatusId AND t.ToStatusId = s.ToStatusId
+) AS s (FromStatusID, ToStatusID, RequiresComment, RequiresAssignee)
+    ON t.FromStatusID = s.FromStatusID AND t.ToStatusID = s.ToStatusID
 WHEN NOT MATCHED THEN
-    INSERT (FromStatusId, ToStatusId, RequiresComment, RequiresAssignee)
-    VALUES (s.FromStatusId, s.ToStatusId, s.RequiresComment, s.RequiresAssignee);
+    INSERT (FromStatusID, ToStatusID, RequiresComment, RequiresAssignee)
+    VALUES (s.FromStatusID, s.ToStatusID, s.RequiresComment, s.RequiresAssignee);
 GO
 
 /* --------------------------------------------------------------- queues -- */
-IF NOT EXISTS (SELECT 1 FROM erp_err.TicketQueue WHERE Code = N'general')
-    INSERT erp_err.TicketQueue (Code, DisplayName, ErpModuleMatch, IsDefault)
+IF NOT EXISTS (SELECT 1 FROM ERM.ERM_TicketQueue WHERE Code = N'general')
+    INSERT ERM.ERM_TicketQueue (Code, DisplayName, ErpModuleMatch, IsDefault)
     VALUES (N'general', N'General Support', NULL, 1);
-IF NOT EXISTS (SELECT 1 FROM erp_err.TicketQueue WHERE Code = N'application')
-    INSERT erp_err.TicketQueue (Code, DisplayName, ErpModuleMatch, IsDefault)
+IF NOT EXISTS (SELECT 1 FROM ERM.ERM_TicketQueue WHERE Code = N'application')
+    INSERT ERM.ERM_TicketQueue (Code, DisplayName, ErpModuleMatch, IsDefault)
     VALUES (N'application', N'Application Support', NULL, 0);
-IF NOT EXISTS (SELECT 1 FROM erp_err.TicketQueue WHERE Code = N'database')
-    INSERT erp_err.TicketQueue (Code, DisplayName, ErpModuleMatch, IsDefault)
+IF NOT EXISTS (SELECT 1 FROM ERM.ERM_TicketQueue WHERE Code = N'database')
+    INSERT ERM.ERM_TicketQueue (Code, DisplayName, ErpModuleMatch, IsDefault)
     VALUES (N'database', N'Database Team', NULL, 0);
 GO
 
 /* ------------------------------------------------------------------ SLA -- */
-MERGE erp_err.SlaPolicy AS t
+MERGE ERM.ERM_SlaPolicy AS t
 USING (VALUES
     (1, 15,  240),     -- critical: respond 15 min, resolve 4 h
     (2, 60,  480),     -- high
     (3, 240, 2880),    -- medium: 4 h / 2 days
     (4, 480, 10080),   -- low
     (5, 1440,43200)    -- info
-) AS s (SeverityId, FirstResponseMinutes, ResolutionMinutes)
-    ON t.SeverityId = s.SeverityId AND t.QueueId IS NULL
+) AS s (SeverityID, FirstResponseMinutes, ResolutionMinutes)
+    ON t.SeverityID = s.SeverityID AND t.ERM_TicketQueueID IS NULL
 WHEN NOT MATCHED THEN
-    INSERT (SeverityId, QueueId, FirstResponseMinutes, ResolutionMinutes)
-    VALUES (s.SeverityId, NULL, s.FirstResponseMinutes, s.ResolutionMinutes);
+    INSERT (SeverityID, ERM_TicketQueueID, FirstResponseMinutes, ResolutionMinutes)
+    VALUES (s.SeverityID, NULL, s.FirstResponseMinutes, s.ResolutionMinutes);
 GO
 
 /* ------------------------------------------------- redaction allow-list -- */
 /* Only these keys survive capture with their real value; everything else in
    the same scope is stored as '***'.                                          */
-MERGE erp_err.RedactionAllowList AS t
+MERGE ERM.ERM_RedactionAllowList AS t
 USING (VALUES
     (N'header', N'content-type'),        (N'header', N'accept'),
     (N'header', N'accept-language'),     (N'header', N'user-agent'),
@@ -171,7 +171,7 @@ WHEN NOT MATCHED THEN
 GO
 
 /* ------------------------------------------------------------- settings -- */
-MERGE erp_err.Setting AS t
+MERGE ERM.ERM_Setting AS t
 USING (VALUES
     (N'capture.enabled',                  N'true',  N'bool', N'Master switch. false = the API accepts and discards envelopes.'),
     (N'capture.maxStackTraceChars',       N'20000', N'int',  N'Stack traces longer than this are truncated with a marker.'),
@@ -200,16 +200,16 @@ GO
 /* Shipped conservative on purpose: only a critical error that has already
    happened three times in an hour raises a ticket by itself.  Everything else
    waits for a human to press Report.                                          */
-IF NOT EXISTS (SELECT 1 FROM erp_err.AutoTicketRule WHERE RuleName = N'Critical recurring')
-    INSERT erp_err.AutoTicketRule (RuleName, MinSeverityId, MinOccurrences, WindowMinutes, TargetQueueId)
-    SELECT N'Critical recurring', 1, 3, 60, (SELECT QueueId FROM erp_err.TicketQueue WHERE Code = N'application');
-IF NOT EXISTS (SELECT 1 FROM erp_err.AutoTicketRule WHERE RuleName = N'Database unavailable')
-    INSERT erp_err.AutoTicketRule (RuleName, CategoryId, MinOccurrences, WindowMinutes, TargetQueueId)
-    SELECT N'Database unavailable', 45, 1, 15, (SELECT QueueId FROM erp_err.TicketQueue WHERE Code = N'database');
+IF NOT EXISTS (SELECT 1 FROM ERM.ERM_AutoTicketRule WHERE RuleName = N'Critical recurring')
+    INSERT ERM.ERM_AutoTicketRule (RuleName, MinSeverityID, MinOccurrences, WindowMinutes, TargetQueueID)
+    SELECT N'Critical recurring', 1, 3, 60, (SELECT ERM_TicketQueueID FROM ERM.ERM_TicketQueue WHERE Code = N'application');
+IF NOT EXISTS (SELECT 1 FROM ERM.ERM_AutoTicketRule WHERE RuleName = N'Database unavailable')
+    INSERT ERM.ERM_AutoTicketRule (RuleName, CategoryID, MinOccurrences, WindowMinutes, TargetQueueID)
+    SELECT N'Database unavailable', 45, 1, 15, (SELECT ERM_TicketQueueID FROM ERM.ERM_TicketQueue WHERE Code = N'database');
 GO
 
 /* ------------------------------------------------------------- retention -- */
-MERGE erp_err.RetentionPolicy AS t
+MERGE ERM.ERM_RetentionPolicy AS t
 USING (VALUES
     (N'occurrence_detail',  30,  0,    5000),  -- payloads archived after 30 days
     (N'occurrence',        180,  730,  5000),  -- events archived at 6 months, purged at 2 years
@@ -222,7 +222,7 @@ WHEN NOT MATCHED THEN
     VALUES (s.DataSet, s.ArchiveAfterDays, s.PurgeAfterDays, s.BatchSize);
 GO
 
-MERGE erp_err.SchemaVersion AS t
+MERGE ERM.ERM_SchemaVersion AS t
 USING (SELECT N'003_seed_reference_data.sql' AS ScriptName) AS s
     ON t.ScriptName = s.ScriptName
 WHEN NOT MATCHED THEN

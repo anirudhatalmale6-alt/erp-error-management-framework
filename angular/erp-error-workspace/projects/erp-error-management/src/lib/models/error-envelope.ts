@@ -1,6 +1,6 @@
 /**
  * The wire contract between every capture point (Angular, Web API 2, ASP.NET
- * Core) and erp_err.usp_Error_Capture.
+ * Core) and ERM.usp_Error_Capture.
  *
  * Keep this file and Erp.ErrorManagement.Core/ErrorEnvelope.cs in step - they
  * are two spellings of the same JSON document, and the stored procedure shreds
@@ -19,7 +19,7 @@ export type ErpErrorLayer =
 
 export type ErpErrorSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
 
-/** Matches erp_err.ErrorCategory.Code.  New codes are a row in that table, not a code change. */
+/** Matches ERM.ERM_ErrorCategory.Code.  New codes are a row in that table, not a code change. */
 export type ErpErrorCategory =
   | 'angular_runtime'
   | 'angular_render'

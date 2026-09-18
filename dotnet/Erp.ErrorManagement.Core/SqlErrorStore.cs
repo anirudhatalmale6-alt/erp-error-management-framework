@@ -132,7 +132,7 @@ namespace Erp.ErrorManagement
                 });
 
                 using (var connection = new SqlConnection(_options.ConnectionString))
-                using (var command = new SqlCommand("erp_err.usp_Error_Capture", connection))
+                using (var command = new SqlCommand("ERM.usp_Error_Capture", connection))
                 {
                     command.CommandType = CommandType.StoredProcedure;
                     command.CommandTimeout = _options.CommandTimeoutSeconds;
@@ -188,7 +188,7 @@ namespace Erp.ErrorManagement
                     // the user has in front of them.
                     long occurrenceId;
                     using (var lookup = new SqlCommand(
-                        "SELECT OccurrenceId FROM erp_err.ErrorOccurrence WHERE ErrorReference = @ref",
+                        "SELECT ERM_ErrorOccurrenceID FROM ERM.ERM_ErrorOccurrence WHERE ErrorReference = @ref",
                         connection))
                     {
                         lookup.CommandTimeout = _options.CommandTimeoutSeconds;
@@ -198,7 +198,7 @@ namespace Erp.ErrorManagement
                         occurrenceId = Convert.ToInt64(scalar);
                     }
 
-                    using (var command = new SqlCommand("erp_err.usp_Ticket_Create", connection))
+                    using (var command = new SqlCommand("ERM.usp_Ticket_Create", connection))
                     {
                         command.CommandType = CommandType.StoredProcedure;
                         command.CommandTimeout = _options.CommandTimeoutSeconds;
@@ -253,7 +253,7 @@ namespace Erp.ErrorManagement
             try
             {
                 using (var connection = new SqlConnection(_options.ConnectionString))
-                using (var command = new SqlCommand("erp_err.usp_Ticket_ListForUser", connection))
+                using (var command = new SqlCommand("ERM.usp_Ticket_ListForUser", connection))
                 {
                     command.CommandType = CommandType.StoredProcedure;
                     command.CommandTimeout = _options.CommandTimeoutSeconds;
@@ -306,7 +306,7 @@ namespace Erp.ErrorManagement
             try
             {
                 using (var connection = new SqlConnection(_options.ConnectionString))
-                using (var command = new SqlCommand("erp_err.usp_Ticket_GetForUser", connection))
+                using (var command = new SqlCommand("ERM.usp_Ticket_GetForUser", connection))
                 {
                     command.CommandType = CommandType.StoredProcedure;
                     command.CommandTimeout = _options.CommandTimeoutSeconds;
@@ -395,7 +395,7 @@ namespace Erp.ErrorManagement
             try
             {
                 using (var connection = new SqlConnection(_options.ConnectionString))
-                using (var command = new SqlCommand("erp_err.usp_Ticket_AddUserComment", connection))
+                using (var command = new SqlCommand("ERM.usp_Ticket_AddUserComment", connection))
                 {
                     command.CommandType = CommandType.StoredProcedure;
                     command.CommandTimeout = _options.CommandTimeoutSeconds;
@@ -428,7 +428,7 @@ namespace Erp.ErrorManagement
             try
             {
                 using (var connection = new SqlConnection(_options.ConnectionString))
-                using (var command = new SqlCommand("erp_err.usp_Ticket_CreateManual", connection))
+                using (var command = new SqlCommand("ERM.usp_Ticket_CreateManual", connection))
                 {
                     command.CommandType = CommandType.StoredProcedure;
                     command.CommandTimeout = _options.CommandTimeoutSeconds;
@@ -498,7 +498,7 @@ namespace Erp.ErrorManagement
             try
             {
                 using (var connection = new SqlConnection(_options.ConnectionString))
-                using (var command = new SqlCommand("erp_err.usp_Ticket_Assign", connection))
+                using (var command = new SqlCommand("ERM.usp_Ticket_Assign", connection))
                 {
                     command.CommandType = CommandType.StoredProcedure;
                     command.CommandTimeout = _options.CommandTimeoutSeconds;
@@ -548,7 +548,7 @@ namespace Erp.ErrorManagement
             try
             {
                 using (var connection = new SqlConnection(_options.ConnectionString))
-                using (var command = new SqlCommand("erp_err.usp_RequestCategory_List", connection))
+                using (var command = new SqlCommand("ERM.usp_RequestCategory_List", connection))
                 {
                     command.CommandType = CommandType.StoredProcedure;
                     command.CommandTimeout = _options.CommandTimeoutSeconds;

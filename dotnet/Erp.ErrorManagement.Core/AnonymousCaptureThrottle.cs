@@ -15,7 +15,7 @@ namespace Erp.ErrorManagement
     /// Without a limit, three things happen, in this order:
     ///   1. The error store fills with junk and the recurring-problem report
     ///      becomes unreadable.
-    ///   2. erp_err grows until it affects the ERP database it shares a disk
+    ///   2. ERM grows until it affects the ERP database it shares a disk
     ///      with, which is the framework harming the application it exists to
     ///      protect.
     ///   3. Nobody notices for weeks, because the whole design is that capture

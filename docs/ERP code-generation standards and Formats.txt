@@ -1,0 +1,123 @@
+LinkedScam Error Management (ERM)
+Ticket and Error Reference Code Standard
+
+1. GENERAL FORMAT
+
+Ticket:
+LS-ERM-TKT-YYMMDD-X
+
+Error:
+LS-ERM-ERR-YYMMDD-X
+
+
+2. CODE SEGMENTS
+
+LS
+- Represents LinkedScam.
+- Fixed prefix.
+
+ERM
+- Represents the LinkedScam Error Management framework.
+- Fixed framework/schema identifier.
+
+TKT
+- Identifies a Ticket reference.
+- Fixed value for tickets.
+
+ERR
+- Identifies an Error reference.
+- Fixed value for errors.
+
+YYMMDD
+- Represents the exact creation date.
+- Two digits for year, month, and day.
+- Example:
+  2026-09-03 = 260903
+
+X
+- Sequential counter for the same date.
+- Starts from 1.
+- Increases by 1 for each newly generated reference.
+- Counter starts again from 1 when the date changes.
+
+
+3. TICKET EXAMPLES
+
+Date: 2026-09-03
+
+LS-ERM-TKT-260903-1
+LS-ERM-TKT-260903-2
+LS-ERM-TKT-260903-3
+
+The next ticket on the same date:
+
+LS-ERM-TKT-260903-4
+
+
+4. ERROR EXAMPLES
+
+Date: 2026-09-03
+
+LS-ERM-ERR-260903-1
+LS-ERM-ERR-260903-2
+LS-ERM-ERR-260903-3
+
+The next error on the same date:
+
+LS-ERM-ERR-260903-4
+
+
+5. DATE CHANGE BEHAVIOR
+
+If the date changes from 2026-09-03 to 2026-09-04,
+the counter starts again from 1.
+
+Date: 2026-09-04
+
+LS-ERM-TKT-260904-1
+LS-ERM-TKT-260904-2
+
+LS-ERM-ERR-260904-1
+LS-ERM-ERR-260904-2
+
+
+6. IMPORTANT
+
+The ticket counter and error counter are separate.
+
+For example, creating three tickets and two errors
+on the same date produces:
+
+LS-ERM-TKT-260903-1
+LS-ERM-TKT-260903-2
+LS-ERM-TKT-260903-3
+
+LS-ERM-ERR-260903-1
+LS-ERM-ERR-260903-2
+
+The ticket counter does not affect the error counter.
+
+
+7. UNIQUENESS AND CONCURRENCY
+
+The reference-generation mechanism must guarantee that
+duplicate codes cannot be generated when multiple users,
+requests, or application instances create tickets/errors
+concurrently.
+
+The generation must be handled safely at the database/
+persistence level rather than relying only on application
+memory.
+
+The generated reference must remain unique across the
+applicable records.
+
+8. FORMAT RULES
+
+- All prefixes are uppercase.
+- No spaces are allowed.
+- Date must always use YYMMDD.
+- Counter starts at 1 for each new date.
+- Ticket and error references must remain distinguishable.
+- The format should be implemented centrally and should
+  not be recreated independently by individual modules.

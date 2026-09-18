@@ -328,7 +328,7 @@ export class MyIssuesPage {
 
   constructor() {
     this.load();
-    // Categories are rows in erp_err.RequestCategory, not a hard-coded enum,
+    // Categories are rows in ERM.ERM_RequestCategory, not a hard-coded enum,
     // so support can change the list without a front-end release.
     this.http
       .get<any>('/api/error-management/request-categories')

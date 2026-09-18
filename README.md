@@ -37,7 +37,12 @@ config.UseErpErrorManagement(new ErrorCaptureOptions {
 });
 ```
 
-**SQL Server** — run `db/001` … `db/007` then `db/010` and `db/011` once. Everything lives in its own
+**SQL Server** — run `db/001` … `db/007` then `db/010` and `db/011` once. Every
+object lives in the **`ERM`** schema and follows the LinkedScam ERP standards
+(`ERM.ERM_TableName`, standard `ROWID`/`DBNo`/`AppNo` + audit columns,
+`LS-ERM-TKT-YYMMDD-X` reference codes) — see `docs/ARCHITECTURE.md` §16.
+Set your system user id before go-live:
+`ALTER FUNCTION ERM.fn_SystemUserID() RETURNS INT AS BEGIN RETURN <id> END;` Everything lives in its own
 `erp_err` schema; no existing object is read, altered or dropped. (`008` and
 `009` are optional add-ons — see `docs/ARCHITECTURE.md` §5.3.)
 
@@ -77,7 +82,7 @@ dotnet/
   Erp.ErrorManagement.Core/        netstandard2.0 — shared by BOTH stacks
   Erp.ErrorManagement.WebApi2/     net472 — Web API 2 integration
   Erp.ErrorManagement.AspNetCore/  net8.0 — for future modules
-  Erp.ErrorManagement.Tests/       123 verification checks (see below)
+  Erp.ErrorManagement.Tests/       143 verification checks (see below)
 
 demo/api/               runnable demo API (SQLite — a harness, not the product)
 docs/ARCHITECTURE.md    the technical design
@@ -93,7 +98,7 @@ tools/                  cross-language fingerprint verification
 dotnet run --project dotnet/Erp.ErrorManagement.Tests
 ```
 
-123 checks, covering:
+143 checks, covering:
 
 * every T-SQL script parsing against the **real SQL Server 2016 grammar**
   (Microsoft's `ScriptDom` — the parser SSMS and sqlpackage use);
@@ -110,6 +115,9 @@ dotnet run --project dotnet/Erp.ErrorManagement.Tests
 * **the SQL that the dynamic search procedures actually build** — every branch
   combination expanded and parsed, so a syntax error inside a string literal
   cannot reach production;
+* **the LinkedScam standards** — no `erp_err` anywhere, every table
+  `ERM.ERM_*`, all nine standard columns present and in order, the reference
+  format, and the atomic (non-racing) counter;
 * support-console authorisation failing **closed**, every admin action carrying
   a capability gate, and the acting user coming from the token rather than the
   request body.
@@ -118,7 +126,9 @@ Each group includes a **positive control** — a check that deliberately expects
 the negative result — because a suite that cannot fail proves nothing.
 
 ```bash
-node tools/verify-fingerprint.mjs     # the TypeScript half of the same corpus
+node tools/verify-fingerprint.mjs            # the TypeScript half of the same corpus
+node tools/verify-reference-concurrency.mjs  # 120 parallel requests, zero duplicate codes
+                                             # (needs the demo running)
 ```
 
 ---

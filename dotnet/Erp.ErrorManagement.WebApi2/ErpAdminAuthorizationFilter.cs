@@ -18,7 +18,7 @@ namespace Erp.ErrorManagement.WebApi2
     ///   1. AUTHENTICATION - the ERP's own JWT middleware. If the request has no
     ///      authenticated principal it never reaches the controller.
     ///   2. AUTHORISATION - this filter, which resolves the caller against the
-    ///      erp_err support roster (and optionally a token role claim) and
+    ///      ERM support roster (and optionally a token role claim) and
     ///      checks the specific capability the action needs.
     ///
     /// Both matter. A route guard in Angular hides a screen; it does not protect
@@ -60,7 +60,7 @@ namespace Erp.ErrorManagement.WebApi2
         public bool AllowMultiple => false;
 
         /// <summary>Key under which the resolved identity is stashed for the action.</summary>
-        public const string IdentityKey = "erp_err.SupportIdentity";
+        public const string IdentityKey = "ERM.SupportIdentity";
 
         public async Task AuthenticateAsync(HttpAuthenticationContext context, CancellationToken cancellationToken)
         {

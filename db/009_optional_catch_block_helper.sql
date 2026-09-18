@@ -30,7 +30,7 @@
    USAGE - the whole integration for a procedure
    ---------------------------------------------
        BEGIN CATCH
-           EXEC erp_err.usp_Error_CaptureFromCatch @ProcedureName = N'usp_PostJournal';
+           EXEC ERM.usp_Error_CaptureFromCatch @ProcedureName = N'usp_PostJournal';
 
            SET @Result = -1;          -- unchanged
            -- no THROW, as before    -- unchanged
@@ -55,7 +55,7 @@ GO
    which return NULL anywhere else.  Called outside one, it does nothing rather
    than writing a row full of NULLs.
    ============================================================================= */
-CREATE OR ALTER PROCEDURE erp_err.usp_Error_CaptureFromCatch
+CREATE OR ALTER PROCEDURE ERM.usp_Error_CaptureFromCatch
 (
     /* Name to group by.  Defaults to ERROR_PROCEDURE(), which is the procedure
        that RAISED the error - for a nested call that is the inner one, so pass
@@ -74,7 +74,7 @@ CREATE OR ALTER PROCEDURE erp_err.usp_Error_CaptureFromCatch
 
        See the note at the bottom on how to make this automatic with
        sp_set_session_context, which needs no procedure signature changes. */
-    @CorrelationId  UNIQUEIDENTIFIER = NULL,
+    @CorrelationID  UNIQUEIDENTIFIER = NULL,
 
     @ErpModule      NVARCHAR(100) = NULL,
     @Severity       NVARCHAR(20)  = NULL   -- override; default derives from ERROR_SEVERITY()
@@ -96,17 +96,17 @@ BEGIN
         DECLARE @Proc     NVARCHAR(256) = COALESCE(@ProcedureName, ERROR_PROCEDURE());
 
         /* ---- correlation: explicit argument, else session context -------- */
-        IF @CorrelationId IS NULL
+        IF @CorrelationID IS NULL
         BEGIN
             /* Set once per connection by the data-access layer; see the note at
                the bottom.  TRY_CONVERT so a malformed value is ignored rather
                than throwing inside an error handler. */
-            SET @CorrelationId = TRY_CONVERT(UNIQUEIDENTIFIER,
-                                             SESSION_CONTEXT(N'erp_err_correlation_id'));
+            SET @CorrelationID = TRY_CONVERT(UNIQUEIDENTIFIER,
+                                             SESSION_CONTEXT(N'ERM_correlation_id'));
         END
 
         IF @ErpModule IS NULL
-            SET @ErpModule = CONVERT(NVARCHAR(100), SESSION_CONTEXT(N'erp_err_module'));
+            SET @ErpModule = CONVERT(NVARCHAR(100), SESSION_CONTEXT(N'ERM_module'));
 
         /* ---- severity ---------------------------------------------------- */
         /* Same reasoning as the .NET classifier: a RAISERROR at severity 11-16
@@ -167,8 +167,8 @@ BEGIN
                 @Normalised              AS normalizedMessage,
                 CONVERT(NVARCHAR(40), SYSUTCDATETIME(), 127) AS occurredUtc,
                 @ErpModule               AS erpModule,
-                CONVERT(NVARCHAR(36), @CorrelationId) AS correlationId,
-                ISNULL(CONVERT(NVARCHAR(40), SESSION_CONTEXT(N'erp_err_environment')),
+                CONVERT(NVARCHAR(36), @CorrelationID) AS correlationId,
+                ISNULL(CONVERT(NVARCHAR(40), SESSION_CONTEXT(N'ERM_environment')),
                        N'SQL Server')    AS environment,
                 @@SERVERNAME             AS machineName,
                 @Number                  AS [sql.number],
@@ -190,12 +190,12 @@ BEGIN
            and returns - so this call is safe from inside an error handler. */
         DECLARE @sink TABLE
         (
-            ErrorReference VARCHAR(24), OccurrenceId BIGINT, FingerprintId BIGINT,
-            ShouldNotifyUser BIT, AutoTicketNumber VARCHAR(24), IsKnownIssue BIT
+            ErrorReference VARCHAR(30), ERM_ErrorOccurrenceID BIGINT, ERM_ErrorFingerprintID BIGINT,
+            ShouldNotifyUser BIT, AutoTicketNumber VARCHAR(30), IsKnownIssue BIT
         );
 
         INSERT @sink
-        EXEC erp_err.usp_Error_Capture @EnvelopeJson = @Envelope, @Source = N'sql-catch';
+        EXEC ERM.usp_Error_Capture @EnvelopeJson = @Envelope, @Source = N'sql-catch';
     END TRY
     BEGIN CATCH
         /* An error inside the error capture, inside the caller's CATCH block.
@@ -218,8 +218,8 @@ GO
    once per request:
 
        -- called by the SP executor immediately after opening the connection
-       EXEC erp_err.usp_Session_SetContext
-            @CorrelationId = @correlationFromHttpHeader,
+       EXEC ERM.usp_Session_SetContext
+            @CorrelationID = @correlationFromHttpHeader,
             @ErpModule     = @moduleFromHttpHeader,
             @Environment   = N'Production';
 
@@ -232,9 +232,9 @@ GO
    @read_only is deliberately NOT used: a pooled connection is reused for the
    next request, which must be able to overwrite the previous value.
    ============================================================================= */
-CREATE OR ALTER PROCEDURE erp_err.usp_Session_SetContext
+CREATE OR ALTER PROCEDURE ERM.usp_Session_SetContext
 (
-    @CorrelationId UNIQUEIDENTIFIER = NULL,
+    @CorrelationID UNIQUEIDENTIFIER = NULL,
     @ErpModule     NVARCHAR(100) = NULL,
     @Environment   NVARCHAR(40)  = NULL
 )
@@ -242,11 +242,11 @@ AS
 BEGIN
     SET NOCOUNT ON;
     BEGIN TRY
-        EXEC sp_set_session_context @key = N'erp_err_correlation_id',
-                                    @value = @CorrelationId;
-        EXEC sp_set_session_context @key = N'erp_err_module',
+        EXEC sp_set_session_context @key = N'ERM_correlation_id',
+                                    @value = @CorrelationID;
+        EXEC sp_set_session_context @key = N'ERM_module',
                                     @value = @ErpModule;
-        EXEC sp_set_session_context @key = N'erp_err_environment',
+        EXEC sp_set_session_context @key = N'ERM_environment',
                                     @value = @Environment;
     END TRY
     BEGIN CATCH
@@ -257,7 +257,7 @@ BEGIN
 END
 GO
 
-MERGE erp_err.SchemaVersion AS t
+MERGE ERM.ERM_SchemaVersion AS t
 USING (SELECT N'009_optional_catch_block_helper.sql' AS ScriptName) AS s
     ON t.ScriptName = s.ScriptName
 WHEN NOT MATCHED THEN

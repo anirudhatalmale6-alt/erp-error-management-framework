@@ -1,0 +1,98 @@
+============================================================
+LINKEDSCAM ERP DATABASE STANDARD
+TABLE NAMING CONVENTION
+============================================================
+
+1. PURPOSE
+
+The Error Management framework must follow the existing
+LinkedScam ERP database naming conventions.
+
+The framework must NOT use a generic schema/table naming
+convention such as:
+
+    erp_err
+
+Instead, it must follow the standard LinkedScam ERP format.
+
+------------------------------------------------------------
+2. SCHEMA AND TABLE NAMING FORMAT
+------------------------------------------------------------
+
+Standard format:
+
+    SCM.SCM_TableName
+
+Where:
+
+    SCM
+    - Represents the database schema name.
+    - Must be a 3-4 character uppercase abbreviation.
+    - The schema abbreviation represents the relevant
+      ERP module or functional area.
+
+    _
+    - Underscore separator between the schema abbreviation
+      and the actual table name.
+
+    TableName
+    - Represents the actual descriptive table name.
+    - Must use clear and meaningful naming.
+
+------------------------------------------------------------
+3. EXISTING LINKEDSCAM ERP EXAMPLES
+------------------------------------------------------------
+
+Property:
+
+    PR.PR_PropertyViews
+
+Education:
+
+    ED.ED_Staff
+
+The schema abbreviation is repeated as the prefix of the
+table name.
+
+------------------------------------------------------------
+4. ERROR MANAGEMENT FRAMEWORK
+------------------------------------------------------------
+
+The Error Management framework will use:
+
+    ERM
+
+as its dedicated database schema abbreviation.
+
+Therefore, the framework tables must follow:
+
+    ERM.ERM_TableName
+
+Examples:
+
+    ERM.ERM_TicketQueue
+    ERM.ERM_ErrorCategory
+    ERM.ERM_AutoTicketRule
+
+The exact table names will be defined according to the
+Error Management framework requirements, while following
+the same LinkedScam naming convention.
+
+------------------------------------------------------------
+5. IMPORTANT RULE
+------------------------------------------------------------
+
+All Error Management framework database objects must follow
+the LinkedScam ERP database naming standards.
+
+The existing:
+
+    erp_err
+
+schema/table naming approach should therefore be replaced
+with the LinkedScam standard:
+
+    ERM.ERM_TableName
+
+
+============================================================

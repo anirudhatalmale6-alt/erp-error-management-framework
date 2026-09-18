@@ -5,7 +5,7 @@ namespace Erp.ErrorManagement
 {
     /// <summary>
     /// Host-supplied settings.  Anything an administrator should be able to
-    /// change at runtime lives in erp_err.Setting instead; this is the
+    /// change at runtime lives in ERM.Setting instead; this is the
     /// deployment-time configuration only.
     /// </summary>
     public class ErrorCaptureOptions
@@ -15,7 +15,7 @@ namespace Erp.ErrorManagement
         ///
         /// CAN be the ERP's own connection string - the framework only ever
         /// touches its own schema - but a separate login with EXECUTE on
-        /// erp_err and nothing else is the recommendation (db/006_security.sql).
+        /// ERM and nothing else is the recommendation (db/006_security.sql).
         /// It also lets the error store be moved to its own database later
         /// without touching a line of application code.
         /// </summary>
@@ -117,7 +117,7 @@ namespace Erp.ErrorManagement
 
         /// <summary>
         /// Token role claims that additionally grant support-console access,
-        /// on top of the erp_err.SupportUser roster.
+        /// on top of the ERM.SupportUser roster.
         ///
         /// Empty by default, which means the roster is the only source. Set it
         /// if you would rather drive authorisation from your identity provider:
@@ -140,7 +140,7 @@ namespace Erp.ErrorManagement
 
         /// <summary>
         /// Role code assumed for a caller who is authorised by claim rather
-        /// than by roster. Must exist in erp_err.SupportRole.
+        /// than by roster. Must exist in ERM.SupportRole.
         /// </summary>
         public string ClaimAuthorisedRoleCode { get; set; } = "administrator";
 
@@ -173,7 +173,7 @@ namespace Erp.ErrorManagement
             if (string.IsNullOrWhiteSpace(ConnectionString))
                 throw new InvalidOperationException(
                     "ErrorCaptureOptions.ConnectionString is required. " +
-                    "Point it at the database that hosts the erp_err schema.");
+                    "Point it at the database that hosts the ERM schema.");
         }
     }
 }

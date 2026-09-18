@@ -4,7 +4,7 @@ import { ErpErrorEnvelope, ErpErrorSeverity } from '../models/error-envelope';
 /**
  * Everything the host application can tune at bootstrap.  Runtime-tunable
  * behaviour (sampling, what to store, mute windows) lives in the database
- * instead - see erp_err.Setting - so it can change without a redeploy.
+ * instead - see ERM.ERM_Setting - so it can change without a redeploy.
  */
 export interface ErpErrorConfig {
   /** Base URL of the error-management API, e.g. '/api/error-management'. */

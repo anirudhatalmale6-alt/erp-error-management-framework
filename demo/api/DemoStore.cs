@@ -174,10 +174,10 @@ public class DemoStore
     }
 
     /* ==================================================================== */
-    /*  Reference data - the rows that live in erp_err.* config tables      */
+    /*  Reference data - the rows that live in ERM.* config tables      */
     /* ==================================================================== */
 
-    // Mirrors erp_err.TicketStatus.  IsPaused time is excluded from active
+    // Mirrors ERM.ERM_TicketStatus.  IsPaused time is excluded from active
     // processing minutes; IsTerminal blocks further transitions.
     private static readonly Dictionary<string, (string Display, bool IsOpen, bool IsTerminal, bool IsPaused, int Rank)> Statuses
         = new(StringComparer.OrdinalIgnoreCase)
@@ -192,7 +192,7 @@ public class DemoStore
             ["reopened"] = ("Reopened", true, false, false, 8),
         };
 
-    // Mirrors erp_err.TicketStatusTransition.  (from, to) -> requires comment.
+    // Mirrors ERM.ERM_TicketStatusTransition.  (from, to) -> requires comment.
     private static readonly Dictionary<(string, string), bool> Transitions = new()
     {
         [("new", "assigned")] = false, [("new", "in_progress")] = false, [("new", "cancelled")] = true,
@@ -208,7 +208,7 @@ public class DemoStore
         [("reopened", "resolved")] = true,
     };
 
-    /// <summary>Mirrors erp_err.SupportRole - capability flags, not a hierarchy.</summary>
+    /// <summary>Mirrors ERM.ERM_SupportRole - capability flags, not a hierarchy.</summary>
     private static readonly Dictionary<string, (string Name, bool View, bool Diag, bool Manage,
         bool Assignable, bool Triage, bool Configure)> Roles = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -220,7 +220,7 @@ public class DemoStore
     };
 
     /// <summary>
-    /// Mirrors erp_err.fn_SupportCapability. FAILS CLOSED - no roster row means
+    /// Mirrors ERM.fn_SupportCapability. FAILS CLOSED - no roster row means
     /// no capability, and an unknown capability name grants nothing.
     /// </summary>
     public object WhoAmI(string userName)
@@ -438,7 +438,7 @@ public class DemoStore
         }
     }
 
-    // Mirrors erp_err.SlaPolicy.
+    // Mirrors ERM.ERM_SlaPolicy.
     private static readonly Dictionary<string, (int FirstResponse, int Resolution)> Sla = new()
     {
         ["critical"] = (15, 240), ["high"] = (60, 480), ["medium"] = (240, 2880),
@@ -1053,7 +1053,7 @@ public class DemoStore
     {
         using var c = Open();
 
-        // Whitelisted sort, exactly like erp_err.SortWhitelist - the caller's
+        // Whitelisted sort, exactly like ERM.ERM_SortWhitelist - the caller's
         // value is a lookup key, never concatenated SQL.
         // Resolve to the EFFECTIVE key, and report that back rather than
         // echoing what was asked for. Echoing an unrecognised key told the UI
@@ -1716,13 +1716,55 @@ public class DemoStore
         return row is not null && Statuses.TryGetValue((string)row["Status"]!, out var s) && !s.IsTerminal;
     }
 
-    private string NextReference(SqliteConnection c, SqliteTransaction? tx, string prefix, DateTime now)
+    /// <summary>
+    /// LinkedScam reference format: LS-ERM-TKT-YYMMDD-X / LS-ERM-ERR-YYMMDD-X,
+    /// with the counter restarting each UTC day and ticket/error counted
+    /// separately.
+    ///
+    /// Mirrors ERM.usp_NextReference, including the part that matters: the
+    /// increment and the read are ONE statement, so two concurrent callers are
+    /// serialised by the engine and cannot be handed the same number. A
+    /// SELECT MAX+1 would look identical in a single-user demo and collide the
+    /// first time two users hit an error in the same second.
+    /// </summary>
+    private string NextReference(SqliteConnection c, SqliteTransaction? tx, string refType, DateTime now)
     {
-        Exec(c, tx, "INSERT INTO Counter (Name, Value) VALUES ($n, 0) ON CONFLICT(Name) DO NOTHING",
-            ("$n", prefix));
-        Exec(c, tx, "UPDATE Counter SET Value = Value + 1 WHERE Name = $n", ("$n", prefix));
-        var value = ExecScalarLong(c, tx, "SELECT Value FROM Counter WHERE Name = $n", ("$n", prefix));
-        return $"{prefix}-{now:yyyy}-{value:D8}";
+        var day = now.ToString("yyyy-MM-dd");
+        int next;
+
+        // UPDATE ... RETURNING is the SQLite equivalent of the T-SQL
+        // UPDATE ... OUTPUT: atomic increment-and-read.
+        using (var cmd = c.CreateCommand())
+        {
+            cmd.CommandText = "UPDATE Counter SET Value = Value + 1 "
+                            + "WHERE Name = $n RETURNING Value";
+            if (tx is not null) cmd.Transaction = tx;
+            cmd.Parameters.AddWithValue("$n", refType + "|" + day);
+            var scalar = cmd.ExecuteScalar();
+
+            if (scalar is null || scalar is DBNull)
+            {
+                // First reference of the day for this type. INSERT OR IGNORE
+                // then re-run, so a lost race resolves rather than throwing -
+                // the same shape as the duplicate-key retry in the T-SQL.
+                Exec(c, tx, "INSERT OR IGNORE INTO Counter (Name, Value) VALUES ($n, 0)",
+                    ("$n", refType + "|" + day));
+
+                using var retry = c.CreateCommand();
+                retry.CommandText = "UPDATE Counter SET Value = Value + 1 "
+                                  + "WHERE Name = $n RETURNING Value";
+                if (tx is not null) retry.Transaction = tx;
+                retry.Parameters.AddWithValue("$n", refType + "|" + day);
+                next = Convert.ToInt32(retry.ExecuteScalar());
+            }
+            else
+            {
+                next = Convert.ToInt32(scalar);
+            }
+        }
+
+        // Counter is NOT zero-padded: the standard's examples are -1, -2, -3.
+        return $"LS-ERM-{refType}-{now:yyMMdd}-{next}";
     }
 
     private static string Iso(DateTime utc) => utc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");

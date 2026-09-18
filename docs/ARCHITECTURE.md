@@ -1,6 +1,6 @@
 # ERP Error Management Framework — Technical Design
 
-Version 1.3.0 · 17 September 2026
+Version 2.0.0 · 18 September 2026
 
 This document answers the six points the brief explicitly left to the
 freelancer to propose:
@@ -19,6 +19,7 @@ Answers to the clarification questions of 16 September are in §4.2a (NgModule),
 §4.4 (non-throwing failures), §5.3 (swallowed SQL errors) and §13 (ticket
 panels). Data loading and production performance are §14; support-console
 access control, assignment and manually raised tickets are §15.
+Compliance with the LinkedScam ERP database standards is §16.
 
 Everything described here is implemented in this repository, not just proposed.
 §11 lists what is verified and how, and §12 lists the limitations honestly.
@@ -663,7 +664,7 @@ the `RequiresComment` / `RequiresAssignee` flags on each one.
 
 ## 11. What is verified, and how
 
-`dotnet run --project dotnet/Erp.ErrorManagement.Tests` — 123 checks, all
+`dotnet run --project dotnet/Erp.ErrorManagement.Tests` — 143 checks, all
 passing:
 
 * **All six T-SQL scripts parse** against the real SQL Server 2016 grammar,
@@ -1085,3 +1086,137 @@ tickets, which is correct — they are not errors.
 **Ownership comes from the token.** The owner fields are `[JsonIgnore]`, so a
 client cannot set them even by sending them, and nobody can raise a ticket in
 someone else's name.
+
+
+---
+
+## 16. LinkedScam ERP database standards
+
+Version 2.0.0 applies the three standards documents. This is a breaking schema
+change, which is why it is a major version: **nothing is migrated in place, and
+the framework has no production data yet, so the scripts create the new shape
+directly.** If you had already deployed 1.x anywhere, drop the `erp_err` schema
+and run the new scripts.
+
+### 16.1 Naming
+
+`erp_err` is gone. Every object is `ERM.ERM_TableName`, and every primary key is
+named after its table:
+
+| Was | Is |
+|---|---|
+| `erp_err.ErrorOccurrence` | `ERM.ERM_ErrorOccurrence` |
+| `ErrorOccurrence.OccurrenceId` | `ERM_ErrorOccurrence.ERM_ErrorOccurrenceID` |
+| `erp_err.Ticket` | `ERM.ERM_Ticket` |
+| `Ticket.TicketId` | `ERM_Ticket.ERM_TicketID` |
+
+Foreign-key and other id columns take your casing (`TicketStatusID`,
+`SeverityID`), matching the `TicketStatusID` example in the structure document.
+
+**What deliberately did NOT change: the procedure result columns.** The
+procedures are the API — the C#, and through it the browser, consume their
+output. Renaming `OccurrenceId` to `ERM_ErrorOccurrenceID` in a *result set*
+would churn the application contract for a storage decision, so the procedures
+alias back to the stable names. Your standards govern tables; a result-set alias
+is not a table.
+
+### 16.2 Table structure
+
+All 28 tables now carry the standard columns in the prescribed order: `ROWID`,
+`DBNo`, `AppNo`, then the business columns, then `IsActive`, `IsDeleted`,
+`CreatedBy`, `CreatedDate`, `UpdatedBy`, `UpdatedDate`. Enforced by a test that
+walks every `CREATE TABLE` and checks both presence and order, so a table added
+later cannot quietly skip it.
+
+**`CreatedBy INT NOT NULL` needed a decision.** The framework writes rows with no
+ERP user behind them: an error from a public page, an occurrence written by the
+capture pipeline, reference data seeded by the deployment scripts, a ticket
+raised by an automatic rule. There is no user id to put in the column.
+
+So there is a reserved system user id, supplied by `ERM.fn_SystemUserID()`, and
+every table defaults `CreatedBy` to it. That satisfies the standard without
+threading a user id through code paths that genuinely do not have one. **Set it
+before go-live:**
+
+```sql
+ALTER FUNCTION ERM.fn_SystemUserID() RETURNS INT AS BEGIN RETURN <your id> END;
+```
+
+It returns a **constant**, deliberately. A version that reads the value from a
+settings table would be a scalar UDF doing a table read, used as a column
+default on `ERM_ErrorOccurrence` — the highest-volume table in the framework —
+so it would execute once per row inserted. That is a well-known way to turn a
+fast insert into a slow one.
+
+**Identity note.** Your `CreatedBy` is an int ERP user id; the framework also
+records the user from the JWT as a string (login name and claim id), because
+that is what the token actually carries. Both are kept: the int for your
+standard, the string for display and for matching tickets to their owner. If
+your token carries the int user id in a claim, point `UserProvider` at it and
+`CreatedBy` will be populated from the real user instead of the system id.
+
+### 16.3 Reference codes
+
+`LS-ERM-TKT-YYMMDD-X` and `LS-ERM-ERR-YYMMDD-X`, counters independent and
+restarting each UTC day.
+
+The previous implementation used a SQL `SEQUENCE`, which is ideal for a
+monotonic number and **cannot reset daily at all** — so this is a different
+mechanism, not a reformat.
+
+Point 7 of the standard is the hard part, and it rules out the obvious
+implementation. `SELECT MAX(counter) + 1` is a read followed by a write; two
+sessions read the same value and write the same reference. That is not a rare
+race for this framework specifically — error capture is *bursty by nature*, and
+one bad deployment produces hundreds of errors in the same second from different
+users across several application instances.
+
+So the increment and the read are a **single statement**:
+
+```sql
+UPDATE ERM.ERM_ReferenceCounter
+   SET LastValue = LastValue + 1
+OUTPUT inserted.LastValue INTO @Claimed
+ WHERE RefType = @RefType AND RefDate = @Today;
+```
+
+There is no window between reading and writing because there is no read. The
+one remaining race — two sessions creating the first row of a new day — is
+settled by the primary key: one INSERT wins, the loser catches the duplicate-key
+error and re-runs the UPDATE. A retry loop rather than `MERGE` under
+`SERIALIZABLE`, because MERGE has its own documented deadlock behaviour and this
+path runs at most once per type per day.
+
+The date comes from `GETUTCDATE()` to match every other timestamp in the schema.
+Using local time would reset the counter at a different moment than the data is
+stamped, producing two references numbered `-1` on the same calendar day at the
+boundary.
+
+**Proven, not asserted.** `tools/verify-reference-concurrency.mjs` fires 120
+simultaneous ticket creations at the running demo:
+
+```
+PASS  every request produced a reference (120)
+PASS  all references match LS-ERM-TKT-260918-N
+PASS  no duplicates across 120 concurrent requests
+PASS  counter is a contiguous 1..120, no gaps and no repeats
+```
+
+Contiguity matters as much as uniqueness: no gaps means nothing was skipped, no
+repeats means nothing was handed out twice. The check includes a positive
+control that feeds it a deliberately duplicated list, because "no duplicates
+found" proves nothing unless the checker can find one.
+
+The demo is SQLite and production is SQL Server, so this exercises the *shape*
+of the algorithm — atomic increment-and-return, no read-then-write window —
+rather than SQL Server's locking. Both sides use the same shape for the same
+reason.
+
+### 16.4 What is enforced automatically
+
+Twenty checks in the suite, so the standards stay applied rather than being a
+one-off tidy-up: no `erp_err` anywhere, every table `ERM.ERM_*`, all nine
+standard columns present and correctly ordered on every declared table, the
+system-user default present and constant, UTC timestamps, the reference format,
+separate per-type counters, the atomic increment, the absence of `SELECT MAX`,
+and the absence of the old sequence.

@@ -6,7 +6,7 @@ namespace Erp.ErrorManagement
 {
     /// <summary>
     /// The wire contract shared by every capture point.  Property names are the
-    /// JSON names that erp_err.usp_Error_Capture shreds with OPENJSON, and the
+    /// JSON names that ERM.usp_Error_Capture shreds with OPENJSON, and the
     /// same names the Angular library sends - keep this file, the TypeScript
     /// models/error-envelope.ts and script 004 in step.
     /// </summary>
@@ -205,7 +205,7 @@ namespace Erp.ErrorManagement
         [JsonProperty("wasDeduplicated")] public bool WasDeduplicated { get; set; }
     }
 
-    /// <summary>Layer codes - must match erp_err.AppLayer.Code.</summary>
+    /// <summary>Layer codes - must match ERM.ERM_AppLayer.Code.</summary>
     public static class ErrorLayers
     {
         public const string Angular        = "angular";
@@ -218,7 +218,7 @@ namespace Erp.ErrorManagement
         public const string Infrastructure = "infrastructure";
     }
 
-    /// <summary>Category codes - must match erp_err.ErrorCategory.Code.</summary>
+    /// <summary>Category codes - must match ERM.ERM_ErrorCategory.Code.</summary>
     public static class ErrorCategories
     {
         public const string ApiUnhandled   = "api_unhandled";
@@ -237,7 +237,7 @@ namespace Erp.ErrorManagement
         public const string Unclassified   = "unclassified";
     }
 
-    /// <summary>Severity codes - must match erp_err.Severity.Code.</summary>
+    /// <summary>Severity codes - must match ERM.ERM_Severity.Code.</summary>
     public static class ErrorSeverities
     {
         public const string Critical = "critical";

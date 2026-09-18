@@ -47,7 +47,7 @@ namespace Erp.ErrorManagement.WebApi2
                 options.AnonymousCaptureRatePerMinute,
                 options.AnonymousCaptureBurst);
 
-            // Resolves who is support staff, from the erp_err roster. Fails
+            // Resolves who is support staff, from the ERM roster. Fails
             // CLOSED - if it cannot read the roster, nobody is authorised.
             var directory = new SqlSupportDirectory(options);
 

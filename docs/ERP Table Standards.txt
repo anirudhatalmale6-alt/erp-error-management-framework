@@ -1,0 +1,325 @@
+============================================================
+LINKEDSCAM ERP DATABASE STANDARD
+TABLE STRUCTURE STANDARD
+============================================================
+
+1. PURPOSE
+
+Every table created for the Error Management framework must
+follow the standard LinkedScam ERP table structure.
+
+The standard common columns must exist in every table,
+in addition to the table-specific business columns.
+
+------------------------------------------------------------
+2. STANDARD TABLE STRUCTURE
+------------------------------------------------------------
+
+Example:
+
+CREATE TABLE [SCM].[SCM_TableName]
+(
+    [ROWID]       [uniqueidentifier] NOT NULL DEFAULT (NEWID()),
+    [DBNo]        [int]              NOT NULL DEFAULT (1),
+    [AppNo]       [int]              NOT NULL DEFAULT (1),
+
+    --------------------------------------------------------
+    -- TABLE-SPECIFIC / BUSINESS COLUMNS
+    --------------------------------------------------------
+
+    [TableNameID] [int] IDENTITY(1,1) NOT NULL,
+
+    --------------------------------------------------------
+    -- STANDARD AUDIT / STATUS COLUMNS
+    --------------------------------------------------------
+
+    [IsActive]    [bit]      NOT NULL DEFAULT (1),
+    [IsDeleted]   [bit]      NOT NULL DEFAULT (0),
+
+    [CreatedBy]   [int]      NOT NULL,
+    [CreatedDate] [datetime] NOT NULL DEFAULT (GETUTCDATE()),
+
+    [UpdatedBy]   [int]      NULL,
+    [UpdatedDate] [datetime] NULL
+);
+
+
+------------------------------------------------------------
+3. STANDARD COLUMN ORDER
+------------------------------------------------------------
+
+Every table should follow this logical order:
+
+1. ROWID
+2. DBNo
+3. AppNo
+
+4. Table-specific / business columns
+
+5. IsActive
+6. IsDeleted
+7. CreatedBy
+8. CreatedDate
+9. UpdatedBy
+10. UpdatedDate
+
+
+------------------------------------------------------------
+4. COMMON COLUMN DEFINITIONS
+------------------------------------------------------------
+
+ROWID
+-----
+Data type:
+
+    uniqueidentifier
+
+Required:
+
+    NOT NULL
+
+Default:
+
+    NEWID()
+
+Purpose:
+
+    Unique row identifier for the record.
+
+
+DBNo
+----
+Data type:
+
+    int
+
+Required:
+
+    NOT NULL
+
+Default:
+
+    1
+
+Purpose:
+
+    Existing LinkedScam ERP architecture.
+
+
+AppNo
+-----
+Data type:
+
+    int
+
+Required:
+
+    NOT NULL
+
+Default:
+
+    1
+
+Purpose:
+
+    Existing LinkedScam ERP architecture.
+
+
+------------------------------------------------------------
+5. PRIMARY KEY
+------------------------------------------------------------
+
+Each table must have its own table-specific primary key.
+
+The primary key column name should be based on the table name.
+
+Example:
+
+    ERM_Ticket
+    Primary Key: ERM_TicketID
+
+    ERM_Error
+    Primary Key: ERM_ErrorID
+
+The primary key should use:
+
+    int IDENTITY(1,1)
+
+or
+
+    bigint IDENTITY(1,1)
+
+depending on the expected volume of the table.
+
+The table-specific ID is separate from ROWID.
+
+------------------------------------------------------------
+6. TABLE-SPECIFIC / BUSINESS COLUMNS
+------------------------------------------------------------
+
+After ROWID, DBNo and AppNo, all actual business/domain
+columns for the table should be defined.
+
+Example:
+
+    ERM_TicketID
+    TicketCode
+    TicketTitle
+    TicketStatusID
+    etc.
+
+The exact columns depend on the table's purpose.
+
+------------------------------------------------------------
+7. STATUS COLUMNS
+------------------------------------------------------------
+
+IsActive
+--------
+Data type:
+
+    bit
+
+Required:
+
+    NOT NULL
+
+Default:
+
+    1
+
+Meaning:
+
+    Indicates whether the record is currently active.
+
+
+IsDeleted
+---------
+Data type:
+
+    bit
+
+Required:
+
+    NOT NULL
+
+Default:
+
+    0
+
+Meaning:
+
+    Indicates whether the record has been logically deleted.
+
+The framework should follow the existing LinkedScam approach
+rather than physically deleting records where the framework
+requires soft deletion.
+
+
+------------------------------------------------------------
+8. AUDIT USER COLUMNS
+------------------------------------------------------------
+
+CreatedBy
+---------
+Data type:
+
+    int
+
+Required:
+
+    NOT NULL
+
+Meaning:
+
+    User ID of the user who created the record.
+
+
+UpdatedBy
+---------
+Data type:
+
+    int
+
+Required:
+
+    NULL
+
+Meaning:
+
+    User ID of the user who last updated the record.
+
+
+CreatedBy and UpdatedBy represent LinkedScam ERP user IDs.
+
+
+------------------------------------------------------------
+9. AUDIT DATE COLUMNS
+------------------------------------------------------------
+
+CreatedDate
+-----------
+Data type:
+
+    datetime
+
+Required:
+
+    NOT NULL
+
+Default:
+
+    GETUTCDATE()
+
+Meaning:
+
+    UTC date/time when the record was created.
+
+
+UpdatedDate
+-----------
+Data type:
+
+    datetime
+
+Required:
+
+    NULL
+
+Meaning:
+
+    UTC date/time when the record was last updated.
+
+All framework-created/updated timestamps must follow the
+LinkedScam UTC date/time standard.
+
+
+------------------------------------------------------------
+10. IMPORTANT REQUIREMENT
+------------------------------------------------------------
+
+The Error Management framework must follow this common table
+structure for ALL framework tables.
+
+The framework must not introduce a different table structure
+or separate audit convention.
+
+Every applicable table must contain:
+
+    ROWID
+    DBNo
+    AppNo
+
+    [Table-specific columns]
+
+    IsActive
+    IsDeleted
+    CreatedBy
+    CreatedDate
+    UpdatedBy
+    UpdatedDate
+
+The framework's table-specific columns may vary according to
+the purpose of each table, but the above common LinkedScam
+ERP columns and conventions must remain consistent.
+============================================================

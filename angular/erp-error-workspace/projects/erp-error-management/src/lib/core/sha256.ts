@@ -11,7 +11,7 @@
  * This implementation is byte-for-byte compatible with
  * System.Security.Cryptography.SHA256 over the same UTF-8 bytes, which is what
  * makes an Angular-side hash and a .NET-side hash of the same signature collide
- * correctly in erp_err.ErrorFingerprint.  Verified against the NIST vectors in
+ * correctly in ERM.ERM_ErrorFingerprint.  Verified against the NIST vectors in
  * sha256.spec.ts.
  */
 
