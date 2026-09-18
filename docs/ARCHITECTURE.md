@@ -625,6 +625,20 @@ UI would still have sent the data to the browser.
 
 ## 9. Deployment
 
+**Environments: Test first, EBS-PROD only once the framework is mature.** The
+step-by-step runbook, including what to watch during Test and the promotion
+checklist, is [`db/README.md`](../db/README.md). Two points worth stating here
+because they shape the design rather than just the procedure:
+
+* The framework is **additive and removable**. Everything lives in `ERM`, no
+  existing object is touched, and removing it is dropping one schema plus five
+  lines of application registration. That is what makes a Test deployment a
+  low-risk decision — the worst case is an unused schema.
+* EBS-PROD should be deployed with `capture.enabled = false`, verified, then
+  switched on. The first thing production does with the framework is then
+  nothing, which is the safest possible first action.
+
+
 1. **Database.** Run `db/001` … `db/006` in order against the ERP database.
    Idempotent — safe to re-run. `db/006` needs `@AppUser` edited first.
 2. **Packages.** Publish the four packages to your internal feed.

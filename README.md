@@ -37,7 +37,10 @@ config.UseErpErrorManagement(new ErrorCaptureOptions {
 });
 ```
 
-**SQL Server** — run `db/001` … `db/007` then `db/010` and `db/011` once. Every
+**SQL Server** — **[`db/README.md`](db/README.md) is the deployment runbook**:
+script order, the two things to set first, what to watch during Test, and the
+Test → EBS-PROD promotion checklist. Run `db/001` … `db/007` then `db/010` and
+`db/011` once. Every
 object lives in the **`ERM`** schema and follows the LinkedScam ERP standards
 (`ERM.ERM_TableName`, standard `ROWID`/`DBNo`/`AppNo` + audit columns,
 `LS-ERM-TKT-YYMMDD-X` reference codes) — see `docs/ARCHITECTURE.md` §16.
