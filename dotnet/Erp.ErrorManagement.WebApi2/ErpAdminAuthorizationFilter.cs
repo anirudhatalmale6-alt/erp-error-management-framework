@@ -86,9 +86,11 @@ namespace Erp.ErrorManagement.WebApi2
                 return;
             }
 
-            var userId = ReadClaim(principal, ClaimTypes.NameIdentifier)
-                         ?? ReadClaim(principal, "sub")
-                         ?? ReadClaim(principal, "uid");
+            // The same value the rest of the framework uses, resolved by the
+            // correlation handler from ATC's own request context. Falling back
+            // to a claim here would let the console and the audit trail
+            // disagree about who is acting.
+            var userProfileId = ErpUser.Normalize(ErrorContext.Values?.UserProfileId ?? ErpUser.None);
             var userName = principal.Identity.Name;
 
             SupportIdentity identity;
@@ -101,7 +103,7 @@ namespace Erp.ErrorManagement.WebApi2
                 identity = new SupportIdentity
                 {
                     IsSupportUser = true,
-                    UserId = userId,
+                    UserProfileId = userProfileId,
                     UserName = userName,
                     DisplayName = userName,
                     RoleCode = _options.ClaimAuthorisedRoleCode,
@@ -116,7 +118,7 @@ namespace Erp.ErrorManagement.WebApi2
             }
             else
             {
-                identity = await _directory.ResolveAsync(userId, userName, cancellationToken)
+                identity = await _directory.ResolveAsync(userProfileId, cancellationToken)
                     .ConfigureAwait(false);
             }
 

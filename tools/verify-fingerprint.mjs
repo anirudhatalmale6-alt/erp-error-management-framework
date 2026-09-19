@@ -1,6 +1,75 @@
 import crypto from 'node:crypto';
-import { sha256Hex } from './core/sha256.js';
-import { computeFingerprint, normalizeMessage, normalizeStackFrames, normalizeEndpoint } from './core/fingerprint.js';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+/*
+ * The point of this script is to run the REAL TypeScript implementation - the
+ * one the browser ships - and compare it against the C# twin. So it compiles
+ * the library's own source files rather than importing a hand-kept JavaScript
+ * copy.
+ *
+ * An earlier version imported ./core/*.js, which were build artefacts that were
+ * never committed: the script crashed on a clean checkout with
+ * ERR_MODULE_NOT_FOUND. A checked-in copy would have been worse - it would run,
+ * and it would verify a copy of the implementation rather than the
+ * implementation.
+ */
+const here = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(here, '..');
+const libCore = join(repoRoot, 'angular/erp-error-workspace/projects/erp-error-management/src/lib/core');
+const outDir = join(here, '.compiled');
+const tsc = join(repoRoot, 'angular/erp-error-workspace/node_modules/typescript/bin/tsc');
+
+if (!existsSync(tsc)) {
+  console.error(
+    'TypeScript was not found. Run `npm install` in angular/erp-error-workspace first:\n' +
+    `  expected ${tsc}`,
+  );
+  process.exit(1);
+}
+
+rmSync(outDir, { recursive: true, force: true });
+mkdirSync(outDir, { recursive: true });
+
+try {
+  execFileSync(
+    process.execPath,
+    [tsc, join(libCore, 'sha256.ts'), join(libCore, 'fingerprint.ts'),
+     '--outDir', outDir, '--module', 'esnext', '--target', 'es2022',
+     '--moduleResolution', 'bundler', '--skipLibCheck'],
+    { stdio: 'inherit' },
+  );
+} catch {
+  console.error('Could not compile the library core. See the errors above.');
+  process.exit(1);
+}
+
+// tsc keeps the source tree shape, and fingerprint.ts imports from
+// ../models/, so the common root is src/lib and the output lands in core/.
+const compiledCore = join(outDir, 'core');
+
+/*
+ * Angular sources import without a file extension ('./sha256'), because the
+ * bundler resolves those. Node's ESM loader does not - it requires the
+ * extension - so the emitted files need it added. Rewriting the emit is the
+ * narrow fix; the alternative is compiling under nodenext, which would mean
+ * putting '.js' extensions into the TypeScript sources purely to satisfy this
+ * script, and the library's own build does not want them.
+ */
+for (const file of readdirSync(compiledCore).filter((f) => f.endsWith('.js'))) {
+  const full = join(compiledCore, file);
+  const patched = readFileSync(full, 'utf8').replace(
+    /(from\s+['"])(\.[^'"]*?)(['"])/g,
+    (whole, pre, spec, post) => (spec.endsWith('.js') ? whole : `${pre}${spec}.js${post}`),
+  );
+  writeFileSync(full, patched);
+}
+
+const { sha256Hex } = await import(pathToFileURL(join(compiledCore, 'sha256.js')).href);
+const { computeFingerprint, normalizeMessage, normalizeStackFrames, normalizeEndpoint } =
+  await import(pathToFileURL(join(compiledCore, 'fingerprint.js')).href);
 
 let fail = 0;
 const check = (name, actual, expected) => {

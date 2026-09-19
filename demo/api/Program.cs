@@ -74,8 +74,15 @@ if (hasUi)
 // The demo stands in for JWT with a header. In production the identity comes
 // from the validated token and NEVER from a request parameter - which is why
 // the demo does not accept one either.
-static string DemoUser(HttpContext ctx)
+static string DemoUserName(HttpContext ctx)
     => ctx.Request.Headers["X-Demo-User"].FirstOrDefault() ?? "fatima.saeed";
+
+// Resolved ONCE, here at the edge, exactly as production resolves the request
+// context to a UserProfileID before anything else runs. Everything below this
+// point works in integers - a name never reaches an ownership or authorisation
+// check, because a display name is not unique and is editable.
+static int DemoUserProfileId(HttpContext ctx)
+    => DemoStore.ProfileIdOf(DemoUserName(ctx));
 
 var json = new JsonSerializerOptions
 {
@@ -93,8 +100,8 @@ var json = new JsonSerializerOptions
 // stack trace and user name in the system.
 static IResult? RequireSupport(HttpContext ctx, DemoStore db, string capability)
 {
-    var user = DemoUser(ctx);
-    if (!db.HasCapability(user, capability))
+    var user = DemoUserName(ctx);
+    if (!db.HasCapability(DemoUserProfileId(ctx), capability))
     {
         // 403 with no detail about WHICH capability is missing - telling an
         // unauthorised caller that maps the permission model out for them.
@@ -143,8 +150,8 @@ app.MapPost("/api/error-management/tickets", async (HttpContext ctx, DemoStore d
     var req = await JsonSerializer.DeserializeAsync<TicketRequest>(ctx.Request.Body, json);
     if (req?.ErrorReference is null) return Results.BadRequest(new { message = "errorReference is required" });
 
-    var user = ctx.Request.Headers["X-Demo-User"].FirstOrDefault() ?? "fatima.saeed";
-    var result = db.CreateTicket(req.ErrorReference, req.UserDescription, user, "user");
+    var result = db.CreateTicket(req.ErrorReference, req.UserDescription,
+        DemoUserProfileId(ctx), "user");
     return result is null
         ? Results.Json(new { message = "Ticket could not be created." }, json, statusCode: 503)
         : Results.Json(result, json);
@@ -161,11 +168,11 @@ app.MapGet("/api/error-management/tickets/{ticketNumber}", (HttpContext ctx, Dem
 // identity comes from the validated token and NEVER from a request parameter -
 // that is the whole point, so the demo does not accept one either.
 app.MapGet("/api/error-management/tickets/mine", (HttpContext ctx, DemoStore db, bool onlyOpen = false)
-    => Results.Json(db.ListTicketsForUser(DemoUser(ctx), onlyOpen), json));
+    => Results.Json(db.ListTicketsForUser(DemoUserProfileId(ctx), onlyOpen), json));
 
 app.MapGet("/api/error-management/my-tickets/{ticketNumber}", (HttpContext ctx, DemoStore db, string ticketNumber) =>
 {
-    var detail = db.GetTicketForUser(ticketNumber, DemoUser(ctx));
+    var detail = db.GetTicketForUser(ticketNumber, DemoUserProfileId(ctx));
     // 404 for "not yours" as well as "not there": a 403 would confirm the
     // number is real and turn sequential numbers into an enumeration oracle.
     return detail is null ? Results.NotFound() : Results.Json(detail, json);
@@ -178,7 +185,7 @@ app.MapPost("/api/error-management/my-tickets/{ticketNumber}/comments",
     if (string.IsNullOrWhiteSpace(req?.CommentText))
         return Results.BadRequest(new { message = "commentText is required" });
 
-    var ok = db.AddUserComment(ticketNumber, DemoUser(ctx), req!.CommentText!);
+    var ok = db.AddUserComment(ticketNumber, DemoUserProfileId(ctx), req!.CommentText!);
     return ok ? Results.Json(new { added = true }, json) : Results.NotFound();
 });
 
@@ -190,11 +197,10 @@ app.MapPost("/api/error-management/tickets/{ticketNumber}/status",
     var denied = RequireSupport(ctx, db, "manage");
     if (denied is not null) return denied;
 
-    var user = DemoUser(ctx);
     try
     {
-        return Results.Json(db.ChangeStatus(ticketNumber, req.ToStatus!, user, req.Comments,
-            req.AssignTo), json);
+        return Results.Json(db.ChangeStatus(ticketNumber, req.ToStatus!, DemoUserProfileId(ctx),
+            req.Comments, req.AssignToUserProfileId), json);
     }
     catch (InvalidOperationException ex)
     {
@@ -242,7 +248,7 @@ app.MapGet("/api/error-management/admin/error/{errorReference}", (HttpContext ct
     => RequireSupport(ctx, db, "diagnostics") ?? Results.Json(db.GetErrorDetail(errorReference), json));
 
 app.MapGet("/api/error-management/admin/whoami", (HttpContext ctx, DemoStore db)
-    => Results.Json(db.WhoAmI(DemoUser(ctx)), json));
+    => Results.Json(db.WhoAmI(DemoUserProfileId(ctx)), json));
 
 app.MapGet("/api/error-management/admin/assignable-users", (HttpContext ctx, DemoStore db)
     => RequireSupport(ctx, db, "manage") ?? Results.Json(db.ListAssignable(), json));
@@ -257,7 +263,8 @@ app.MapPost("/api/error-management/admin/tickets/{ticketNumber}/assign",
 
     // WHO performed it comes from the identity, never from the body - accepting
     // it from the caller would make the audit trail worth nothing.
-    var result = db.AssignTicket(ticketNumber, req?.AssignToUserName, DemoUser(ctx), req?.Comments);
+    var result = db.AssignTicket(ticketNumber, req?.AssignToUserProfileId,
+        DemoUserProfileId(ctx), req?.Comments);
 
     return result is null
         ? Results.Json(new { message = "The ticket could not be assigned. Check that it exists and "
@@ -278,7 +285,7 @@ app.MapPost("/api/error-management/tickets/manual", async (HttpContext ctx, Demo
     // Ownership comes from the identity, so nobody can raise a ticket in
     // someone else's name.
     var result = db.CreateManualTicket(req!.Title!, req.Description, req.RequestCategory,
-        req.ErpModule, req.ReportedScreen, DemoUser(ctx));
+        req.ErpModule, req.ReportedScreen, DemoUserProfileId(ctx));
 
     return result is null
         ? Results.Json(new { message = "The ticket could not be created." }, json, statusCode: 503)
@@ -382,8 +389,8 @@ Console.WriteLine();
 app.Run();
 
 record TicketRequest(string? ErrorReference, string? UserDescription);
-record StatusChangeRequest(string? ToStatus, string? Comments, string? AssignTo);
+record StatusChangeRequest(string? ToStatus, string? Comments, int? AssignToUserProfileId);
 record CommentRequest(string? CommentText);
-record AssignRequest(string? AssignToUserName, string? Comments);
+record AssignRequest(int? AssignToUserProfileId, string? Comments);
 record ManualRequest(string? Title, string? Description, string? RequestCategory,
                      string? ErpModule, string? ReportedScreen);

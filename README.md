@@ -39,18 +39,16 @@ config.UseErpErrorManagement(new ErrorCaptureOptions {
 
 **SQL Server** — **[`db/README.md`](db/README.md) is the deployment runbook**:
 script order, the two things to set first, what to watch during Test, and the
-Test → EBS-PROD promotion checklist. Run `db/001` … `db/007`, then `db/010` and
-`db/011`, once.
+Test → EBS-PROD promotion checklist. Run `db/001` … `db/007`, then `db/010`,
+`db/011` and `db/012`, once.
 
 Every object lives in the **`ERM`** schema and follows the LinkedScam ERP
 standards (`ERM.ERM_TableName`, standard `ROWID`/`DBNo`/`AppNo` + audit columns,
 `LS-ERM-TKT-YYMMDD-X` reference codes) — see `docs/ARCHITECTURE.md` §16. No
-existing ERP object is read, altered or dropped by any script. Set your system
-user id before go-live:
+existing ERP object is read, altered or dropped by any script.
 
-```sql
-ALTER FUNCTION ERM.fn_SystemUserID() RETURNS INT AS BEGIN RETURN <id> END;
-```
+`CreatedBy` and `UpdatedBy` carry **no default**: the caller supplies the ERP
+`UserProfileID`, and `-1` is used where there is no user.
 
 (`008` and `009` are optional add-ons, not part of the default install — see
 `docs/ARCHITECTURE.md` §5.3.)
@@ -79,6 +77,8 @@ db/                     SQL Server schema, procedures, seed data, retention job
   010_search_performance.sql    server-side sort/keyset paging + indexes
   011_support_access_...sql     support roster/roles, audited assignment,
                                 manually raised tickets
+  012_notifications.sql         ticket-notification outbox + the ONE adapter
+                                into the ERP's own notification system
   008_optional_...              OPTIONAL: Extended Events for swallowed errors
   009_optional_...              OPTIONAL: one-line capture from a CATCH block
 
@@ -91,7 +91,7 @@ dotnet/
   Erp.ErrorManagement.Core/        netstandard2.0 — shared by BOTH stacks
   Erp.ErrorManagement.WebApi2/     net472 — Web API 2 integration
   Erp.ErrorManagement.AspNetCore/  net8.0 — for future modules
-  Erp.ErrorManagement.Tests/       146 verification checks (see below)
+  Erp.ErrorManagement.Tests/       186 verification checks (see below)
 
 demo/api/               runnable demo API (SQLite — a harness, not the product)
 docs/ARCHITECTURE.md    the technical design
@@ -107,7 +107,7 @@ tools/                  cross-language fingerprint verification
 dotnet run --project dotnet/Erp.ErrorManagement.Tests
 ```
 
-146 checks, covering:
+186 checks, covering:
 
 * every T-SQL script parsing against the **real SQL Server 2016 grammar**
   (Microsoft's `ScriptDom` — the parser SSMS and sqlpackage use);
@@ -132,7 +132,16 @@ dotnet run --project dotnet/Erp.ErrorManagement.Tests
   one there would fail only at run time, on the deliberately silent capture path;
 * support-console authorisation failing **closed**, every admin action carrying
   a capability gate, and the acting user coming from the token rather than the
-  request body.
+  request body;
+* **ATC's CreatedBy rule** — no default on `CreatedBy`/`UpdatedBy` anywhere, and
+  every `INSERT` into an `ERM` table naming it, asserted over the parse tree
+  rather than by grep;
+* **one identity** — the ERP `UserProfileID` and no text user id, distinct-user
+  counts on the id rather than a display name, and the client's claimed identity
+  discarded server-side;
+* **notifications** — no channel of the framework's own (no SMTP, no Teams, no
+  dynamic dispatch), the adapter refusing to report success until it is wired
+  up, and an internal comment never being announced.
 
 Each group includes a **positive control** — a check that deliberately expects
 the negative result — because a suite that cannot fail proves nothing.
@@ -231,4 +240,4 @@ still works.
 The framework is complete and verified as described above. Open items are listed in
 `docs/ARCHITECTURE.md` §12 — chiefly that the T-SQL has been **parsed** against
 the real grammar but not **executed**, because I have no SQL Server instance.
-Run `db/001…007`, `db/010` and `db/011` against a development database before production.
+Run `db/001…007`, `db/010`, `db/011` and `db/012` against a development database before production.

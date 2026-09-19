@@ -12,6 +12,7 @@ import {
 import { computeFingerprint } from '../core/fingerprint';
 import { safeEndpoint, scrubText } from '../core/redaction';
 import {
+  ERP_NO_USER,
   ErpErrorCaptureResult,
   ErpErrorCategory,
   ErpErrorEnvelope,
@@ -162,15 +163,16 @@ export class ErpErrorReporterService {
       httpStatusCode: http?.status ?? null,
       durationMs: options.durationMs ?? null,
 
-      user: user
-        ? {
-            id: user.id ?? null,
-            name: user.name ?? null,
-            displayName: user.displayName ?? null,
-            tenantId: user.tenantId ?? null,
-            sessionId: user.sessionId ?? null,
-          }
-        : null,
+      // Always present, and profileId is always a number. getUser() never
+      // returns null now, so an error from a public page carries -1 rather than
+      // an absent user object that the server then has to guess about.
+      user: {
+        profileId: user?.profileId ?? ERP_NO_USER,
+        name: user?.name ?? null,
+        displayName: user?.displayName ?? null,
+        tenantId: user?.tenantId ?? null,
+        sessionId: user?.sessionId ?? null,
+      },
       client: this.context.getClientInfo(),
 
       correlationId: this.context.getCorrelationId(),

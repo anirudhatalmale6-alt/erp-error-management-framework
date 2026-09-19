@@ -78,7 +78,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_ReferenceCounter_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_ReferenceCounter_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_ReferenceCounter_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_ReferenceCounter_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -146,8 +146,8 @@ BEGIN
                here together; the primary key decides which one creates the row
                and the other loops round to the UPDATE above. */
             BEGIN TRY
-                INSERT ERM.ERM_ReferenceCounter (RefType, RefDate, LastValue)
-                VALUES (@RefType, @Today, 1);
+                INSERT ERM.ERM_ReferenceCounter (RefType, RefDate, LastValue, CreatedBy)
+                VALUES (@RefType, @Today, 1, ERM.fn_SystemUserID());
 
                 SET @Next = 1;
             END TRY
@@ -231,7 +231,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_ErrorFingerprint_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_ErrorFingerprint_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_ErrorFingerprint_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_ErrorFingerprint_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -313,8 +313,16 @@ BEGIN
         SqlDatabaseName     NVARCHAR(128)   NULL,
         SqlSchemaName       NVARCHAR(128)   NULL,
 
-        /* ---- who ---- */
-        UserID              NVARCHAR(128)   NULL,
+        /* ---- who ----
+           UserProfileID is the ERP's OWN integer user key - the value
+           generic_service.GetUserProfileKey() returns in Angular, and the value
+           the ERP APIs and procedures already receive as CreatedBy / UpdatedBy
+           / UserProfileID.  The framework deliberately does not mint or map an
+           identifier of its own: a second user id is a second thing to keep in
+           step, and it would be wrong exactly when it mattered.
+           -1 = no ERP user (public page, scheduled job, automatic rule).
+           UserName is display text.  Never join or filter on it. */
+        UserProfileID       INT             NOT NULL,
         UserName            NVARCHAR(200)   NULL,
         UserDisplayName     NVARCHAR(200)   NULL,
         TenantID            NVARCHAR(64)    NULL,
@@ -351,7 +359,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_ErrorOccurrence_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_ErrorOccurrence_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_ErrorOccurrence_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_ErrorOccurrence_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -365,10 +373,10 @@ BEGIN
     );
 
     CREATE INDEX IX_Occurrence_OccurredUtc  ON ERM.ERM_ErrorOccurrence (OccurredUtc DESC)
-        INCLUDE (ERM_ErrorFingerprintID, SeverityID, LayerID, ErpModule, UserName, ERM_TicketID);
+        INCLUDE (ERM_ErrorFingerprintID, SeverityID, LayerID, ErpModule, UserProfileID, UserName, ERM_TicketID);
     CREATE INDEX IX_Occurrence_Fingerprint  ON ERM.ERM_ErrorOccurrence (ERM_ErrorFingerprintID, OccurredUtc DESC);
     CREATE INDEX IX_Occurrence_Correlation  ON ERM.ERM_ErrorOccurrence (CorrelationID, OccurredUtc);
-    CREATE INDEX IX_Occurrence_User         ON ERM.ERM_ErrorOccurrence (UserName, OccurredUtc DESC);
+    CREATE INDEX IX_Occurrence_User         ON ERM.ERM_ErrorOccurrence (UserProfileID, OccurredUtc DESC);
     CREATE INDEX IX_Occurrence_Module       ON ERM.ERM_ErrorOccurrence (ErpModule, Screen, OccurredUtc DESC);
     CREATE INDEX IX_Occurrence_Api          ON ERM.ERM_ErrorOccurrence (ApiController, ApiAction, OccurredUtc DESC);
     CREATE INDEX IX_Occurrence_Sql          ON ERM.ERM_ErrorOccurrence (SqlErrorNumber, OccurredUtc DESC) WHERE SqlErrorNumber IS NOT NULL;
@@ -406,7 +414,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_ErrorOccurrenceDetail_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_ErrorOccurrenceDetail_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_ErrorOccurrenceDetail_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_ErrorOccurrenceDetail_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -444,11 +452,17 @@ BEGIN
         -- What the user typed in the modal, if anything.
         UserDescription     NVARCHAR(MAX)   NULL,
 
-        ReportedByUserID    NVARCHAR(128)   NULL,
+        -- The reporter's ERP UserProfileID.  This is what "my tickets" and
+        -- every ownership check key off; -1 means it was raised without a
+        -- signed-in user behind it.
+        ReportedByUserProfileID INT         NOT NULL,
         ReportedByUserName  NVARCHAR(200)   NULL,
         -- 'user' | 'auto_rule' | 'admin'
         CreatedVia          NVARCHAR(20)    NOT NULL CONSTRAINT DF_Ticket_CreatedVia DEFAULT (N'user'),
-        AssignedToUserID    NVARCHAR(128)   NULL,
+        -- NULL, not -1: unassigned is a real and different state from
+        -- "assigned to nobody in particular", and the queue view depends on
+        -- being able to tell them apart.
+        AssignedToUserProfileID INT         NULL,
         AssignedToUserName  NVARCHAR(200)   NULL,
 
         ErpModule           NVARCHAR(100)   NULL,
@@ -480,7 +494,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_Ticket_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_Ticket_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_Ticket_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_Ticket_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -494,10 +508,10 @@ BEGIN
         CONSTRAINT FK_Ticket_Sla         FOREIGN KEY (ERM_SlaPolicyID)   REFERENCES ERM.ERM_SlaPolicy (ERM_SlaPolicyID)
     );
 
-    CREATE INDEX IX_Ticket_Status      ON ERM.ERM_Ticket (StatusID, CreatedUtc DESC) INCLUDE (ERM_TicketQueueID, SeverityID, AssignedToUserName);
+    CREATE INDEX IX_Ticket_Status      ON ERM.ERM_Ticket (StatusID, CreatedUtc DESC) INCLUDE (ERM_TicketQueueID, SeverityID, AssignedToUserProfileID, AssignedToUserName);
     CREATE INDEX IX_Ticket_Queue       ON ERM.ERM_Ticket (ERM_TicketQueueID, StatusID, CreatedUtc DESC);
-    CREATE INDEX IX_Ticket_Reporter    ON ERM.ERM_Ticket (ReportedByUserName, CreatedUtc DESC);
-    CREATE INDEX IX_Ticket_Assignee    ON ERM.ERM_Ticket (AssignedToUserName, StatusID);
+    CREATE INDEX IX_Ticket_Reporter    ON ERM.ERM_Ticket (ReportedByUserProfileID, CreatedUtc DESC);
+    CREATE INDEX IX_Ticket_Assignee    ON ERM.ERM_Ticket (AssignedToUserProfileID, StatusID);
     CREATE INDEX IX_Ticket_Fingerprint ON ERM.ERM_Ticket (ERM_ErrorFingerprintID, StatusID);
 END
 GO
@@ -529,7 +543,7 @@ BEGIN
         SequenceNo          INT             NOT NULL,      -- 1-based, gapless per ticket
         FromStatusID        TINYINT         NULL,          -- NULL on creation
         ToStatusID          TINYINT         NOT NULL,
-        ChangedByUserID     NVARCHAR(128)   NULL,
+        ChangedByUserProfileID INT          NOT NULL,
         ChangedByUserName   NVARCHAR(200)   NULL,
         ChangedUtc          DATETIME2(3)    NOT NULL CONSTRAINT DF_TSH_ChangedUtc DEFAULT (SYSUTCDATETIME()),
         -- Minutes the ticket spent in FromStatusID before this change.  This is
@@ -542,7 +556,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_TicketStatusHistory_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_TicketStatusHistory_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_TicketStatusHistory_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_TicketStatusHistory_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -567,7 +581,7 @@ BEGIN
         [AppNo]       INT              NOT NULL CONSTRAINT DF_TicketComment_AppNo DEFAULT (1),
         ERM_TicketCommentID           BIGINT          IDENTITY(1,1) NOT NULL,
         ERM_TicketID            BIGINT          NOT NULL,
-        AuthorUserID        NVARCHAR(128)   NULL,
+        AuthorUserProfileID INT             NOT NULL,
         AuthorUserName      NVARCHAR(200)   NULL,
         -- 'reporter' | 'support' | 'system'
         AuthorRole          NVARCHAR(20)    NOT NULL CONSTRAINT DF_TC_Role DEFAULT (N'support'),
@@ -577,7 +591,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_TicketComment_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_TicketComment_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_TicketComment_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_TicketComment_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -606,7 +620,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_TicketOccurrenceLink_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_TicketOccurrenceLink_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_TicketOccurrenceLink_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_TicketOccurrenceLink_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -636,12 +650,13 @@ BEGIN
         Operation       VARCHAR(10)     NOT NULL,     -- INSERT | UPDATE | DELETE
         OldValuesJson   NVARCHAR(MAX)   NULL,
         NewValuesJson   NVARCHAR(MAX)   NULL,
+        ChangedByUserProfileID INT      NOT NULL,
         ChangedByUserName NVARCHAR(200) NULL,
         ChangedUtc      DATETIME2(3)    NOT NULL CONSTRAINT DF_ConfigAudit_ChangedUtc DEFAULT (SYSUTCDATETIME()),
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_ConfigAudit_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_ConfigAudit_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_ConfigAudit_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_ConfigAudit_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -675,7 +690,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_DeadLetter_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_DeadLetter_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_DeadLetter_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_DeadLetter_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -688,5 +703,6 @@ MERGE ERM.ERM_SchemaVersion AS t
 USING (SELECT N'002_core_tables.sql' AS ScriptName) AS s
     ON t.ScriptName = s.ScriptName
 WHEN NOT MATCHED THEN
-    INSERT (ScriptName, FrameworkVersion) VALUES (s.ScriptName, N'1.0.0');
+    INSERT (ScriptName, FrameworkVersion, CreatedBy)
+    VALUES (s.ScriptName, N'1.0.0', ERM.fn_SystemUserID());
 GO

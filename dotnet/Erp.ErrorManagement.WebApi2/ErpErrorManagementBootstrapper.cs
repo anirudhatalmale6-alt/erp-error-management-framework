@@ -52,7 +52,7 @@ namespace Erp.ErrorManagement.WebApi2
             var directory = new SqlSupportDirectory(options);
 
             // 1. Ambient context + correlation, before routing.
-            config.MessageHandlers.Add(new ErpErrorCorrelationHandler(options.DefaultErpModule));
+            config.MessageHandlers.Add(new ErpErrorCorrelationHandler(options.DefaultErpModule, options));
 
             // 2. Record every unhandled exception.  ADD, not Replace - Web API
             //    supports multiple loggers and the ERP may already have one

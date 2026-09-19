@@ -202,10 +202,27 @@ namespace Erp.ErrorManagement
                 if (serverUser != null)
                 {
                     envelope.User = envelope.User ?? new UserContext();
-                    envelope.User.Id = serverUser.Id ?? envelope.User.Id;
+
+                    // IDENTITY IS NOT NEGOTIABLE. The other fields fall back to
+                    // what the browser sent, because they are descriptive and a
+                    // wrong one is cosmetic. UserProfileId is different: it is
+                    // what CreatedBy, ticket ownership and "who is affected" are
+                    // all keyed on. If the server knows who this is, the server
+                    // wins; if it does not, the answer is -1 and NOT whatever
+                    // number the page put in the payload - otherwise any browser
+                    // could post someone else's id and file errors, or tickets,
+                    // in their name.
+                    envelope.User.ProfileId = ErpUser.Normalize(serverUser.ProfileId);
+
                     envelope.User.Name = serverUser.Name ?? envelope.User.Name;
                     envelope.User.DisplayName = serverUser.DisplayName ?? envelope.User.DisplayName;
                     envelope.User.TenantId = serverUser.TenantId ?? envelope.User.TenantId;
+                }
+                else if (envelope.User != null)
+                {
+                    // No server-side context at all (a public page). The client's
+                    // claim is discarded rather than believed.
+                    envelope.User.ProfileId = ErpUser.None;
                 }
                 if (envelope.User != null) envelope.User.ClientIp = clientIp;
 
@@ -255,7 +272,7 @@ namespace Erp.ErrorManagement
 
             return new UserContext
             {
-                Id = ctx.UserId,
+                ProfileId = ErpUser.Normalize(ctx.UserProfileId),
                 Name = ctx.UserName,
                 DisplayName = ctx.UserDisplayName,
                 TenantId = ctx.TenantId,

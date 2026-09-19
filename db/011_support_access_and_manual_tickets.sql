@@ -62,7 +62,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_SupportRole_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_SupportRole_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_SupportRole_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_SupportRole_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -87,18 +87,19 @@ USING (VALUES
     ON t.RoleID = s.RoleID
 WHEN NOT MATCHED THEN
     INSERT (RoleID, Code, DisplayName, CanViewErrors, CanViewDiagnostics,
-            CanManageTickets, CanBeAssigned, CanTriage, CanConfigure)
+            CanManageTickets, CanBeAssigned, CanTriage, CanConfigure, CreatedBy)
     VALUES (s.RoleID, s.Code, s.DisplayName, s.CanViewErrors, s.CanViewDiagnostics,
-            s.CanManageTickets, s.CanBeAssigned, s.CanTriage, s.CanConfigure);
+            s.CanManageTickets, s.CanBeAssigned, s.CanTriage, s.CanConfigure,
+            ERM.fn_SystemUserID());
 GO
 
 /* -----------------------------------------------------------------------------
    The roster.
 
    This is deliberately NOT a copy of your user directory. It holds only the
-   people who have a support function, keyed by whatever identifier your JWT
-   carries, so the framework never needs to read your ERP's user tables - which
-   is the same isolation rule as everything else in ERM.
+   people who have a support function, keyed by their ERP UserProfileID, so the
+   framework never needs to read your ERP's user tables - which is the same
+   isolation rule as everything else in ERM.
 
    It serves two purposes that are easy to conflate:
      * AUTHORISATION  - may this caller use the admin API at all?
@@ -115,9 +116,12 @@ BEGIN
         [DBNo]        INT              NOT NULL CONSTRAINT DF_SupportUser_DBNo  DEFAULT (1),
         [AppNo]       INT              NOT NULL CONSTRAINT DF_SupportUser_AppNo DEFAULT (1),
         ERM_SupportUserID   INT             IDENTITY(1,1) NOT NULL,
-        /* Match on EITHER, because which one your token carries can change
-           across an auth migration and old tickets must keep resolving. */
-        UserID          NVARCHAR(128)   NULL,
+        /* The ERP's own UserProfileID, and nothing else. An earlier draft
+           matched on a token id OR a user name, to survive an auth migration.
+           That is the wrong trade here: ATC has one canonical user key, and
+           two ways to identify the same person is two ways for authorisation
+           to disagree with itself. UserName below is display text only. */
+        UserProfileID   INT             NOT NULL,
         UserName        NVARCHAR(200)   NULL,
         DisplayName     NVARCHAR(200)   NOT NULL,
         RoleID          TINYINT         NOT NULL,
@@ -129,24 +133,21 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_SupportUser_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_SupportUser_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_SupportUser_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_SupportUser_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
         CONSTRAINT PK_SupportUser PRIMARY KEY CLUSTERED (ERM_SupportUserID),
         CONSTRAINT FK_SupportUser_Role  FOREIGN KEY (RoleID)         REFERENCES ERM.ERM_SupportRole (RoleID),
         CONSTRAINT FK_SupportUser_Queue FOREIGN KEY (DefaultQueueID) REFERENCES ERM.ERM_TicketQueue (ERM_TicketQueueID),
-        /* A row that identifies nobody is a row that authorises nobody - but it
-           would also be invisible in the console, so reject it outright. */
-        CONSTRAINT CK_SupportUser_Identity CHECK (UserID IS NOT NULL OR UserName IS NOT NULL)
+        /* -1 is the non-user value; it must never be able to hold support
+           rights, or every anonymous caller would be an administrator. */
+        CONSTRAINT CK_SupportUser_RealUser CHECK (UserProfileID > 0)
     );
 
-    /* Filtered unique indexes: one roster row per identity, while still
-       allowing many rows to have a NULL UserID or NULL UserName. */
-    CREATE UNIQUE INDEX UX_SupportUser_UserId
-        ON ERM.ERM_SupportUser (UserID) WHERE UserID IS NOT NULL;
-    CREATE UNIQUE INDEX UX_SupportUser_UserName
-        ON ERM.ERM_SupportUser (UserName) WHERE UserName IS NOT NULL;
+    /* One roster row per person. */
+    CREATE UNIQUE INDEX UX_SupportUser_UserProfileID
+        ON ERM.ERM_SupportUser (UserProfileID);
 END
 GO
 
@@ -159,17 +160,18 @@ GO
    ----------------------------------------------------------------------------- */
 CREATE OR ALTER FUNCTION ERM.fn_SupportCapability
 (
-    @UserID     NVARCHAR(128),
-    @UserName   NVARCHAR(200),
+    @UserProfileID INT,
     /* 'view' | 'diagnostics' | 'manage' | 'triage' | 'configure' */
     @Capability NVARCHAR(20)
 )
 RETURNS BIT
 AS
 BEGIN
-    /* No identity = no capability. An anonymous caller must never satisfy
-       this, whatever else is true. */
-    IF @UserID IS NULL AND @UserName IS NULL RETURN 0;
+    /* No identity = no capability. NULL is an anonymous caller and -1 is the
+       framework's own non-user value; neither may ever satisfy this, whatever
+       else is true. This is the line that makes a forgotten check fail
+       closed. */
+    IF @UserProfileID IS NULL OR @UserProfileID <= 0 RETURN 0;
 
     DECLARE @granted BIT = 0;
 
@@ -185,8 +187,7 @@ BEGIN
     JOIN ERM.ERM_SupportRole r ON r.RoleID = su.RoleID
     WHERE su.IsActive = 1
       AND r.IsActive = 1
-      AND (   (@UserID   IS NOT NULL AND su.UserID   = @UserID)
-           OR (@UserName IS NOT NULL AND su.UserName = @UserName));
+      AND su.UserProfileID = @UserProfileID;
 
     RETURN ISNULL(@granted, 0);
 END
@@ -196,15 +197,16 @@ GO
    cache per request. */
 CREATE OR ALTER PROCEDURE ERM.usp_Support_WhoAmI
 (
-    @UserID   NVARCHAR(128) = NULL,
-    @UserName NVARCHAR(200) = NULL
+    @UserProfileID INT = NULL
 )
 AS
 BEGIN
     SET NOCOUNT ON;
 
+    IF @UserProfileID IS NULL OR @UserProfileID <= 0 RETURN;
+
     SELECT TOP 1
-           su.ERM_SupportUserID, su.DisplayName, su.UserID, su.UserName,
+           su.ERM_SupportUserID, su.DisplayName, su.UserProfileID, su.UserName,
            r.Code AS RoleCode, r.DisplayName AS RoleName,
            r.CanViewErrors, r.CanViewDiagnostics, r.CanManageTickets,
            r.CanBeAssigned, r.CanTriage, r.CanConfigure,
@@ -214,8 +216,7 @@ BEGIN
     JOIN ERM.ERM_SupportRole r ON r.RoleID = su.RoleID
     LEFT JOIN ERM.ERM_TicketQueue q ON q.ERM_TicketQueueID = su.DefaultQueueID
     WHERE su.IsActive = 1 AND r.IsActive = 1
-      AND (   (@UserID   IS NOT NULL AND su.UserID   = @UserID)
-           OR (@UserName IS NOT NULL AND su.UserName = @UserName));
+      AND su.UserProfileID = @UserProfileID;
 
     /* No row = not support staff. The API turns that into a 403; the absence
        of a row is the answer, not an error. */
@@ -232,7 +233,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    SELECT su.ERM_SupportUserID, su.UserID, su.UserName, su.DisplayName,
+    SELECT su.ERM_SupportUserID, su.UserProfileID, su.UserName, su.DisplayName,
            r.Code AS RoleCode, r.DisplayName AS RoleName,
            su.DefaultQueueID, q.Code AS DefaultQueueCode,
            su.IsAvailable,
@@ -241,8 +242,7 @@ BEGIN
            (SELECT COUNT_BIG(*) FROM ERM.ERM_Ticket t
             JOIN ERM.ERM_TicketStatus ts ON ts.StatusID = t.StatusID
             WHERE ts.IsOpen = 1
-              AND (   (su.UserID   IS NOT NULL AND t.AssignedToUserID   = su.UserID)
-                   OR (su.UserName IS NOT NULL AND t.AssignedToUserName = su.UserName))
+              AND t.AssignedToUserProfileID = su.UserProfileID
            ) AS OpenTicketCount
     FROM ERM.ERM_SupportUser su
     JOIN ERM.ERM_SupportRole r ON r.RoleID = su.RoleID
@@ -267,8 +267,8 @@ GO
    status change and so never triggered a history row at all - left no trace,
    and even the initial assignment only recorded who PERFORMED it, never who
    RECEIVED it. */
-IF COL_LENGTH(N'ERM.ERM_TicketStatusHistory', N'AssignedToUserID') IS NULL
-    ALTER TABLE ERM.ERM_TicketStatusHistory ADD AssignedToUserID NVARCHAR(128) NULL;
+IF COL_LENGTH(N'ERM.ERM_TicketStatusHistory', N'AssignedToUserProfileID') IS NULL
+    ALTER TABLE ERM.ERM_TicketStatusHistory ADD AssignedToUserProfileID INT NULL;
 GO
 IF COL_LENGTH(N'ERM.ERM_TicketStatusHistory', N'AssignedToUserName') IS NULL
     ALTER TABLE ERM.ERM_TicketStatusHistory ADD AssignedToUserName NVARCHAR(200) NULL;
@@ -298,10 +298,9 @@ GO
 CREATE OR ALTER PROCEDURE ERM.usp_Ticket_Assign
 (
     @TicketNumber       VARCHAR(30),
-    /* Target. NULL in both = unassign. */
-    @AssignToUserID     NVARCHAR(128) = NULL,
-    @AssignToUserName   NVARCHAR(200) = NULL,
-    @ChangedByUserID    NVARCHAR(128) = NULL,
+    /* NULL = unassign. */
+    @AssignToUserProfileID  INT = NULL,
+    @ChangedByUserProfileID INT = NULL,
     @ChangedByUserName  NVARCHAR(200) = NULL,
     @Comments           NVARCHAR(MAX) = NULL,
     /* Move New -> Assigned at the same time, if the workflow permits it. */
@@ -314,16 +313,16 @@ BEGIN
 
     /* The caller must be allowed to manage tickets. Checked here as well as in
        the API so that a forgotten check fails closed. */
-    IF ERM.fn_SupportCapability(@ChangedByUserID, @ChangedByUserName, N'manage') = 0
+    IF ERM.fn_SupportCapability(@ChangedByUserProfileID, N'manage') = 0
     BEGIN
         RAISERROR (N'Not authorised to manage tickets.', 16, 1);
         RETURN;
     END
 
-    DECLARE @ERM_TicketID BIGINT, @StatusID TINYINT, @PrevAssignee NVARCHAR(200), @PrevAssigneeId NVARCHAR(128);
+    DECLARE @ERM_TicketID BIGINT, @StatusID TINYINT, @PrevAssignee NVARCHAR(200), @PrevAssigneeId INT;
 
     SELECT @ERM_TicketID = ERM_TicketID, @StatusID = StatusID,
-           @PrevAssignee = AssignedToUserName, @PrevAssigneeId = AssignedToUserID
+           @PrevAssignee = AssignedToUserName, @PrevAssigneeId = AssignedToUserProfileID
     FROM ERM.ERM_Ticket WHERE TicketNumber = @TicketNumber;
 
     IF @ERM_TicketID IS NULL
@@ -332,21 +331,19 @@ BEGIN
         RETURN;
     END
 
-    DECLARE @unassigning BIT = CASE WHEN @AssignToUserID IS NULL AND @AssignToUserName IS NULL
-                                    THEN 1 ELSE 0 END;
+    DECLARE @unassigning BIT = CASE WHEN @AssignToUserProfileID IS NULL THEN 1 ELSE 0 END;
 
-    DECLARE @targetId NVARCHAR(128), @targetName NVARCHAR(200), @targetDisplay NVARCHAR(200);
+    DECLARE @targetId INT, @targetName NVARCHAR(200), @targetDisplay NVARCHAR(200);
 
     IF @unassigning = 0
     BEGIN
         /* Resolve against the roster, and fail if the target is not a real,
            active, assignable person. */
-        SELECT TOP 1 @targetId = su.UserID, @targetName = su.UserName, @targetDisplay = su.DisplayName
+        SELECT TOP 1 @targetId = su.UserProfileID, @targetName = su.UserName, @targetDisplay = su.DisplayName
         FROM ERM.ERM_SupportUser su
         JOIN ERM.ERM_SupportRole r ON r.RoleID = su.RoleID
         WHERE su.IsActive = 1 AND r.IsActive = 1 AND r.CanBeAssigned = 1
-          AND (   (@AssignToUserID   IS NOT NULL AND su.UserID   = @AssignToUserID)
-               OR (@AssignToUserName IS NOT NULL AND su.UserName = @AssignToUserName));
+          AND su.UserProfileID = @AssignToUserProfileID;
 
         IF @targetDisplay IS NULL
         BEGIN
@@ -360,8 +357,10 @@ BEGIN
     BEGIN TRANSACTION;
 
         UPDATE ERM.ERM_Ticket
-           SET AssignedToUserID   = @targetId,
+           SET AssignedToUserProfileID = @targetId,
                AssignedToUserName = @targetName,
+               UpdatedBy          = ISNULL(@ChangedByUserProfileID, ERM.fn_SystemUserID()),
+               UpdatedDate        = GETUTCDATE(),
                AssignedUtc        = CASE WHEN @unassigning = 1 THEN NULL
                                          ELSE ISNULL(AssignedUtc, @Now) END,
                /* An assignment is a response: somebody has picked the ticket
@@ -377,16 +376,17 @@ BEGIN
         WHERE ERM_TicketID = @ERM_TicketID;
 
         INSERT ERM.ERM_TicketStatusHistory
-            (ERM_TicketID, SequenceNo, FromStatusID, ToStatusID, ChangedByUserID, ChangedByUserName,
+            (ERM_TicketID, SequenceNo, FromStatusID, ToStatusID, ChangedByUserProfileID, ChangedByUserName,
              ChangedUtc, MinutesInFromStatus, Comments, IsCustomerVisible,
-             AssignedToUserID, AssignedToUserName, PreviousAssignedToUserName, ChangeKind)
+             AssignedToUserProfileID, AssignedToUserName, PreviousAssignedToUserName, ChangeKind,
+             CreatedBy)
         VALUES
             (@ERM_TicketID, @SeqNo,
              /* Same status on both sides: this row records an ASSIGNMENT, not a
                 transition, and pretending otherwise would corrupt the
                 minutes-in-status accounting. */
              @StatusID, @StatusID,
-             @ChangedByUserID, @ChangedByUserName, @Now,
+             ISNULL(@ChangedByUserProfileID, ERM.fn_SystemUserID()), @ChangedByUserName, @Now,
              NULL,
              COALESCE(@Comments,
                       CASE WHEN @unassigning = 1 THEN N'Ticket unassigned.'
@@ -395,7 +395,8 @@ BEGIN
              /* Internal: which engineer holds the ticket is not the end user's
                 business, and telling them invites them to chase that person. */
              0,
-             @targetId, @targetName, @PrevAssignee, N'assignment');
+             @targetId, @targetName, @PrevAssignee, N'assignment',
+             ISNULL(@ChangedByUserProfileID, ERM.fn_SystemUserID()));
 
     COMMIT TRANSACTION;
 
@@ -415,14 +416,27 @@ BEGIN
             EXEC ERM.usp_Ticket_ChangeStatus
                  @ERM_TicketID          = @ERM_TicketID,
                  @ToStatusID        = @AssignedStatusId,
-                 @ChangedByUserID   = @ChangedByUserID,
+                 @ChangedByUserProfileID = @ChangedByUserProfileID,
                  @ChangedByUserName = @ChangedByUserName,
                  @Comments          = N'Assigned.',
-                 @AssignToUserID    = @targetId,
+                 @AssignToUserProfileID = @targetId,
                  @AssignToUserName  = @targetName,
                  @IsCustomerVisible = 1;
         END
     END
+
+    /* The person who has just been given the work is the one who needs to
+       know. The reporter is told about STATUS, not about which engineer holds
+       their ticket - see the IsCustomerVisible = 0 on the history row above. */
+    IF @unassigning = 0 AND OBJECT_ID(N'ERM.usp_Notification_Enqueue', N'P') IS NOT NULL
+        EXEC ERM.usp_Notification_Enqueue
+             @RecipientUserProfileID = @targetId,
+             @EventKind    = N'assigned',
+             @ERM_TicketID = @ERM_TicketID,
+             @TicketNumber = @TicketNumber,
+             @Title        = N'A support ticket has been assigned to you',
+             @Body         = @TicketNumber,
+             @ActedByUserProfileID = @ChangedByUserProfileID;
 
     SELECT @TicketNumber AS TicketNumber,
            @targetName AS AssignedToUserName,
@@ -447,7 +461,7 @@ BEGIN
        writes its row, so the two stay consistent without duplicating the
        assignment logic. */
     UPDATE h
-       SET h.AssignedToUserID   = t.AssignedToUserID,
+       SET h.AssignedToUserProfileID = t.AssignedToUserProfileID,
            h.AssignedToUserName = t.AssignedToUserName
       FROM ERM.ERM_TicketStatusHistory h
       JOIN ERM.ERM_Ticket t ON t.ERM_TicketID = h.ERM_TicketID
@@ -518,7 +532,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_RequestCategory_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_RequestCategory_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_RequestCategory_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_RequestCategory_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -543,8 +557,8 @@ USING (VALUES
 ) AS s (Code, DisplayName, DefaultSeverityID, RankOrder)
     ON t.Code = s.Code
 WHEN NOT MATCHED THEN
-    INSERT (Code, DisplayName, DefaultSeverityID, RankOrder)
-    VALUES (s.Code, s.DisplayName, s.DefaultSeverityID, s.RankOrder);
+    INSERT (Code, DisplayName, DefaultSeverityID, RankOrder, CreatedBy)
+    VALUES (s.Code, s.DisplayName, s.DefaultSeverityID, s.RankOrder, ERM.fn_SystemUserID());
 GO
 
 CREATE OR ALTER PROCEDURE ERM.usp_RequestCategory_List
@@ -578,11 +592,11 @@ CREATE OR ALTER PROCEDURE ERM.usp_Ticket_CreateManual
     @ErpModule          NVARCHAR(100) = NULL,
     @ReportedScreen     NVARCHAR(200) = NULL,
     @Environment        NVARCHAR(40)  = NULL,
-    @ReportedByUserID   NVARCHAR(128) = NULL,
+    @ReportedByUserProfileID INT      = NULL,
     @ReportedByUserName NVARCHAR(200) = NULL,
     /* Support staff raising one on a user's behalf - phone call, corridor
-       conversation. The ticket is owned by @ReportedByUserName so it appears in
-       THEIR My Tickets, not the agent's. */
+       conversation. The ticket is owned by @ReportedByUserProfileID so it
+       appears in THEIR My Tickets, not the agent's. */
     @CreatedVia         NVARCHAR(20)  = N'user',
     @SeverityCode       NVARCHAR(20)  = NULL,
     @TicketNumber       VARCHAR(30)   OUTPUT
@@ -598,11 +612,13 @@ BEGIN
         RETURN;
     END
 
-    IF @ReportedByUserID IS NULL AND @ReportedByUserName IS NULL
+    IF @ReportedByUserProfileID IS NULL OR @ReportedByUserProfileID <= 0
     BEGIN
         /* An unowned manual ticket cannot appear in anyone's My Tickets and
-           nobody can be asked for more information - it is a dead record. */
-        RAISERROR (N'A manual ticket must have an owner.', 16, 1);
+           nobody can be asked for more information - it is a dead record.
+           -1 counts as unowned: the non-user value is not a person who can be
+           asked anything. */
+        RAISERROR (N'A manual ticket must have a real ERP user as its owner.', 16, 1);
         RETURN;
     END
 
@@ -640,30 +656,40 @@ BEGIN
         INSERT ERM.ERM_Ticket
         (
             TicketNumber, ERM_ErrorOccurrenceID, ERM_ErrorFingerprintID, StatusID, SeverityID, ERM_TicketQueueID, ERM_SlaPolicyID,
-            Title, UserDescription, ReportedByUserID, ReportedByUserName, CreatedVia,
+            Title, UserDescription, ReportedByUserProfileID, ReportedByUserName, CreatedVia,
             ErpModule, Environment, CreatedUtc, LastStatusChangeUtc, LinkedOccurrenceCount,
-            TicketSource, RequestCategory, ReportedScreen
+            TicketSource, RequestCategory, ReportedScreen, CreatedBy
         )
         VALUES
         (
             @TicketNumber, NULL, NULL, 1 /*new*/, @SeverityID, @ERM_TicketQueueID, @ERM_SlaPolicyID,
-            LEFT(LTRIM(RTRIM(@Title)), 400), @Description, @ReportedByUserID, @ReportedByUserName,
+            LEFT(LTRIM(RTRIM(@Title)), 400), @Description, @ReportedByUserProfileID, @ReportedByUserName,
             @CreatedVia, @ErpModule, @Environment, @Now, @Now,
             /* No occurrences behind it. */
             0,
-            N'manual', @catCode, @ReportedScreen
+            N'manual', @catCode, @ReportedScreen, @ReportedByUserProfileID
         );
 
         SET @NewTicketId = SCOPE_IDENTITY();
 
         INSERT ERM.ERM_TicketStatusHistory
-            (ERM_TicketID, SequenceNo, FromStatusID, ToStatusID, ChangedByUserID, ChangedByUserName,
-             ChangedUtc, MinutesInFromStatus, Comments, IsCustomerVisible, ChangeKind)
+            (ERM_TicketID, SequenceNo, FromStatusID, ToStatusID, ChangedByUserProfileID, ChangedByUserName,
+             ChangedUtc, MinutesInFromStatus, Comments, IsCustomerVisible, ChangeKind, CreatedBy)
         VALUES
-            (@NewTicketId, 1, NULL, 1, @ReportedByUserID, @ReportedByUserName, @Now, NULL,
-             N'Ticket raised manually by the user.', 1, N'status');
+            (@NewTicketId, 1, NULL, 1, @ReportedByUserProfileID, @ReportedByUserName, @Now, NULL,
+             N'Ticket raised manually by the user.', 1, N'status', @ReportedByUserProfileID);
 
     COMMIT TRANSACTION;
+
+    IF OBJECT_ID(N'ERM.usp_Notification_Enqueue', N'P') IS NOT NULL
+        EXEC ERM.usp_Notification_Enqueue
+             @RecipientUserProfileID = @ReportedByUserProfileID,
+             @EventKind    = N'created',
+             @ERM_TicketID = @NewTicketId,
+             @TicketNumber = @TicketNumber,
+             @Title        = N'Your request has been logged',
+             @Body         = @Title,
+             @ActedByUserProfileID = NULL;
 
     SELECT @TicketNumber AS TicketNumber, @NewTicketId AS TicketId,
            CONVERT(BIT, 0) AS WasDeduplicated;
@@ -674,5 +700,6 @@ MERGE ERM.ERM_SchemaVersion AS t
 USING (SELECT N'011_support_access_and_manual_tickets.sql' AS ScriptName) AS s
     ON t.ScriptName = s.ScriptName
 WHEN NOT MATCHED THEN
-    INSERT (ScriptName, FrameworkVersion) VALUES (s.ScriptName, N'1.3.0');
+    INSERT (ScriptName, FrameworkVersion, CreatedBy)
+    VALUES (s.ScriptName, N'1.3.0', ERM.fn_SystemUserID());
 GO

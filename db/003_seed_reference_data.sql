@@ -22,7 +22,8 @@ USING (VALUES
 ) AS s (SeverityID, Code, DisplayName, RankOrder)
     ON t.SeverityID = s.SeverityID
 WHEN NOT MATCHED THEN
-    INSERT (SeverityID, Code, DisplayName, RankOrder) VALUES (s.SeverityID, s.Code, s.DisplayName, s.RankOrder);
+    INSERT (SeverityID, Code, DisplayName, RankOrder, CreatedBy)
+    VALUES (s.SeverityID, s.Code, s.DisplayName, s.RankOrder, ERM.fn_SystemUserID());
 GO
 
 /* ---------------------------------------------------------------- layer -- */
@@ -39,7 +40,8 @@ USING (VALUES
 ) AS s (LayerID, Code, DisplayName)
     ON t.LayerID = s.LayerID
 WHEN NOT MATCHED THEN
-    INSERT (LayerID, Code, DisplayName) VALUES (s.LayerID, s.Code, s.DisplayName);
+    INSERT (LayerID, Code, DisplayName, CreatedBy)
+    VALUES (s.LayerID, s.Code, s.DisplayName, ERM.fn_SystemUserID());
 GO
 
 /* ------------------------------------------------------------- category -- */
@@ -74,8 +76,8 @@ USING (VALUES
 ) AS s (CategoryID, Code, DisplayName, DefaultSeverityID)
     ON t.CategoryID = s.CategoryID
 WHEN NOT MATCHED THEN
-    INSERT (CategoryID, Code, DisplayName, DefaultSeverityID)
-    VALUES (s.CategoryID, s.Code, s.DisplayName, s.DefaultSeverityID);
+    INSERT (CategoryID, Code, DisplayName, DefaultSeverityID, CreatedBy)
+    VALUES (s.CategoryID, s.Code, s.DisplayName, s.DefaultSeverityID, ERM.fn_SystemUserID());
 GO
 
 /* -------------------------------------------------------- ticket status -- */
@@ -92,8 +94,8 @@ USING (VALUES
 ) AS s (StatusID, Code, DisplayName, RankOrder, IsOpen, IsTerminal, IsPaused)
     ON t.StatusID = s.StatusID
 WHEN NOT MATCHED THEN
-    INSERT (StatusID, Code, DisplayName, RankOrder, IsOpen, IsTerminal, IsPaused)
-    VALUES (s.StatusID, s.Code, s.DisplayName, s.RankOrder, s.IsOpen, s.IsTerminal, s.IsPaused);
+    INSERT (StatusID, Code, DisplayName, RankOrder, IsOpen, IsTerminal, IsPaused, CreatedBy)
+    VALUES (s.StatusID, s.Code, s.DisplayName, s.RankOrder, s.IsOpen, s.IsTerminal, s.IsPaused, ERM.fn_SystemUserID());
 GO
 
 /* ---------------------------------------------------------- transitions -- */
@@ -112,20 +114,20 @@ USING (VALUES
 ) AS s (FromStatusID, ToStatusID, RequiresComment, RequiresAssignee)
     ON t.FromStatusID = s.FromStatusID AND t.ToStatusID = s.ToStatusID
 WHEN NOT MATCHED THEN
-    INSERT (FromStatusID, ToStatusID, RequiresComment, RequiresAssignee)
-    VALUES (s.FromStatusID, s.ToStatusID, s.RequiresComment, s.RequiresAssignee);
+    INSERT (FromStatusID, ToStatusID, RequiresComment, RequiresAssignee, CreatedBy)
+    VALUES (s.FromStatusID, s.ToStatusID, s.RequiresComment, s.RequiresAssignee, ERM.fn_SystemUserID());
 GO
 
 /* --------------------------------------------------------------- queues -- */
 IF NOT EXISTS (SELECT 1 FROM ERM.ERM_TicketQueue WHERE Code = N'general')
-    INSERT ERM.ERM_TicketQueue (Code, DisplayName, ErpModuleMatch, IsDefault)
-    VALUES (N'general', N'General Support', NULL, 1);
+    INSERT ERM.ERM_TicketQueue (Code, DisplayName, ErpModuleMatch, IsDefault, CreatedBy)
+    VALUES (N'general', N'General Support', NULL, 1, ERM.fn_SystemUserID());
 IF NOT EXISTS (SELECT 1 FROM ERM.ERM_TicketQueue WHERE Code = N'application')
-    INSERT ERM.ERM_TicketQueue (Code, DisplayName, ErpModuleMatch, IsDefault)
-    VALUES (N'application', N'Application Support', NULL, 0);
+    INSERT ERM.ERM_TicketQueue (Code, DisplayName, ErpModuleMatch, IsDefault, CreatedBy)
+    VALUES (N'application', N'Application Support', NULL, 0, ERM.fn_SystemUserID());
 IF NOT EXISTS (SELECT 1 FROM ERM.ERM_TicketQueue WHERE Code = N'database')
-    INSERT ERM.ERM_TicketQueue (Code, DisplayName, ErpModuleMatch, IsDefault)
-    VALUES (N'database', N'Database Team', NULL, 0);
+    INSERT ERM.ERM_TicketQueue (Code, DisplayName, ErpModuleMatch, IsDefault, CreatedBy)
+    VALUES (N'database', N'Database Team', NULL, 0, ERM.fn_SystemUserID());
 GO
 
 /* ------------------------------------------------------------------ SLA -- */
@@ -139,8 +141,8 @@ USING (VALUES
 ) AS s (SeverityID, FirstResponseMinutes, ResolutionMinutes)
     ON t.SeverityID = s.SeverityID AND t.ERM_TicketQueueID IS NULL
 WHEN NOT MATCHED THEN
-    INSERT (SeverityID, ERM_TicketQueueID, FirstResponseMinutes, ResolutionMinutes)
-    VALUES (s.SeverityID, NULL, s.FirstResponseMinutes, s.ResolutionMinutes);
+    INSERT (SeverityID, ERM_TicketQueueID, FirstResponseMinutes, ResolutionMinutes, CreatedBy)
+    VALUES (s.SeverityID, NULL, s.FirstResponseMinutes, s.ResolutionMinutes, ERM.fn_SystemUserID());
 GO
 
 /* ------------------------------------------------- redaction allow-list -- */
@@ -167,7 +169,7 @@ USING (VALUES
 ) AS s (Scope, KeyName)
     ON t.Scope = s.Scope AND t.KeyName = s.KeyName
 WHEN NOT MATCHED THEN
-    INSERT (Scope, KeyName) VALUES (s.Scope, s.KeyName);
+    INSERT (Scope, KeyName, CreatedBy) VALUES (s.Scope, s.KeyName, ERM.fn_SystemUserID());
 GO
 
 /* ------------------------------------------------------------- settings -- */
@@ -192,8 +194,8 @@ USING (VALUES
 ) AS s (SettingKey, SettingValue, DataType, Description)
     ON t.SettingKey = s.SettingKey
 WHEN NOT MATCHED THEN
-    INSERT (SettingKey, SettingValue, DataType, Description)
-    VALUES (s.SettingKey, s.SettingValue, s.DataType, s.Description);
+    INSERT (SettingKey, SettingValue, DataType, Description, CreatedBy)
+    VALUES (s.SettingKey, s.SettingValue, s.DataType, s.Description, ERM.fn_SystemUserID());
 GO
 
 /* -------------------------------------------------- auto-ticket rules ---- */
@@ -201,11 +203,11 @@ GO
    happened three times in an hour raises a ticket by itself.  Everything else
    waits for a human to press Report.                                          */
 IF NOT EXISTS (SELECT 1 FROM ERM.ERM_AutoTicketRule WHERE RuleName = N'Critical recurring')
-    INSERT ERM.ERM_AutoTicketRule (RuleName, MinSeverityID, MinOccurrences, WindowMinutes, TargetQueueID)
-    SELECT N'Critical recurring', 1, 3, 60, (SELECT ERM_TicketQueueID FROM ERM.ERM_TicketQueue WHERE Code = N'application');
+    INSERT ERM.ERM_AutoTicketRule (RuleName, MinSeverityID, MinOccurrences, WindowMinutes, TargetQueueID, CreatedBy)
+    SELECT N'Critical recurring', 1, 3, 60, (SELECT ERM_TicketQueueID FROM ERM.ERM_TicketQueue WHERE Code = N'application'), ERM.fn_SystemUserID();
 IF NOT EXISTS (SELECT 1 FROM ERM.ERM_AutoTicketRule WHERE RuleName = N'Database unavailable')
-    INSERT ERM.ERM_AutoTicketRule (RuleName, CategoryID, MinOccurrences, WindowMinutes, TargetQueueID)
-    SELECT N'Database unavailable', 45, 1, 15, (SELECT ERM_TicketQueueID FROM ERM.ERM_TicketQueue WHERE Code = N'database');
+    INSERT ERM.ERM_AutoTicketRule (RuleName, CategoryID, MinOccurrences, WindowMinutes, TargetQueueID, CreatedBy)
+    SELECT N'Database unavailable', 45, 1, 15, (SELECT ERM_TicketQueueID FROM ERM.ERM_TicketQueue WHERE Code = N'database'), ERM.fn_SystemUserID();
 GO
 
 /* ------------------------------------------------------------- retention -- */
@@ -218,13 +220,14 @@ USING (VALUES
 ) AS s (DataSet, ArchiveAfterDays, PurgeAfterDays, BatchSize)
     ON t.DataSet = s.DataSet
 WHEN NOT MATCHED THEN
-    INSERT (DataSet, ArchiveAfterDays, PurgeAfterDays, BatchSize)
-    VALUES (s.DataSet, s.ArchiveAfterDays, s.PurgeAfterDays, s.BatchSize);
+    INSERT (DataSet, ArchiveAfterDays, PurgeAfterDays, BatchSize, CreatedBy)
+    VALUES (s.DataSet, s.ArchiveAfterDays, s.PurgeAfterDays, s.BatchSize, ERM.fn_SystemUserID());
 GO
 
 MERGE ERM.ERM_SchemaVersion AS t
 USING (SELECT N'003_seed_reference_data.sql' AS ScriptName) AS s
     ON t.ScriptName = s.ScriptName
 WHEN NOT MATCHED THEN
-    INSERT (ScriptName, FrameworkVersion) VALUES (s.ScriptName, N'1.0.0');
+    INSERT (ScriptName, FrameworkVersion, CreatedBy)
+    VALUES (s.ScriptName, N'1.0.0', ERM.fn_SystemUserID());
 GO

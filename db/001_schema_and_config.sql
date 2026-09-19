@@ -25,42 +25,49 @@ IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'ERM')
 GO
 
 /* =============================================================================
-   SYSTEM USER ID
+   THE NON-USER VALUE  (-1)
    -----------------------------------------------------------------------------
-   The LinkedScam standard requires CreatedBy INT NOT NULL on every table. The
-   framework, however, writes rows that have NO ERP user behind them:
+   The LinkedScam standard requires CreatedBy INT NOT NULL on every table, and
+   ATC's rule is that CreatedBy / UpdatedBy carry NO DEFAULT CONSTRAINT: the
+   value is supplied by the caller, from the ERP UserProfileID the API or the
+   stored procedure already receives.
+
+   No column in this framework has a default on CreatedBy or UpdatedBy. Every
+   INSERT names the column and passes a value. That is enforced, not just
+   intended - the verification suite walks the parse tree of every script and
+   fails if an INSERT into an ERM table omits CreatedBy, or if any table grows
+   a default on it again.
+
+   Some rows genuinely have no ERP user behind them:
 
      * an error captured from a PUBLIC page, where the browser has no token;
-     * an occurrence written by the capture pipeline itself;
      * reference data seeded by these deployment scripts;
-     * a ticket raised by an automatic rule rather than by a person.
+     * a ticket raised by an automatic rule rather than by a person;
+     * a retention run started by SQL Agent at 02:00.
 
-   So there has to be a reserved user id meaning "the framework itself". This
-   function supplies it, and every table defaults CreatedBy to it, which keeps
-   the standard satisfied without threading a user id through code paths that
-   genuinely do not have one.
-
-   SET THIS to your reserved system/service user id before go-live:
-
-       ALTER FUNCTION ERM.fn_SystemUserID() RETURNS INT AS BEGIN RETURN 0 END;
+   Those use ATC's standard non-user value, -1. This function names it, so the
+   constant appears once rather than in ninety INSERT statements, and so the
+   grep for "where does -1 come from" has one answer.
 
    WHY A CONSTANT RATHER THAN A LOOKUP.  It is tempting to read this from a
-   settings table so it can be changed without an ALTER. Do not: this function
-   is a column DEFAULT on ERM_ErrorOccurrence, the highest-volume table in the
-   framework, so a version that queries a table executes once PER ROW INSERTED.
-   A scalar UDF doing a table read on a hot insert path is a well-known way to
-   turn a fast insert into a slow one. Returning a constant lets SQL Server
-   inline it to nothing.
+   settings table so it can be changed without an ALTER. Do not: it is called
+   on the capture path, the highest-volume path in the framework, so a version
+   that queries a table executes once PER ROW INSERTED. A scalar UDF doing a
+   table read on a hot insert path is a well-known way to turn a fast insert
+   into a slow one. Returning a constant lets SQL Server inline it to nothing.
+
+   CREATE OR ALTER, not CREATE-if-absent: an environment deployed before this
+   change has the old value, and re-running the scripts is how an environment is
+   brought up to date. A guarded CREATE would silently leave it stale.
    ============================================================================= */
-IF OBJECT_ID(N'ERM.fn_SystemUserID', N'FN') IS NULL
-    EXEC (N'
-CREATE FUNCTION ERM.fn_SystemUserID()
+EXEC (N'
+CREATE OR ALTER FUNCTION ERM.fn_SystemUserID()
 RETURNS INT
 AS
 BEGIN
-    /* Reserved id representing the Error Management framework itself.
-       Change with ALTER FUNCTION - see the note above. */
-    RETURN 0;
+    /* ATC standard non-user / system value. Used where no ERP UserProfileID
+       exists - public pages, seed data, scheduled jobs, automatic rules. */
+    RETURN -1;
 END');
 GO
 
@@ -84,7 +91,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_SchemaVersion_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_SchemaVersion_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_SchemaVersion_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_SchemaVersion_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -117,7 +124,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_Severity_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_Severity_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_Severity_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_Severity_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -144,7 +151,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_ErrorCategory_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_ErrorCategory_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_ErrorCategory_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_ErrorCategory_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -170,7 +177,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_AppLayer_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_AppLayer_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_AppLayer_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_AppLayer_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -202,7 +209,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_TicketStatus_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_TicketStatus_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_TicketStatus_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_TicketStatus_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -228,7 +235,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_TicketStatusTransition_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_TicketStatusTransition_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_TicketStatusTransition_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_TicketStatusTransition_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -257,7 +264,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_TicketQueue_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_TicketQueue_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_TicketQueue_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_TicketQueue_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -283,7 +290,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_SlaPolicy_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_SlaPolicy_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_SlaPolicy_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_SlaPolicy_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -315,7 +322,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_Setting_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_Setting_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_Setting_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_Setting_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -352,7 +359,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_AutoTicketRule_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_AutoTicketRule_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_AutoTicketRule_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_AutoTicketRule_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -385,7 +392,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_RedactionAllowList_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_RedactionAllowList_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_RedactionAllowList_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_RedactionAllowList_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -416,7 +423,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_RetentionPolicy_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_RetentionPolicy_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_RetentionPolicy_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_RetentionPolicy_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -430,5 +437,6 @@ MERGE ERM.ERM_SchemaVersion AS t
 USING (SELECT N'001_schema_and_config.sql' AS ScriptName) AS s
     ON t.ScriptName = s.ScriptName
 WHEN NOT MATCHED THEN
-    INSERT (ScriptName, FrameworkVersion) VALUES (s.ScriptName, N'1.0.0');
+    INSERT (ScriptName, FrameworkVersion, CreatedBy)
+    VALUES (s.ScriptName, N'1.0.0', ERM.fn_SystemUserID());
 GO

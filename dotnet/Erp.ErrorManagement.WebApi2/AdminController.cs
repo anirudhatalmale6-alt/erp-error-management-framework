@@ -71,9 +71,13 @@ namespace Erp.ErrorManagement.WebApi2
 
         public class AssignRequest
         {
-            /// <summary>Either is accepted; both null means unassign.</summary>
-            public string AssignToUserId { get; set; }
-            public string AssignToUserName { get; set; }
+            /// <summary>
+            /// The assignee's ERP UserProfileID. Null means unassign.
+            /// The assignee's NAME is not accepted and not needed - it is
+            /// resolved from the roster inside the procedure, so the stored name
+            /// cannot disagree with the stored id.
+            /// </summary>
+            public int? AssignToUserProfileId { get; set; }
             public string Comments { get; set; }
         }
 
@@ -98,12 +102,11 @@ namespace Erp.ErrorManagement.WebApi2
 
             var result = await _store.AssignTicketAsync(
                 ticketNumber,
-                request.AssignToUserId,
-                request.AssignToUserName,
-                // WHO performed it comes from the token, never from the body.
-                // Accepting it from the caller would make the audit trail
-                // worth nothing.
-                me.UserId,
+                request.AssignToUserProfileId,
+                // WHO performed it comes from the resolved identity, never from
+                // the body. Accepting it from the caller would make the audit
+                // trail worth nothing.
+                me.UserProfileId,
                 me.UserName,
                 request.Comments,
                 cancellationToken).ConfigureAwait(false);
@@ -136,8 +139,8 @@ namespace Erp.ErrorManagement.WebApi2
             public string ErpModule { get; set; }
             public string ReportedScreen { get; set; }
             public string SeverityCode { get; set; }
-            /// <summary>The user this ticket belongs to.</summary>
-            public string OnBehalfOfUserId { get; set; }
+            /// <summary>The ERP UserProfileID of the user this ticket belongs to.</summary>
+            public int? OnBehalfOfUserProfileId { get; set; }
             public string OnBehalfOfUserName { get; set; }
         }
 
@@ -149,9 +152,9 @@ namespace Erp.ErrorManagement.WebApi2
             if (request == null || string.IsNullOrWhiteSpace(request.Title))
                 return BadRequest("A title is required.");
 
-            if (string.IsNullOrWhiteSpace(request.OnBehalfOfUserId)
-                && string.IsNullOrWhiteSpace(request.OnBehalfOfUserName))
-                return BadRequest("The user this ticket is for must be supplied.");
+            if (!request.OnBehalfOfUserProfileId.HasValue
+                || !ErpUser.IsReal(request.OnBehalfOfUserProfileId.Value))
+                return BadRequest("The UserProfileID this ticket is for must be supplied.");
 
             var result = await _store.CreateManualTicketAsync(new ManualTicketRequest
             {
@@ -161,7 +164,7 @@ namespace Erp.ErrorManagement.WebApi2
                 ErpModule = request.ErpModule,
                 ReportedScreen = request.ReportedScreen,
                 SeverityCode = request.SeverityCode,
-                ReportedByUserId = request.OnBehalfOfUserId,
+                ReportedByUserProfileId = request.OnBehalfOfUserProfileId.Value,
                 ReportedByUserName = request.OnBehalfOfUserName,
                 CreatedVia = "admin"
             }, cancellationToken).ConfigureAwait(false);

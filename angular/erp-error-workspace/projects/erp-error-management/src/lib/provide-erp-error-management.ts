@@ -26,10 +26,11 @@ import { ErpErrorContextService } from './core/erp-error-context.service';
  *         apiBaseUrl: '/api/error-management',
  *         environment: 'Production',
  *         appVersion: '2026.3.1',
- *         userProvider: () => {
- *           const u = inject(AuthService).currentUser;
- *           return u ? { id: u.userId, name: u.login, displayName: u.fullName } : null;
- *         },
+ *         // The ERP's existing global service - no new identity, no mapping.
+ *         userProvider: () => ({
+ *           profileId: generic_service.GetUserProfileKey(),
+ *           name: generic_service.GetUserName(),
+ *         }),
  *       }),
  *     ],
  *   };

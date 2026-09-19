@@ -310,8 +310,8 @@ import { RouterLink } from '@angular/router';
               <div class="assign">
                 <select [(ngModel)]="assignTarget" [disabled]="!me()?.canManageTickets">
                   <option [ngValue]="null">&mdash; unassigned &mdash;</option>
-                  @for (u of assignable(); track u.userName) {
-                    <option [ngValue]="u.userName">
+                  @for (u of assignable(); track u.userProfileId) {
+                    <option [ngValue]="u.userProfileId">
                       {{ u.displayName }} ({{ u.roleName }}) &middot; {{ u.openTicketCount }} open
                     </option>
                   }
@@ -660,7 +660,9 @@ export class AdminPage {
 
   me = signal<any>(null);
   assignable = signal<any[]>([]);
-  assignTarget: string | null = null;
+  // The ERP UserProfileID, not the name - the same key the API and the
+  // roster use, so the picker cannot select something ownership cannot match.
+  assignTarget: number | null = null;
   assignError = signal<string | null>(null);
   tickets = signal<any[]>([]);
   selected = signal<any>(null);
@@ -776,7 +778,7 @@ export class AdminPage {
     this.assignError.set(null);
     this.http
       .post<any>(`/api/error-management/admin/tickets/${ticketNumber}/assign`, {
-        assignToUserName: this.assignTarget,
+        assignToUserProfileId: this.assignTarget,
       })
       .subscribe({
         next: () => {
@@ -798,7 +800,7 @@ export class AdminPage {
       .get<any>(`/api/error-management/tickets/${ticketNumber}`)
       .subscribe((t) => {
         this.selected.set(t);
-        this.assignTarget = t?.assignedTo ?? null;
+        this.assignTarget = t?.assignedToProfileId ?? null;
       });
   }
 
@@ -816,7 +818,7 @@ export class AdminPage {
       .post<any>(`/api/error-management/tickets/${ticketNumber}/status`, {
         toStatus: transition.to,
         comments,
-        assignTo: transition.to === 'assigned' ? 'sam.ops' : null,
+        assignToUserProfileId: transition.to === 'assigned' ? 20001 /* sam.ops */ : null,
       })
       .subscribe({
         next: () => this.refresh(),

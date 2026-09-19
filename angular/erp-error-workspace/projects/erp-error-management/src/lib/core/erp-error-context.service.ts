@@ -1,7 +1,13 @@
 import { DestroyRef, Injectable, inject } from '@angular/core';
 import { ActivatedRoute, NavigationEnd, Router } from '@angular/router';
 import { filter } from 'rxjs/operators';
-import { ErpErrorBreadcrumb, ErpErrorClientInfo } from '../models/error-envelope';
+import {
+  ERP_NO_USER,
+  ErpErrorBreadcrumb,
+  ErpErrorClientInfo,
+  ErpErrorUserContext,
+  normalizeUserProfileId,
+} from '../models/error-envelope';
 import { ERP_ERROR_CONFIG, ErpErrorRouteContext } from '../config/erp-error-config';
 import { scrubText } from './redaction';
 
@@ -83,15 +89,26 @@ export class ErpErrorContextService {
     if (ctx.screen) this.screen = ctx.screen;
   }
 
-  getUser() {
-    if (!this.config.userProvider) return null;
+  /**
+   * The user, with `profileId` always a number.
+   *
+   * Anything the host returns that is not a positive integer becomes -1. That
+   * matters more than it looks: `GetUserProfileKey()` returns 0, undefined or
+   * an empty string at various points before login completes, and letting any
+   * of those through would either crash the shredding in SQL or, worse, file
+   * the error against user 0.
+   */
+  getUser(): ErpErrorUserContext | null {
+    if (!this.config.userProvider) return { profileId: ERP_NO_USER };
     try {
-      return this.config.userProvider();
+      const supplied = this.config.userProvider();
+      if (!supplied) return { profileId: ERP_NO_USER };
+      return { ...supplied, profileId: normalizeUserProfileId(supplied.profileId) };
     } catch {
       // A broken user provider must never stop an error being reported - that
       // is exactly the moment the identity service is likely to be the thing
       // that is broken.
-      return null;
+      return { profileId: ERP_NO_USER };
     }
   }
 

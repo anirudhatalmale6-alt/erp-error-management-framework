@@ -32,7 +32,11 @@ namespace Erp.ErrorManagement
             public string ApiAction { get; set; }
             public string ApiEndpoint { get; set; }
             public string HttpMethod { get; set; }
-            public string UserId { get; set; }
+            /// <summary>
+            /// ERP UserProfileID taken from the request the ERP already sends;
+            /// <see cref="ErpUser.None"/> (-1) when there is no user.
+            /// </summary>
+            public int UserProfileId { get; set; } = ErpUser.None;
             public string UserName { get; set; }
             public string UserDisplayName { get; set; }
             public string TenantId { get; set; }

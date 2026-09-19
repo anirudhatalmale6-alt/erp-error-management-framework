@@ -150,8 +150,19 @@ public class ErpErrorManagementMiddleware
             if (principal?.Identity?.IsAuthenticated != true) return;
 
             values.UserName = principal.Identity.Name;
-            values.UserId = principal.FindFirst(ClaimTypes.NameIdentifier)?.Value
-                            ?? principal.FindFirst("sub")?.Value;
+
+            // Same rule as the Web API 2 side: the ERP UserProfileID is an
+            // integer and anything that is not a positive integer means "no
+            // user", not "user 0".
+            foreach (var claimType in new[] { "UserProfileID", "userProfileId", "uid", "sub" })
+            {
+                var raw = principal.FindFirst(claimType)?.Value;
+                if (int.TryParse(raw, out var parsed) && ErpUser.IsReal(parsed))
+                {
+                    values.UserProfileId = parsed;
+                    break;
+                }
+            }
             values.UserDisplayName = principal.FindFirst("name")?.Value ?? principal.Identity.Name;
             values.TenantId = principal.FindFirst("tid")?.Value
                               ?? principal.FindFirst("tenantId")?.Value;

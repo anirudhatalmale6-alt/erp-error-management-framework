@@ -23,30 +23,29 @@ GO
 /* -----------------------------------------------------------------------------
    Ownership predicate, in one place.
 
-   Matching on EITHER UserID OR UserName, because which one is populated depends
-   on what the JWT carried at the moment the ticket was raised, and that can
-   change across a token format migration.  A ticket raised last year may have
-   only a UserName; one raised today may have both.  Requiring UserID would
-   silently hide a user's own older tickets from them.
+   Ownership is the ERP UserProfileID and nothing else. An earlier draft also
+   matched on user NAME, to survive a token-format migration. That is the wrong
+   trade for an authorisation predicate: a display name is not unique, is not
+   stable, and is editable - so "or the names match" is a second, weaker door
+   into somebody else's ticket. One key, and it is the ERP's own.
    ----------------------------------------------------------------------------- */
 CREATE OR ALTER FUNCTION ERM.fn_UserOwnsTicket
 (
     @ERM_TicketID   BIGINT,
-    @UserID     NVARCHAR(128),
-    @UserName   NVARCHAR(200)
+    @UserProfileID  INT
 )
 RETURNS BIT
 AS
 BEGIN
-    /* No identity supplied = owns nothing.  An anonymous caller must never
-       satisfy this, whatever the ticket looks like. */
-    IF @UserID IS NULL AND @UserName IS NULL RETURN 0;
+    /* No identity supplied = owns nothing. NULL is an anonymous caller and -1
+       is the non-user value; if -1 could own tickets, every anonymous caller
+       would own every ticket raised from a public page. */
+    IF @UserProfileID IS NULL OR @UserProfileID <= 0 RETURN 0;
 
     IF EXISTS (
         SELECT 1 FROM ERM.ERM_Ticket t
         WHERE t.ERM_TicketID = @ERM_TicketID
-          AND (   (@UserID   IS NOT NULL AND t.ReportedByUserID   = @UserID)
-               OR (@UserName IS NOT NULL AND t.ReportedByUserName = @UserName))
+          AND t.ReportedByUserProfileID = @UserProfileID
     )
         RETURN 1;
 
@@ -64,8 +63,7 @@ GO
    ============================================================================= */
 CREATE OR ALTER PROCEDURE ERM.usp_Ticket_ListForUser
 (
-    @UserID     NVARCHAR(128) = NULL,
-    @UserName   NVARCHAR(200) = NULL,
+    @UserProfileID INT = NULL,
     @OnlyOpen   BIT = 0,
     @PageNumber INT = 1,
     @PageSize   INT = 25
@@ -79,7 +77,7 @@ BEGIN
 
     /* No identity, no rows.  Deliberately not an error: an unauthenticated
        caller asking for "my tickets" has none, which is a valid answer. */
-    IF @UserID IS NULL AND @UserName IS NULL RETURN;
+    IF @UserProfileID IS NULL OR @UserProfileID <= 0 RETURN;
 
     SELECT t.TicketNumber, t.Title,
            st.Code AS StatusCode, st.DisplayName AS StatusName, st.IsOpen,
@@ -111,8 +109,7 @@ BEGIN
     FROM ERM.ERM_Ticket t
     JOIN ERM.ERM_TicketStatus st ON st.StatusID = t.StatusID
     JOIN ERM.ERM_Severity     sv ON sv.SeverityID = t.SeverityID
-    WHERE ((@UserID   IS NOT NULL AND t.ReportedByUserID   = @UserID)
-        OR (@UserName IS NOT NULL AND t.ReportedByUserName = @UserName))
+    WHERE t.ReportedByUserProfileID = @UserProfileID
       AND (@OnlyOpen = 0 OR st.IsOpen = 1)
     ORDER BY
         /* Anything waiting on the user comes first - it is the only row in the
@@ -138,8 +135,7 @@ GO
 CREATE OR ALTER PROCEDURE ERM.usp_Ticket_GetForUser
 (
     @TicketNumber VARCHAR(30),
-    @UserID       NVARCHAR(128) = NULL,
-    @UserName     NVARCHAR(200) = NULL
+    @UserProfileID INT = NULL
 )
 AS
 BEGIN
@@ -151,7 +147,7 @@ BEGIN
     /* Not found and not yours return the same thing: nothing.  The caller
        cannot tell them apart, which is the point. */
     IF @ERM_TicketID IS NULL RETURN;
-    IF ERM.fn_UserOwnsTicket(@ERM_TicketID, @UserID, @UserName) = 0 RETURN;
+    IF ERM.fn_UserOwnsTicket(@ERM_TicketID, @UserProfileID) = 0 RETURN;
 
     /* ---- 1: header, end-user fields only -------------------------------- */
     SELECT
@@ -232,7 +228,7 @@ GO
 CREATE OR ALTER PROCEDURE ERM.usp_Ticket_AddUserComment
 (
     @TicketNumber VARCHAR(30),
-    @UserID       NVARCHAR(128) = NULL,
+    @UserProfileID INT = NULL,
     @UserName     NVARCHAR(200) = NULL,
     @CommentText  NVARCHAR(MAX)
 )
@@ -250,7 +246,7 @@ BEGIN
     DECLARE @ERM_TicketID BIGINT =
         (SELECT ERM_TicketID AS TicketId FROM ERM.ERM_Ticket WHERE TicketNumber = @TicketNumber);
 
-    IF @ERM_TicketID IS NULL OR ERM.fn_UserOwnsTicket(@ERM_TicketID, @UserID, @UserName) = 0
+    IF @ERM_TicketID IS NULL OR ERM.fn_UserOwnsTicket(@ERM_TicketID, @UserProfileID) = 0
     BEGIN
         SELECT 0 AS RowsWritten;
         RETURN;
@@ -272,9 +268,29 @@ BEGIN
     BEGIN TRANSACTION;
 
         INSERT ERM.ERM_TicketComment
-            (ERM_TicketID, AuthorUserID, AuthorUserName, AuthorRole, CommentText, IsCustomerVisible, CreatedUtc)
+            (ERM_TicketID, AuthorUserProfileID, AuthorUserName, AuthorRole, CommentText,
+             IsCustomerVisible, CreatedUtc, CreatedBy)
         VALUES
-            (@ERM_TicketID, @UserID, @UserName, N'reporter', @CommentText, 1, @Now);
+            (@ERM_TicketID, @UserProfileID, @UserName, N'reporter', @CommentText, 1, @Now,
+             @UserProfileID);
+
+        /* The assignee is the one waiting on this reply. Enqueued inside the
+           transaction, so a rolled-back reply never announces itself. */
+        IF OBJECT_ID(N'ERM.usp_Notification_Enqueue', N'P') IS NOT NULL
+        BEGIN
+            DECLARE @ReplyAssignee INT;
+            SELECT @ReplyAssignee = t.AssignedToUserProfileID
+            FROM ERM.ERM_Ticket t WHERE t.ERM_TicketID = @ERM_TicketID;
+
+            EXEC ERM.usp_Notification_Enqueue
+                 @RecipientUserProfileID = @ReplyAssignee,
+                 @EventKind    = N'user_replied',
+                 @ERM_TicketID = @ERM_TicketID,
+                 @TicketNumber = @TicketNumber,
+                 @Title        = N'A user has replied on a ticket assigned to you',
+                 @Body         = @TicketNumber,
+                 @ActedByUserProfileID = @UserProfileID;
+        END
 
         /* A reply from the user un-blocks support.  Moving the ticket out of
            the paused status automatically is the difference between a queue
@@ -304,7 +320,7 @@ BEGIN
                 EXEC ERM.usp_Ticket_ChangeStatus
                      @ERM_TicketID          = @ERM_TicketID,
                      @ToStatusID        = @InProgressId,
-                     @ChangedByUserID   = @UserID,
+                     @ChangedByUserProfileID = @UserProfileID,
                      @ChangedByUserName = @UserName,
                      @Comments          = N'Reporter replied with the requested information.',
                      @IsCustomerVisible = 1;
@@ -321,5 +337,6 @@ MERGE ERM.ERM_SchemaVersion AS t
 USING (SELECT N'007_end_user_ticket_access.sql' AS ScriptName) AS s
     ON t.ScriptName = s.ScriptName
 WHEN NOT MATCHED THEN
-    INSERT (ScriptName, FrameworkVersion) VALUES (s.ScriptName, N'1.1.0');
+    INSERT (ScriptName, FrameworkVersion, CreatedBy)
+    VALUES (s.ScriptName, N'1.1.0', ERM.fn_SystemUserID());
 GO

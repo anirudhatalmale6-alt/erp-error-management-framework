@@ -28,6 +28,7 @@ new schema.
 | `007_end_user_ticket_access.sql` | "My Tickets", with ownership enforced in SQL | yes |
 | `010_search_performance.sql` | server-side sorting, keyset paging, supporting indexes | yes |
 | `011_support_access_and_manual_tickets.sql` | support roster/roles, audited assignment, manual tickets | yes |
+| `012_notifications.sql` | ticket-notification outbox + the adapter into your own notification system | yes |
 | `008_optional_swallowed_sql_errors.sql` | Extended Events capture of errors swallowed inside procedures | **no** |
 | `009_optional_catch_block_helper.sql` | one-line capture from an existing `CATCH` block | **no** |
 
@@ -43,16 +44,29 @@ update.
 
 ## 2. Two things to set before anything runs
 
-**The system user id.** Every table has `CreatedBy INT NOT NULL`, per the
-LinkedScam standard, but the framework writes rows with no ERP user behind them
-— errors from public pages, occurrences written by the capture pipeline, seed
-data, tickets raised by an automatic rule. A reserved id covers those:
+**Nothing.** `CreatedBy` and `UpdatedBy` carry no default, per ATC's rule: the
+caller supplies the ERP `UserProfileID` the API and the procedures already
+receive. Rows with no user behind them — public pages, seed data, the retention
+job, tickets raised by an automatic rule — use ATC's non-user value, `-1`, which
+`ERM.fn_SystemUserID()` names in one place.
 
-```sql
-ALTER FUNCTION ERM.fn_SystemUserID() RETURNS INT AS BEGIN RETURN <your id> END;
-```
+That is enforced rather than intended: the verification suite walks the parse
+tree of every script and fails if an `INSERT` into an `ERM` table omits
+`CreatedBy`, or if a default ever reappears on either column.
 
-Ships as `0`. Set it to whatever your reserved system/service user is.
+**Where the UserProfileID comes from.** Angular takes it from
+`generic_service.GetUserProfileKey()` via `userProvider`. The API takes it from
+your existing request context — set `ErrorCaptureOptions.UserProfileIdProvider`
+to whatever your controllers already read `CreatedBy` / `UpdatedBy` /
+`UserProfileID` from. Failing that it reads a `UserProfileID` header, then a
+claim. The client's own claim is never trusted: whatever the browser sends is
+overwritten server-side, or discarded.
+
+**The notification adapter.** `ERM.usp_Notification_ErpAdapter` in `012` is the
+ONE place your existing notification system is called from. It ships as a no-op
+that reports "not wired up" rather than a guess at your signature — a stub that
+pretended to succeed would show every notification as delivered while nobody was
+ever told anything. Replace its body with your own call. Nothing else changes.
 
 **The application login.** Edit `@AppUser` at the top of `006_security.sql`
 before running it. The application needs `EXECUTE` on `ERM` and nothing else —
@@ -64,15 +78,15 @@ every stack trace and SQL object name in the system.
 
 ## 3. Test deployment
 
-1. Run `001` … `007`, then `010`, `011`.
+1. Run `001` … `007`, then `010`, `011`, `012`.
 2. Confirm the ledger: `SELECT * FROM ERM.ERM_SchemaVersion ORDER BY ScriptName;`
-   — nine rows.
+   — ten rows.
 3. Set `fn_SystemUserID` and run `006` with your real `@AppUser`.
 4. Add your support staff so the console is reachable:
 
 ```sql
-INSERT ERM.ERM_SupportUser (UserName, DisplayName, RoleID)
-VALUES (N'<login>', N'<name>', 2);   -- 2 = support_lead
+INSERT ERM.ERM_SupportUser (UserProfileID, UserName, DisplayName, RoleID, CreatedBy)
+VALUES (<their UserProfileID>, N'<login>', N'<name>', 2, -1);   -- 2 = support_lead
 ```
 
    Nobody can open the support console until there is a roster row — the
@@ -140,7 +154,7 @@ yours, and it is the highest-value single check in Test.
 
 Not a date. Move when these are true:
 
-- [ ] All nine required scripts ran clean on Test, ledger complete.
+- [ ] All ten required scripts ran clean on Test, ledger complete.
 - [ ] `ERM_DeadLetter` empty, or every row understood.
 - [ ] No duplicate or malformed reference codes after a period of real load.
 - [ ] The recurring-problems report is readable rather than a wall of noise — if
@@ -153,7 +167,10 @@ Not a date. Move when these are true:
       trail checked.
 - [ ] A normal ERP user has been confirmed to get `403` from the admin API — not
       just a hidden menu item.
-- [ ] `fn_SystemUserID` returns your real id, not `0`.
+- [ ] Notifications: `ERM.usp_Notification_ErpAdapter` wired to your own system,
+      and `SELECT * FROM ERM.ERM_NotificationOutbox WHERE DeliveryState <> 'sent'`
+      is empty or understood. Until it is wired, every row sits at `pending`
+      with the reason on it — which is the intended, visible failure.
 - [ ] `capture.storeRequestBody` / `storeResponseBody` reviewed against what
       your payloads actually contain, and the redaction allow-list extended for
       any field you want kept in full.

@@ -80,7 +80,20 @@ namespace Erp.ErrorManagement
 
     public class UserContext
     {
-        [JsonProperty("id")]          public string Id { get; set; }
+        /// <summary>
+        /// The ERP's own UserProfileID - the value
+        /// <c>generic_service.GetUserProfileKey()</c> returns in Angular, and the
+        /// value ATC's APIs and stored procedures already pass around as
+        /// CreatedBy / UpdatedBy / UserProfileID.
+        ///
+        /// -1 means there is no ERP user behind this error: a public page, or a
+        /// browser with no token. It is never null on the wire, because a
+        /// missing value and "no user" are the same thing here and having two
+        /// spellings of it invites a null check somebody forgets.
+        /// </summary>
+        [JsonProperty("profileId")]   public int ProfileId { get; set; } = ErpUser.None;
+
+        /// <summary>Display text only. Never used to identify or authorise.</summary>
         [JsonProperty("name")]        public string Name { get; set; }
         [JsonProperty("displayName")] public string DisplayName { get; set; }
         [JsonProperty("tenantId")]    public string TenantId { get; set; }

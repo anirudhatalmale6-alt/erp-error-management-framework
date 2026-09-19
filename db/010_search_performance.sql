@@ -78,7 +78,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_SortWhitelist_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_SortWhitelist_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_SortWhitelist_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_SortWhitelist_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -99,7 +99,7 @@ USING (VALUES
     (N'error',   N'severity',         N'sv.RankOrder ASC, o.OccurredUtc DESC, o.ERM_ErrorOccurrenceID DESC', 0),
     (N'error',   N'module',           N'o.ErpModule ASC, o.OccurredUtc DESC, o.ERM_ErrorOccurrenceID DESC', 0),
     (N'error',   N'screen',           N'o.Screen ASC, o.OccurredUtc DESC, o.ERM_ErrorOccurrenceID DESC', 0),
-    (N'error',   N'user',             N'o.UserName ASC, o.OccurredUtc DESC, o.ERM_ErrorOccurrenceID DESC', 0),
+    (N'error',   N'user',             N'o.UserName ASC, o.UserProfileID ASC, o.OccurredUtc DESC, o.ERM_ErrorOccurrenceID DESC', 0),
     (N'error',   N'frequency',        N'f.OccurrenceCount DESC, o.OccurredUtc DESC, o.ERM_ErrorOccurrenceID DESC', 0),
     (N'error',   N'layer',            N'l.LayerID ASC, o.OccurredUtc DESC, o.ERM_ErrorOccurrenceID DESC', 0),
 
@@ -128,8 +128,8 @@ USING (VALUES
 WHEN MATCHED THEN
     UPDATE SET OrderByClause = s.OrderByClause, IsDefault = s.IsDefault
 WHEN NOT MATCHED THEN
-    INSERT (ListName, SortKey, OrderByClause, IsDefault)
-    VALUES (s.ListName, s.SortKey, s.OrderByClause, s.IsDefault);
+    INSERT (ListName, SortKey, OrderByClause, IsDefault, CreatedBy)
+    VALUES (s.ListName, s.SortKey, s.OrderByClause, s.IsDefault, ERM.fn_SystemUserID());
 GO
 
 CREATE OR ALTER FUNCTION ERM.fn_ResolveSort
@@ -687,5 +687,6 @@ MERGE ERM.ERM_SchemaVersion AS t
 USING (SELECT N'010_search_performance.sql' AS ScriptName) AS s
     ON t.ScriptName = s.ScriptName
 WHEN NOT MATCHED THEN
-    INSERT (ScriptName, FrameworkVersion) VALUES (s.ScriptName, N'1.2.0');
+    INSERT (ScriptName, FrameworkVersion, CreatedBy)
+    VALUES (s.ScriptName, N'1.2.0', ERM.fn_SystemUserID());
 GO

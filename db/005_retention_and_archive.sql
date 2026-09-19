@@ -93,7 +93,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_RetentionRunLog_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_RetentionRunLog_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_RetentionRunLog_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_RetentionRunLog_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -147,7 +147,8 @@ BEGIN
         SET @cutoff      = CASE WHEN @archDays  > 0 THEN DATEADD(DAY, -@archDays,  @Now) END;
         SET @purgeCutoff = CASE WHEN @purgeDays > 0 THEN DATEADD(DAY, -@purgeDays, @Now) END;
 
-        INSERT ERM.ERM_RetentionRunLog (DataSet) VALUES (@ds);
+        /* A scheduled job has no ERP user behind it. */
+        INSERT ERM.ERM_RetentionRunLog (DataSet, CreatedBy) VALUES (@ds, ERM.fn_SystemUserID());
         SET @ERM_RetentionRunLogID = SCOPE_IDENTITY();
 
         BEGIN TRY
@@ -419,5 +420,6 @@ MERGE ERM.ERM_SchemaVersion AS t
 USING (SELECT N'005_retention_and_archive.sql' AS ScriptName) AS s
     ON t.ScriptName = s.ScriptName
 WHEN NOT MATCHED THEN
-    INSERT (ScriptName, FrameworkVersion) VALUES (s.ScriptName, N'1.0.0');
+    INSERT (ScriptName, FrameworkVersion, CreatedBy)
+    VALUES (s.ScriptName, N'1.0.0', ERM.fn_SystemUserID());
 GO

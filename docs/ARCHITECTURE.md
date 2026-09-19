@@ -678,7 +678,7 @@ the `RequiresComment` / `RequiresAssignee` flags on each one.
 
 ## 11. What is verified, and how
 
-`dotnet run --project dotnet/Erp.ErrorManagement.Tests` — 146 checks, all
+`dotnet run --project dotnet/Erp.ErrorManagement.Tests` — 186 checks, all
 passing:
 
 * **All six T-SQL scripts parse** against the real SQL Server 2016 grammar,
@@ -729,8 +729,9 @@ Stated plainly, because these are the things that matter at review time.
 
 1. **The T-SQL has been parsed, not executed.** I have no SQL Server instance.
    Syntax is verified against the real grammar; semantics are not. Run
-   `db/001…006` on a development database before production — I expect them to
+   `db/001…012` on a development database before production — I expect them to
    run clean, but "I expect" is not "I verified", and I would rather say so.
+   This is milestone row 49, and it stays open until there is a Test database.
 2. **The demo store is SQLite.** `demo/api` re-implements the procedure logic
    over SQLite so the framework can be seen working without a database server.
    It mirrors the T-SQL; it does not test it.
@@ -743,9 +744,17 @@ Stated plainly, because these are the things that matter at review time.
    maps enabled this is the class name; without them it is a stable but opaque
    token. Route-level `screen` is unaffected and is usually the more useful
    field anyway.
-6. **Answered as of 16 September.** JWT with public pages → §4.5. Mixed
+6. **Answered as of 19 September.** JWT with public pages → §4.5. Mixed
    NgModule + standalone → §4.2a. No external helpdesk, so this framework is
-   the system of record → §13.
+   the system of record → §13. `CreatedBy` has no default and the identity is
+   the ERP `UserProfileID` → §17. Notifications go through the ERP's own
+   system → §18.
+
+6a. **The notification adapter is not wired up, and cannot be by me.**
+   `ERM.usp_Notification_ErpAdapter` is a documented no-op until somebody with
+   the signature of your notification procedure fills in its body. Until then
+   every outbox row sits at `pending` carrying that reason — visibly unwired
+   rather than silently undelivered.
 
 7. **Route protection outside Web API's filter pipeline.** If the ERP guards
    routes with a custom HTTP module or IIS rules rather than a global authorize
@@ -1230,7 +1239,153 @@ reason.
 
 Twenty checks in the suite, so the standards stay applied rather than being a
 one-off tidy-up: no `erp_err` anywhere, every table `ERM.ERM_*`, all nine
-standard columns present and correctly ordered on every declared table, the
-system-user default present and constant, UTC timestamps, the reference format,
-separate per-type counters, the atomic increment, the absence of `SELECT MAX`,
-and the absence of the old sequence.
+standard columns present and correctly ordered on every declared table, UTC
+timestamps, the reference format, separate per-type counters, the atomic
+increment, the absence of `SELECT MAX`, and the absence of the old sequence.
+
+
+---
+
+## 17. `CreatedBy` / `UpdatedBy`, and the one user identity
+
+Two decisions from ATC, taken together because they are the same decision.
+
+### 17.1 No default on `CreatedBy` or `UpdatedBy`
+
+> "We do NOT use a default value for `CreatedBy` or `UpdatedBy` columns... For
+> ERM records generated from a user action, please use the available ERP
+> UserProfileID. For errors/events where no ERP UserProfileID is available, such
+> as unauthenticated/public pages, use `-1`."
+
+Every default constraint on those two columns is gone. `-1` is named once, by
+`ERM.fn_SystemUserID()`, so the constant appears in one place rather than in
+ninety `INSERT` statements.
+
+**Removing the default is the easy half.** The half that bites is that every
+`INSERT` must now name the column, and a missed one does not produce a wrong
+value — it produces
+
+```
+Cannot insert the value NULL into column 'CreatedBy'
+```
+
+at run time, on the capture path. That path is deliberately built to fail
+quietly so it can never break the ERP, so the symptom would not be an error. It
+would be *no errors*, for ever, and nothing saying so.
+
+Grep cannot answer "does this `INSERT` name `CreatedBy`" — that is a question
+about a statement, and the statements span many lines with comments in between.
+So the suite parses every script with ScriptDom and walks the tree: 63 `INSERT`
+and `MERGE` targets into `ERM` tables, each checked for the column, plus a check
+that no table has grown a default back. It found 33 sites when the defaults came
+off, which is 33 run-time failures that never happened.
+
+Archive tables are exempt, deliberately: they are created with `SELECT TOP 0 *
+INTO`, and the retention job moves rows with `INSERT ... SELECT source.*`, which
+carries the original `CreatedBy` across untouched. An archived row must keep the
+user who created it, not acquire the identity of the 02:00 job that moved it.
+
+### 17.2 One identity: the ERP `UserProfileID`
+
+> "Please integrate with the backend/API's existing user context/request values
+> rather than introducing a separate user-ID mapping."
+
+The framework used to store a text user id lifted from a JWT claim
+(`sub` / `NameIdentifier`). That was precisely the separate mapping: a second
+identifier for the same person, which is a second thing to keep in step, and
+which would have been wrong exactly when it mattered — when somebody is trying
+to establish who hit a fault.
+
+It is gone. The identity is ATC's integer `UserProfileID`, end to end:
+
+| Layer | Where it comes from |
+|---|---|
+| Angular | `userProvider: () => ({ profileId: generic_service.GetUserProfileKey() })` |
+| Web API 2 | `ErrorCaptureOptions.UserProfileIdProvider` — point it at the request context your controllers already read `CreatedBy` / `UpdatedBy` / `UserProfileID` from. Then a `UserProfileID` header, then a claim. |
+| SQL | `@UserProfileID` / `@ReportedByUserProfileID` / `@ChangedByUserProfileID` parameters |
+
+`ReportedByUserID`, `AssignedToUserID`, `ChangedByUserID` and `AuthorUserID` are
+now `...UserProfileID` integers. `UserName` survives **as display text only** —
+never joined on, never filtered on, never used to authorise.
+
+Three consequences worth stating, because each fixes something that was wrong:
+
+**Ownership no longer has a second door.** `fn_UserOwnsTicket` used to match on
+the user id *or* the user name, to survive a token-format migration. For an
+authorisation predicate that is the wrong trade: a display name is not unique,
+is not stable, and is editable. One key, and it is the ERP's own.
+
+**Distinct-user counts are on the id.** Two people can share a display name and
+one person can have theirs corrected; either would quietly corrupt "how many
+users does this affect" — the number that decides whether a problem gets fixed.
+`-1` is excluded, or every anonymous visitor would look like the same one user.
+
+**The client cannot assert an identity.** The browser sends `profileId` so that
+an error on a public page still carries what the page knew. The server
+*overwrites* it from the request context, and where there is no context it
+forces `-1` rather than believing the payload. Otherwise any browser could post
+someone else's id and file errors — or tickets — in their name.
+
+`-1` is not a user. It can own nothing, and it cannot hold support rights: the
+roster has `CHECK (UserProfileID > 0)` and both SQL predicates refuse anything
+`<= 0`. Without that, every unauthenticated caller would share one identity, and
+that identity would own every ticket raised from a public page.
+
+---
+
+## 18. Notifications
+
+> "We already have an existing ERP notification system for logged-in users...
+> we do not want to introduce Teams or a separate SMTP notification system."
+
+So the framework adds **no delivery channel at all**. `db/012_notifications.sql`
+adds the two things that were actually missing.
+
+### 18.1 An outbox, not a direct call
+
+The obvious implementation calls the notification system from inside
+`usp_Ticket_ChangeStatus`. Do not: that call then runs inside the ticket
+transaction, so a slow notification system makes changing a ticket slow, and a
+throwing one **rolls back the status change** — a notification failure undoing
+the work it was supposed to announce.
+
+An outbox row is written in the same transaction, so it is exactly as durable as
+the status change and can never announce something that did not happen. Delivery
+is a separate step that can fail, retry and be monitored without touching the
+ticket.
+
+### 18.2 One adapter, and no dynamic dispatch
+
+`ERM.usp_Notification_ErpAdapter` is the only place your notification system is
+called from. Replace its body; nothing else changes.
+
+An earlier draft read the target procedure's *name* from a settings row and
+called it with `sp_executesql`, so it could be repointed without an `ALTER`.
+That is a configurable remote-code-execution hole in the one schema holding
+every stack trace in the system, bought to save one `ALTER PROCEDURE`. There is
+exactly one ERP here.
+
+It ships as a **no-op that reports failure**, not as a stub that returns
+success. A stub that pretended to work would show every row as delivered while
+nobody was ever told anything — discovered months later, from a complaint.
+
+### 18.3 What is announced, and to whom
+
+| Event | Recipient | Note |
+|---|---|---|
+| Ticket created | the reporter | Confirmation that it was received |
+| Status changed | the reporter | The **status**, never the comment |
+| Assigned | the **assignee** | The reporter is never told which engineer holds it |
+| Support replied | the reporter | Only when `IsCustomerVisible = 1` |
+| User replied | the assignee | The person waiting on it |
+
+Nobody is notified about their own action. Internal comments are never
+announced — notification is the one route that would otherwise bypass the
+`IsCustomerVisible` flag the panel respects.
+
+Every enqueue call is guarded by `OBJECT_ID(...) IS NOT NULL`, so a database
+without `012` still tickets normally rather than failing at run time.
+
+Row 41 of the milestone sheet is therefore built on the framework side. The
+remaining work is the body of one procedure, and it is yours because only you
+know the signature.

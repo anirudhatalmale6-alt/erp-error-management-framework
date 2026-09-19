@@ -13,10 +13,10 @@ namespace Erp.ErrorManagement
         Task<ErrorCaptureResult> CaptureAsync(ErrorEnvelope envelope, string source, CancellationToken ct = default);
 
         Task<TicketCreateResult> CreateTicketAsync(string errorReference, string userDescription,
-            string reportedByUserId, string reportedByUserName, CancellationToken ct = default);
+            int reportedByUserProfileId, string reportedByUserName, CancellationToken ct = default);
 
         /// <summary>The caller's own tickets. Scoped in SQL, never by a client parameter.</summary>
-        Task<List<UserTicketSummary>> ListTicketsForUserAsync(string userId, string userName,
+        Task<List<UserTicketSummary>> ListTicketsForUserAsync(int userProfileId,
             bool onlyOpen, int pageNumber, int pageSize, CancellationToken ct = default);
 
         /// <summary>
@@ -24,11 +24,11 @@ namespace Erp.ErrorManagement
         /// not exist OR does not belong to them - the two are deliberately
         /// indistinguishable to the caller.
         /// </summary>
-        Task<UserTicketDetail> GetTicketForUserAsync(string ticketNumber, string userId,
-            string userName, CancellationToken ct = default);
+        Task<UserTicketDetail> GetTicketForUserAsync(string ticketNumber, int userProfileId,
+            CancellationToken ct = default);
 
         /// <summary>The end user replying on their own ticket. False if not theirs.</summary>
-        Task<bool> AddUserCommentAsync(string ticketNumber, string userId, string userName,
+        Task<bool> AddUserCommentAsync(string ticketNumber, int userProfileId, string userName,
             string commentText, CancellationToken ct = default);
 
         /// <summary>
@@ -43,8 +43,8 @@ namespace Erp.ErrorManagement
         /// change, validates the target against the roster, and always writes a
         /// history row (including for reassignment).
         /// </summary>
-        Task<AssignResult> AssignTicketAsync(string ticketNumber, string assignToUserId,
-            string assignToUserName, string changedByUserId, string changedByUserName,
+        Task<AssignResult> AssignTicketAsync(string ticketNumber, int? assignToUserProfileId,
+            int changedByUserProfileId, string changedByUserName,
             string comments, CancellationToken ct = default);
 
         Task<List<RequestCategoryOption>> ListRequestCategoriesAsync(CancellationToken ct = default);
@@ -60,7 +60,7 @@ namespace Erp.ErrorManagement
         [JsonProperty("severityCode")]    public string SeverityCode { get; set; }
 
         /// <summary>Set server-side from the token. Never accepted from the client.</summary>
-        [JsonIgnore] public string ReportedByUserId { get; set; }
+        [JsonIgnore] public int ReportedByUserProfileId { get; set; } = ErpUser.None;
         [JsonIgnore] public string ReportedByUserName { get; set; }
         [JsonIgnore] public string Environment { get; set; }
         [JsonIgnore] public string CreatedVia { get; set; } = "user";
@@ -173,7 +173,7 @@ namespace Erp.ErrorManagement
         }
 
         public async Task<TicketCreateResult> CreateTicketAsync(string errorReference, string userDescription,
-            string reportedByUserId, string reportedByUserName, CancellationToken ct = default)
+            int reportedByUserProfileId, string reportedByUserName, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(errorReference)) return null;
 
@@ -206,8 +206,8 @@ namespace Erp.ErrorManagement
                         command.Parameters.Add("@CreatedVia", SqlDbType.NVarChar, 20).Value = "user";
                         command.Parameters.Add("@UserDescription", SqlDbType.NVarChar, -1).Value =
                             (object)Redactor.ScrubText(userDescription, 4000) ?? DBNull.Value;
-                        command.Parameters.Add("@ReportedByUserId", SqlDbType.NVarChar, 128).Value =
-                            (object)reportedByUserId ?? DBNull.Value;
+                        command.Parameters.Add("@ReportedByUserProfileID", SqlDbType.Int).Value =
+                            ErpUser.IsReal(reportedByUserProfileId) ? (object)reportedByUserProfileId : DBNull.Value;
                         command.Parameters.Add("@ReportedByUserName", SqlDbType.NVarChar, 200).Value =
                             (object)reportedByUserName ?? DBNull.Value;
                         command.Parameters.Add("@QueueId", SqlDbType.SmallInt).Value = DBNull.Value;
@@ -244,11 +244,11 @@ namespace Erp.ErrorManagement
         }
 
         public async Task<List<UserTicketSummary>> ListTicketsForUserAsync(
-            string userId, string userName, bool onlyOpen, int pageNumber, int pageSize,
+            int userProfileId, bool onlyOpen, int pageNumber, int pageSize,
             CancellationToken ct = default)
         {
             var result = new List<UserTicketSummary>();
-            if (userId == null && userName == null) return result;
+            if (!ErpUser.IsReal(userProfileId)) return result;
 
             try
             {
@@ -257,8 +257,7 @@ namespace Erp.ErrorManagement
                 {
                     command.CommandType = CommandType.StoredProcedure;
                     command.CommandTimeout = _options.CommandTimeoutSeconds;
-                    command.Parameters.Add("@UserId", SqlDbType.NVarChar, 128).Value = (object)userId ?? DBNull.Value;
-                    command.Parameters.Add("@UserName", SqlDbType.NVarChar, 200).Value = (object)userName ?? DBNull.Value;
+                    command.Parameters.Add("@UserProfileID", SqlDbType.Int).Value = userProfileId;
                     command.Parameters.Add("@OnlyOpen", SqlDbType.Bit).Value = onlyOpen;
                     command.Parameters.Add("@PageNumber", SqlDbType.Int).Value = pageNumber;
                     command.Parameters.Add("@PageSize", SqlDbType.Int).Value = pageSize;
@@ -299,7 +298,7 @@ namespace Erp.ErrorManagement
         }
 
         public async Task<UserTicketDetail> GetTicketForUserAsync(
-            string ticketNumber, string userId, string userName, CancellationToken ct = default)
+            string ticketNumber, int userProfileId, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(ticketNumber)) return null;
 
@@ -311,8 +310,7 @@ namespace Erp.ErrorManagement
                     command.CommandType = CommandType.StoredProcedure;
                     command.CommandTimeout = _options.CommandTimeoutSeconds;
                     command.Parameters.Add("@TicketNumber", SqlDbType.VarChar, 24).Value = ticketNumber;
-                    command.Parameters.Add("@UserId", SqlDbType.NVarChar, 128).Value = (object)userId ?? DBNull.Value;
-                    command.Parameters.Add("@UserName", SqlDbType.NVarChar, 200).Value = (object)userName ?? DBNull.Value;
+                    command.Parameters.Add("@UserProfileID", SqlDbType.Int).Value = userProfileId;
 
                     await connection.OpenAsync(ct).ConfigureAwait(false);
                     using (var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false))
@@ -386,7 +384,7 @@ namespace Erp.ErrorManagement
         }
 
         public async Task<bool> AddUserCommentAsync(
-            string ticketNumber, string userId, string userName, string commentText,
+            string ticketNumber, int userProfileId, string userName, string commentText,
             CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(ticketNumber) || string.IsNullOrWhiteSpace(commentText))
@@ -400,7 +398,7 @@ namespace Erp.ErrorManagement
                     command.CommandType = CommandType.StoredProcedure;
                     command.CommandTimeout = _options.CommandTimeoutSeconds;
                     command.Parameters.Add("@TicketNumber", SqlDbType.VarChar, 24).Value = ticketNumber;
-                    command.Parameters.Add("@UserId", SqlDbType.NVarChar, 128).Value = (object)userId ?? DBNull.Value;
+                    command.Parameters.Add("@UserProfileID", SqlDbType.Int).Value = userProfileId;
                     command.Parameters.Add("@UserName", SqlDbType.NVarChar, 200).Value = (object)userName ?? DBNull.Value;
                     // Scrubbed: the user is typing free text into a field that
                     // support will read and that may be exported. They will
@@ -448,8 +446,9 @@ namespace Erp.ErrorManagement
                         (object)request.ReportedScreen ?? DBNull.Value;
                     command.Parameters.Add("@Environment", SqlDbType.NVarChar, 40).Value =
                         (object)(request.Environment ?? _options.Environment) ?? DBNull.Value;
-                    command.Parameters.Add("@ReportedByUserId", SqlDbType.NVarChar, 128).Value =
-                        (object)request.ReportedByUserId ?? DBNull.Value;
+                    command.Parameters.Add("@ReportedByUserProfileID", SqlDbType.Int).Value =
+                        ErpUser.IsReal(request.ReportedByUserProfileId)
+                            ? (object)request.ReportedByUserProfileId : DBNull.Value;
                     command.Parameters.Add("@ReportedByUserName", SqlDbType.NVarChar, 200).Value =
                         (object)request.ReportedByUserName ?? DBNull.Value;
                     command.Parameters.Add("@CreatedVia", SqlDbType.NVarChar, 20).Value =
@@ -489,8 +488,8 @@ namespace Erp.ErrorManagement
             }
         }
 
-        public async Task<AssignResult> AssignTicketAsync(string ticketNumber, string assignToUserId,
-            string assignToUserName, string changedByUserId, string changedByUserName,
+        public async Task<AssignResult> AssignTicketAsync(string ticketNumber, int? assignToUserProfileId,
+            int changedByUserProfileId, string changedByUserName,
             string comments, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(ticketNumber)) return null;
@@ -503,12 +502,13 @@ namespace Erp.ErrorManagement
                     command.CommandType = CommandType.StoredProcedure;
                     command.CommandTimeout = _options.CommandTimeoutSeconds;
                     command.Parameters.Add("@TicketNumber", SqlDbType.VarChar, 24).Value = ticketNumber;
-                    command.Parameters.Add("@AssignToUserId", SqlDbType.NVarChar, 128).Value =
-                        (object)assignToUserId ?? DBNull.Value;
-                    command.Parameters.Add("@AssignToUserName", SqlDbType.NVarChar, 200).Value =
-                        (object)assignToUserName ?? DBNull.Value;
-                    command.Parameters.Add("@ChangedByUserId", SqlDbType.NVarChar, 128).Value =
-                        (object)changedByUserId ?? DBNull.Value;
+                    // NULL, not -1: null means unassign, and -1 would mean
+                    // "assign to the non-user", which the roster forbids.
+                    command.Parameters.Add("@AssignToUserProfileID", SqlDbType.Int).Value =
+                        assignToUserProfileId.HasValue && ErpUser.IsReal(assignToUserProfileId.Value)
+                            ? (object)assignToUserProfileId.Value : DBNull.Value;
+                    command.Parameters.Add("@ChangedByUserProfileID", SqlDbType.Int).Value =
+                        changedByUserProfileId;
                     command.Parameters.Add("@ChangedByUserName", SqlDbType.NVarChar, 200).Value =
                         (object)changedByUserName ?? DBNull.Value;
                     command.Parameters.Add("@Comments", SqlDbType.NVarChar, -1).Value =

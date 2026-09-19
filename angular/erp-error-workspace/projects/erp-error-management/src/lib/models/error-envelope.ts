@@ -46,8 +46,36 @@ export type ErpErrorCategory =
   | 'configuration'
   | 'unclassified';
 
+/**
+ * ATC's standard non-user value, used everywhere an ERP UserProfileID is
+ * expected but none exists. It is not a user: nothing is owned by it and it can
+ * hold no support rights.
+ */
+export const ERP_NO_USER = -1;
+
+/**
+ * Coerce whatever the host handed us into a storable UserProfileID.
+ * `0`, `null`, `undefined`, `NaN` and negatives all mean "no user".
+ */
+export function normalizeUserProfileId(value: number | null | undefined): number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : ERP_NO_USER;
+}
+
 export interface ErpErrorUserContext {
-  id?: string | null;
+  /**
+   * The ERP's own UserProfileID - what `generic_service.GetUserProfileKey()`
+   * returns, and the same value the API already receives as CreatedBy /
+   * UpdatedBy / UserProfileID.
+   *
+   * `-1` means there is no ERP user: a public page, or a session with no
+   * profile yet. Never null on the wire - "missing" and "no user" are the same
+   * thing here, and two spellings of it is one null check away from a bug.
+   *
+   * The server does not trust this value. It is sent so that an error captured
+   * on a public page still carries whatever the page knew, and it is overwritten
+   * server-side whenever the request context knows better.
+   */
+  profileId: number;
   name?: string | null;
   displayName?: string | null;
   tenantId?: string | null;

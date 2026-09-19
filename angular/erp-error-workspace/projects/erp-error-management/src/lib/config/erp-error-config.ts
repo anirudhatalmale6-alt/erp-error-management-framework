@@ -87,9 +87,19 @@ export interface ErpErrorConfig {
    * ERP stores identity somewhere different (JWT claim, session service, NgRx
    * store).  Called lazily, inside a try/catch - if it throws, capture
    * continues with an anonymous user rather than losing the error.
+   *
+   * In the LinkedScam ERP this is the existing global service:
+   *
+   *     userProvider: () => ({
+   *       profileId: generic_service.GetUserProfileKey(),
+   *       name: generic_service.GetUserName(),
+   *     }),
+   *
+   * `profileId` is the ERP UserProfileID. Return `-1`, or simply omit it, when
+   * there is no signed-in user - a public page, or before login completes.
    */
   userProvider?: () => {
-    id?: string | null;
+    profileId?: number | null;
     name?: string | null;
     displayName?: string | null;
     tenantId?: string | null;

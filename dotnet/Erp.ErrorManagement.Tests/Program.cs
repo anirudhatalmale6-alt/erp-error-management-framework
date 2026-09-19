@@ -47,6 +47,9 @@ namespace Erp.ErrorManagement.Tests
             RunSupportAccessChecks(Path.Combine(repoRoot, "db"), repoRoot);
             RunLinkedScamStandardsChecks(Path.Combine(repoRoot, "db"));
             RunSourceNamingChecks(repoRoot);
+            RunAuditColumnChecks(Path.Combine(repoRoot, "db"));
+            RunNotificationChecks(Path.Combine(repoRoot, "db"), repoRoot);
+            RunIdentityChecks(Path.Combine(repoRoot, "db"), repoRoot);
 
             Console.WriteLine();
             Console.WriteLine(_failures == 0
@@ -473,9 +476,17 @@ namespace Erp.ErrorManagement.Tests
             Check("ownership predicate exists", sql.Contains("fn_UserOwnsTicket"), true);
 
             var ownsFn = Section(sql, "FUNCTION ERM.fn_UserOwnsTicket");
+            // Stronger than it was: ownership used to be refused only for a
+            // NULL identity. It now also refuses -1, the non-user value - which
+            // matters because tickets raised from public pages carry -1, so a
+            // -1 caller owning "their" tickets would mean every anonymous
+            // visitor owning all of them.
             Check("an anonymous caller owns nothing",
-                ownsFn.Contains("@UserID IS NULL AND @UserName IS NULL") && ownsFn.Contains("RETURN 0"),
+                ownsFn.Contains("@UserProfileID IS NULL OR @UserProfileID <= 0") && ownsFn.Contains("RETURN 0"),
                 true);
+            Check("ownership is the ERP UserProfileID alone, with no name fallback",
+                ownsFn.Contains("t.ReportedByUserProfileID = @UserProfileID")
+                && !ownsFn.Contains("ReportedByUserName"), true);
 
             var getForUser = Section(sql, "PROCEDURE ERM.usp_Ticket_GetForUser");
             var addComment = Section(sql, "PROCEDURE ERM.usp_Ticket_AddUserComment");
@@ -629,6 +640,299 @@ namespace Erp.ErrorManagement.Tests
 
         /* ================== LinkedScam ERP standards compliance ========= */
 
+        /* ============================================ notifications (012) == */
+
+        /// <summary>
+        /// ATC's decision: no Teams, no SMTP, integrate with the ERP's existing
+        /// notification system. So the things worth proving are mostly about
+        /// what this must NOT do.
+        /// </summary>
+        private static void RunNotificationChecks(string dbFolder, string repoRoot)
+        {
+            Console.WriteLine("\n=== Notifications: the ERP's own system, nothing else ===");
+
+            var path = Path.Combine(dbFolder, "012_notifications.sql");
+            Check("012_notifications.sql exists", File.Exists(path), true);
+            if (!File.Exists(path)) return;
+
+            var sql = File.ReadAllText(path);
+            var stripped = StripSqlComments(sql);
+
+            // --- no channel of our own ---------------------------------------
+            foreach (var forbidden in new[] { "sp_send_dbmail", "smtp", "webhook", "outlook.office", "teams" })
+                Check($"no delivery channel of its own: {forbidden}",
+                    stripped.IndexOf(forbidden, StringComparison.OrdinalIgnoreCase) >= 0, false);
+
+            // --- and no dynamic dispatch -------------------------------------
+            // An earlier draft read the target procedure NAME from a settings
+            // row and called it with sp_executesql. That is a configurable
+            // remote-code-execution hole in the schema that holds every stack
+            // trace in the system.
+            Check("delivery is not dynamic SQL",
+                stripped.Contains("sp_executesql") || stripped.Contains("EXEC (@"), false);
+
+            // --- the adapter must not claim success before it is wired up ----
+            var adapter = Section(sql, "PROCEDURE ERM.usp_Notification_ErpAdapter");
+            Check("the adapter ships as a no-op", adapter.Contains("SET @Delivered = 0;"), true);
+            Check("...and says so rather than silently succeeding",
+                adapter.Contains("has not been wired up"), true);
+
+            // --- the outbox cannot hold the non-user value -------------------
+            Check("the non-user value cannot be a notification recipient",
+                stripped.Contains("CK_NotificationOutbox_RealUser CHECK (RecipientUserProfileID > 0)"), true);
+            Check("enqueue refuses a non-user recipient before the constraint has to",
+                stripped.Contains("IF @RecipientUserProfileID IS NULL OR @RecipientUserProfileID <= 0 RETURN;"), true);
+
+            // --- nobody is notified about their own action -------------------
+            Check("an actor is not notified about their own action",
+                stripped.Contains("IF @ActedByUserProfileID IS NOT NULL AND @ActedByUserProfileID = @RecipientUserProfileID RETURN;"),
+                true);
+
+            // --- a permanently failing row stops being retried ---------------
+            Check("delivery gives up after @MaxAttempts", stripped.Contains("AttemptCount < @MaxAttempts"), true);
+
+            // --- the enqueue calls must not hard-fail a ticket operation -----
+            var prog = File.ReadAllText(Path.Combine(dbFolder, "004_programmability.sql"));
+            var support = File.ReadAllText(Path.Combine(dbFolder, "011_support_access_and_manual_tickets.sql"));
+            var enduser = File.ReadAllText(Path.Combine(dbFolder, "007_end_user_ticket_access.sql"));
+            var callers = prog + support + enduser;
+
+            var enqueueCalls = System.Text.RegularExpressions.Regex.Matches(
+                callers, @"EXEC ERM\.usp_Notification_Enqueue").Count;
+            Check("ticket events actually enqueue notifications", enqueueCalls >= 4, true);
+
+            var guards = System.Text.RegularExpressions.Regex.Matches(
+                callers, @"OBJECT_ID\(N'ERM\.usp_Notification_Enqueue', N'P'\) IS NOT NULL").Count;
+            Check($"every enqueue is guarded, so a missing 012 cannot break ticketing " +
+                  $"({guards} guards for {enqueueCalls} calls)",
+                guards >= enqueueCalls, true);
+
+            // --- an INTERNAL comment must never be announced -----------------
+            var addComment = Section(prog, "PROCEDURE ERM.usp_Ticket_AddComment");
+            Check("only a customer-visible support reply is notified",
+                addComment.Contains("IF @AuthorRole = N'support' AND @IsCustomerVisible = 1"), true);
+
+            // POSITIVE CONTROL - these string checks must be able to fail.
+            Check("positive control: a channel that IS present is detected",
+                "EXEC msdb.dbo.sp_send_dbmail".IndexOf("sp_send_dbmail", StringComparison.OrdinalIgnoreCase) >= 0,
+                true);
+        }
+
+        /* ================================= one identity, and it is the ERP's = */
+
+        /// <summary>
+        /// ATC: "integrate with the backend/API's existing user context/request
+        /// values rather than introducing a separate user-ID mapping."
+        ///
+        /// The framework used to carry a text user id lifted from the JWT. These
+        /// checks assert it is gone, and - more importantly - that the one that
+        /// replaced it cannot be asserted by the client.
+        /// </summary>
+        private static void RunIdentityChecks(string dbFolder, string repoRoot)
+        {
+            Console.WriteLine("\n=== Identity: the ERP UserProfileID, and only that ===");
+
+            var db = string.Join("\n", Directory.GetFiles(dbFolder, "*.sql").OrderBy(f => f)
+                .Select(f => StripSqlComments(File.ReadAllText(f))));
+
+            // The old text id is gone from the schema entirely.
+            foreach (var gone in new[]
+                     {
+                         "ReportedByUserID ", "AssignedToUserID ", "ChangedByUserID ", "AuthorUserID ",
+                     })
+                Check($"the old text identity is gone: {gone.Trim()}", db.Contains(gone), false);
+
+            Check("the occurrence carries UserProfileID", db.Contains("UserProfileID       INT             NOT NULL"), true);
+
+            // Distinct-user counting must be on the id, not a display name -
+            // it is the number that decides whether a problem gets fixed.
+            Check("distinct users are counted on the id, not the name",
+                db.Contains("o.UserProfileID = (SELECT UserProfileID FROM @e)"), true);
+            Check("...and the non-user value is excluded from that count",
+                db.Contains("IF EXISTS (SELECT 1 FROM @e WHERE UserProfileID > 0)"), true);
+
+            // THE one that matters: the client cannot assert who it is.
+            var capture = File.ReadAllText(Path.Combine(repoRoot, "dotnet",
+                "Erp.ErrorManagement.Core", "ErrorCaptureService.cs"));
+            Check("the server overwrites the client's claimed identity",
+                capture.Contains("envelope.User.ProfileId = ErpUser.Normalize(serverUser.ProfileId);"), true);
+            Check("...and discards it entirely when there is no server context",
+                capture.Contains("envelope.User.ProfileId = ErpUser.None;"), true);
+
+            // The end user's view must filter on visibility, not merely omit a
+            // name: the assignment row's own comment names the engineer.
+            var demoStore = File.ReadAllText(Path.Combine(repoRoot, "demo", "api", "DemoStore.cs"));
+            var endUserView = demoStore.Substring(
+                demoStore.IndexOf("public object? GetTicketForUser", StringComparison.Ordinal));
+            Check("the end-user view filters history on IsCustomerVisible",
+                endUserView.Contains("FROM TicketHistory WHERE TicketId = $t AND IsCustomerVisible = 1"), true);
+            Check("the end-user view filters comments on IsCustomerVisible",
+                endUserView.Contains("FROM TicketComment WHERE TicketId = $t AND IsCustomerVisible = 1"), true);
+
+            // POSITIVE CONTROL
+            Check("positive control: a present identity string IS detected",
+                "ReportedByUserID NVARCHAR(128)".Contains("ReportedByUserID "), true);
+        }
+
+        /* ======================================= CreatedBy / UpdatedBy rule == */
+
+        /// <summary>
+        /// ATC's rule: CreatedBy and UpdatedBy carry NO default constraint. The
+        /// caller supplies the ERP UserProfileID, or -1 where there is no user.
+        ///
+        /// Removing a default is the easy half. The half that bites is that
+        /// every INSERT must now name the column - and a missed one does not
+        /// show up as a wrong value, it shows up as
+        /// "Cannot insert the value NULL into column 'CreatedBy'" at run time,
+        /// on the capture path, which is built to fail silently. So the failure
+        /// mode of getting this wrong is: no errors are ever recorded, and
+        /// nothing says so.
+        ///
+        /// Grep cannot answer this - "does this INSERT name CreatedBy" is a
+        /// question about a statement, not a line, and the statements span
+        /// several lines with comments in between. So this walks the real parse
+        /// tree instead, the same one SQL Server builds.
+        /// </summary>
+        private static void RunAuditColumnChecks(string dbFolder)
+        {
+            Console.WriteLine("\n=== CreatedBy / UpdatedBy: no defaults, always supplied ===");
+
+            var scripts = Directory.GetFiles(dbFolder, "*.sql").OrderBy(f => f).ToList();
+
+            // --- 1. no default constraint anywhere on either column -----------
+            var withDefaults = new List<string>();
+            var missing = new List<string>();
+            var inserts = 0;
+
+            foreach (var path in scripts)
+            {
+                var parser = new TSql130Parser(initialQuotedIdentifiers: true);
+                TSqlFragment tree;
+                using (var reader = new StreamReader(path))
+                    tree = parser.Parse(reader, out IList<ParseError> errs);
+
+                var visitor = new AuditColumnVisitor(Path.GetFileName(path));
+                tree.Accept(visitor);
+
+                withDefaults.AddRange(visitor.DefaultedAuditColumns);
+                missing.AddRange(visitor.InsertsMissingCreatedBy);
+                inserts += visitor.InsertsChecked;
+            }
+
+            Check(withDefaults.Count == 0
+                    ? "no table defines a default on CreatedBy or UpdatedBy"
+                    : $"no table defines a default on CreatedBy or UpdatedBy (found: {string.Join(", ", withDefaults)})",
+                withDefaults.Count, 0);
+
+            Check("there are INSERTs into ERM tables to check", inserts > 25, true);
+
+            Check(missing.Count == 0
+                    ? $"every INSERT into an ERM table supplies CreatedBy ({inserts} statements)"
+                    : $"every INSERT into an ERM table supplies CreatedBy (missing in: {string.Join("; ", missing)})",
+                missing.Count, 0);
+
+            // --- 2. the non-user value is ATC's -1 ---------------------------
+            var config = File.ReadAllText(Path.Combine(dbFolder, "001_schema_and_config.sql"));
+            Check("the non-user value is -1, per ATC", config.Contains("RETURN -1;"), true);
+            Check("fn_SystemUserID is CREATE OR ALTER, so a re-run updates a stale environment",
+                config.Contains("CREATE OR ALTER FUNCTION ERM.fn_SystemUserID"), true);
+
+            // POSITIVE CONTROL - the visitor must be able to SEE a bad INSERT.
+            var rigged = new TSql130Parser(true);
+            var riggedTree = rigged.Parse(
+                new StringReader("INSERT ERM.ERM_Ticket (Title, CreatedDate) VALUES (N'x', GETUTCDATE());"),
+                out IList<ParseError> _);
+            var riggedVisitor = new AuditColumnVisitor("positive-control");
+            riggedTree.Accept(riggedVisitor);
+            Check("positive control: an INSERT that omits CreatedBy IS detected",
+                riggedVisitor.InsertsMissingCreatedBy.Count, 1);
+
+            var riggedOk = new TSql130Parser(true);
+            var okTree = riggedOk.Parse(
+                new StringReader("INSERT ERM.ERM_Ticket (Title, CreatedBy) VALUES (N'x', -1);"),
+                out IList<ParseError> _);
+            var okVisitor = new AuditColumnVisitor("positive-control");
+            okTree.Accept(okVisitor);
+            Check("positive control: an INSERT that supplies CreatedBy is NOT flagged",
+                okVisitor.InsertsMissingCreatedBy.Count, 0);
+        }
+
+        /// <summary>
+        /// Walks CREATE TABLE definitions looking for defaults on the two audit
+        /// columns, and every INSERT / MERGE-INSERT targeting an ERM table
+        /// looking for a CreatedBy in the column list.
+        /// </summary>
+        private sealed class AuditColumnVisitor : TSqlFragmentVisitor
+        {
+            private readonly string _file;
+            public AuditColumnVisitor(string file) { _file = file; }
+
+            public List<string> DefaultedAuditColumns { get; } = new List<string>();
+            public List<string> InsertsMissingCreatedBy { get; } = new List<string>();
+            public int InsertsChecked { get; private set; }
+
+            public override void Visit(CreateTableStatement node)
+            {
+                var table = Name(node.SchemaObjectName);
+                foreach (var col in node.Definition.ColumnDefinitions)
+                {
+                    var name = col.ColumnIdentifier.Value;
+                    if (!name.Equals("CreatedBy", StringComparison.OrdinalIgnoreCase) &&
+                        !name.Equals("UpdatedBy", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    if (col.DefaultConstraint != null)
+                        DefaultedAuditColumns.Add($"{_file}:{table}.{name}");
+                }
+            }
+
+            public override void Visit(InsertSpecification node) => CheckInsert(
+                node.Target as NamedTableReference, node.Columns);
+
+            public override void Visit(MergeSpecification node)
+            {
+                var target = node.Target as NamedTableReference;
+                foreach (var clause in node.ActionClauses)
+                    if (clause.Action is InsertMergeAction ins)
+                        CheckInsert(target, ins.Columns);
+            }
+
+            private void CheckInsert(NamedTableReference target, IList<ColumnReferenceExpression> columns)
+            {
+                if (target == null) return;
+                var table = Name(target.SchemaObject);
+
+                // Only the framework's own tables. Temp tables and table
+                // variables have no audit columns and are not the standard's
+                // concern.
+                if (!table.StartsWith("ERM.ERM_", StringComparison.OrdinalIgnoreCase)) return;
+
+                // Archive tables are exempt, and deliberately so. They are
+                // created by SELECT TOP 0 * INTO, so they are column-for-column
+                // copies, and the retention job moves rows with
+                // INSERT ... SELECT source.*, @Now - which carries the original
+                // CreatedBy across untouched. That is what we want: an archived
+                // row must keep the user who created it, not acquire the
+                // identity of the 02:00 job that moved it. Naming columns there
+                // would also mean listing forty of them in two places and
+                // keeping both in step by hand.
+                if (table.EndsWith("_Archive", StringComparison.OrdinalIgnoreCase)) return;
+
+                InsertsChecked++;
+
+                var named = columns
+                    .Select(c => c.MultiPartIdentifier?.Identifiers?.LastOrDefault()?.Value)
+                    .Where(v => v != null)
+                    .ToList();
+
+                if (!named.Any(v => v.Equals("CreatedBy", StringComparison.OrdinalIgnoreCase)))
+                    InsertsMissingCreatedBy.Add($"{_file}:{target.StartLine} -> {table}");
+            }
+
+            private static string Name(SchemaObjectName n) =>
+                string.Join(".", new[] { n.SchemaIdentifier?.Value, n.BaseIdentifier?.Value }
+                    .Where(v => !string.IsNullOrEmpty(v)));
+        }
+
         /// <summary>
         /// The standards check above reads db/*.sql only, which leaves a gap:
         /// the application code REFERS to database objects by name, in string
@@ -750,10 +1054,14 @@ namespace Erp.ErrorManagement.Tests
             Check("standard columns are in the prescribed order",
                 wrongOrder.Count == 0 ? "correct" : string.Join(", ", wrongOrder), "correct");
 
-            Check("CreatedBy has a system-user default, so framework rows satisfy NOT NULL",
-                all.Contains("DEFAULT (ERM.fn_SystemUserID())"), true);
+            // ATC's rule reverses what this used to assert: CreatedBy carries
+            // NO default and the caller supplies it. The "every INSERT names it"
+            // half is enforced over the parse tree in RunAuditColumnChecks.
+            Check("CreatedBy is NOT NULL and carries no default",
+                all.Contains("[CreatedBy]   INT      NOT NULL,")
+                && !all.Contains("CreatedBy DEFAULT"), true);
             Check("the system user id is a constant, not a per-row table read",
-                System.Text.RegularExpressions.Regex.IsMatch(all, @"fn_SystemUserID[\s\S]{0,400}?RETURN 0;"), true);
+                System.Text.RegularExpressions.Regex.IsMatch(all, @"fn_SystemUserID[\s\S]{0,400}?RETURN -1;"), true);
             Check("timestamps use the UTC standard",
                 all.Contains("DEFAULT (GETUTCDATE())"), true);
 
@@ -809,7 +1117,11 @@ namespace Erp.ErrorManagement.Tests
             var cap = Section(sql, "FUNCTION ERM.fn_SupportCapability");
             Check("capability check exists", cap.Length > 0, true);
             Check("no identity -> no capability (fails closed)",
-                cap.Contains("@UserID IS NULL AND @UserName IS NULL") && cap.Contains("RETURN 0"), true);
+                cap.Contains("@UserProfileID IS NULL OR @UserProfileID <= 0") && cap.Contains("RETURN 0"), true);
+            // The non-user value must not be able to hold support rights, or
+            // every unauthenticated caller is an administrator.
+            Check("the roster cannot contain the non-user value at all",
+                sql.Contains("CK_SupportUser_RealUser CHECK (UserProfileID > 0)"), true);
             Check("an unknown capability name grants nothing",
                 cap.Contains("ELSE CONVERT(BIT, 0)"), true);
             Check("only ACTIVE roster rows and ACTIVE roles count",
@@ -833,8 +1145,13 @@ namespace Erp.ErrorManagement.Tests
             // as one - that would corrupt the minutes-in-status accounting.
             Check("the assignment row does NOT fabricate a status transition",
                 assign.Contains("@StatusID, @StatusID"), true);
+            // Was: does the literal N'assignment') appear. That asserted the
+            // ChangeKind and only incidentally sat next to the visibility flag.
+            // This ties the 0 to the assignment row itself, which is the thing
+            // that actually keeps the assignee's name off the user's screen.
             Check("assignment detail is internal, not shown to the end user",
-                assign.Contains("N'assignment')"), true);
+                System.Text.RegularExpressions.Regex.IsMatch(
+                    assign, @"0,\s*@targetId, @targetName, @PrevAssignee, N'assignment'"), true);
 
             // --- manual tickets -------------------------------------------
             var manual = Section(sql, "PROCEDURE ERM.usp_Ticket_CreateManual");
@@ -844,7 +1161,9 @@ namespace Erp.ErrorManagement.Tests
             Check("a manual ticket has no occurrence and no fingerprint",
                 manual.Contains("@TicketNumber, NULL, NULL,"), true);
             Check("a manual ticket must have an owner",
-                manual.Contains("A manual ticket must have an owner"), true);
+                manual.Contains("A manual ticket must have a real ERP user as its owner"), true);
+            Check("the non-user value cannot own a manual ticket",
+                manual.Contains("@ReportedByUserProfileID IS NULL OR @ReportedByUserProfileID <= 0"), true);
             Check("severity comes from the CATEGORY, not the caller's wish",
                 manual.Contains("DefaultSeverityID FROM ERM.ERM_RequestCategory"), true);
             Check("manual tickets are marked as such", manual.Contains("N'manual'"), true);
@@ -889,19 +1208,19 @@ namespace Erp.ErrorManagement.Tests
 
             // The audit trail is worthless if the client can say who acted.
             Check("the API takes the acting user from the token, not the body",
-                admin.Contains("me.UserId") && admin.Contains("me.UserName"), true);
+                admin.Contains("me.UserProfileId") && admin.Contains("me.UserName"), true);
             Check("AssignRequest does not accept a 'changed by' field",
                 admin.Contains("ChangedBy"), false);
 
             var userCtl = File.ReadAllText(Path.Combine(repoRoot, "dotnet",
                 "Erp.ErrorManagement.WebApi2", "ErrorManagementController.cs"));
             Check("manual-ticket ownership is set from the token",
-                userCtl.Contains("request.ReportedByUserId = ctx?.UserId"), true);
+                userCtl.Contains("request.ReportedByUserProfileId = UserProfileId(ctx)"), true);
 
             var core = File.ReadAllText(Path.Combine(repoRoot, "dotnet",
                 "Erp.ErrorManagement.Core", "SqlErrorStore.cs"));
             Check("...and a client cannot send it (JsonIgnore on the owner fields)",
-                core.Contains("[JsonIgnore] public string ReportedByUserId"), true);
+                core.Contains("[JsonIgnore] public int ReportedByUserProfileId"), true);
 
             var dir = File.ReadAllText(Path.Combine(repoRoot, "dotnet",
                 "Erp.ErrorManagement.Core", "SupportAuthorization.cs"));

@@ -33,9 +33,9 @@ export const appConfig: ApplicationConfig = {
       appVersion: '2026.3.1',
       defaultErpModule: 'CORE',
       logToConsole: true,
-      // In the real ERP this reads from the existing auth service.
+      // In the real ERP this is generic_service.GetUserProfileKey().
       userProvider: () => ({
-        id: 'U-10427',
+        profileId: 10427,
         name: 'fatima.saeed',
         displayName: 'Fatima Saeed',
         tenantId: 'GROUP-01',

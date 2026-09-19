@@ -107,7 +107,7 @@ BEGIN
             SqlServerName     NVARCHAR(128),
             SqlDatabaseName   NVARCHAR(128),
             SqlSchemaName     NVARCHAR(128),
-            UserID            NVARCHAR(128),
+            UserProfileID     INT,
             UserName          NVARCHAR(200),
             UserDisplayName   NVARCHAR(200),
             TenantID          NVARCHAR(64),
@@ -171,7 +171,7 @@ BEGIN
             SqlServerName     NVARCHAR(128)   '$.sql.serverName',
             SqlDatabaseName   NVARCHAR(128)   '$.sql.databaseName',
             SqlSchemaName     NVARCHAR(128)   '$.sql.schemaName',
-            UserID            NVARCHAR(128)   '$.user.id',
+            UserProfileID     INT             '$.user.profileId',
             UserName          NVARCHAR(200)   '$.user.name',
             UserDisplayName   NVARCHAR(200)   '$.user.displayName',
             TenantID          NVARCHAR(64)    '$.user.tenantId',
@@ -220,8 +220,8 @@ BEGIN
             /* No usable fingerprint: refuse to guess, dead-letter and get out.
                A wrong fingerprint is worse than none - it silently merges two
                unrelated problems into one ticket. */
-            INSERT ERM.ERM_DeadLetter (Source, RawEnvelopeJson, FailureReason)
-            VALUES (@Source, @EnvelopeJson, N'Missing or malformed fingerprintHash');
+            INSERT ERM.ERM_DeadLetter (Source, RawEnvelopeJson, FailureReason, CreatedBy)
+            VALUES (@Source, @EnvelopeJson, N'Missing or malformed fingerprintHash', ERM.fn_SystemUserID());
 
             SELECT CONVERT(VARCHAR(30), NULL) AS ErrorReference, CONVERT(BIGINT, NULL) AS OccurrenceId,
                    CONVERT(BIGINT, NULL) AS FingerprintId, CONVERT(BIT, 1) AS ShouldNotifyUser,
@@ -255,7 +255,8 @@ BEGIN
             WHEN NOT MATCHED THEN
                 INSERT (FingerprintHash, SignatureText, LayerID, CategoryID, SeverityID,
                         ExceptionType, NormalizedMessage, ErpModule, Screen, Component,
-                        ApiEndpoint, SqlObjectName, FirstSeenUtc, LastSeenUtc, OccurrenceCount)
+                        ApiEndpoint, SqlObjectName, FirstSeenUtc, LastSeenUtc, OccurrenceCount,
+                        CreatedBy)
                 VALUES (@Hash,
                         ISNULL((SELECT SignatureText FROM @e), N'(no signature supplied)'),
                         @LayerID, @CategoryID, @SeverityID,
@@ -263,7 +264,12 @@ BEGIN
                         (SELECT COALESCE(NormalizedMessage, Message) FROM @e),
                         (SELECT ErpModule FROM @e), (SELECT Screen FROM @e), (SELECT Component FROM @e),
                         (SELECT ApiEndpoint FROM @e), (SELECT SqlObjectName FROM @e),
-                        @OccurredUtc, @OccurredUtc, 1);
+                        @OccurredUtc, @OccurredUtc, 1,
+                        /* A fingerprint is a PROBLEM, not a person's record. It
+                           is created by the framework the first time a fault is
+                           seen, so it is never attributable to the user who
+                           happened to hit it first. */
+                        ERM.fn_SystemUserID());
 
             SELECT @ERM_ErrorFingerprintID = ERM_ErrorFingerprintID,
                    @IsKnownIssue  = CASE WHEN TriageState IN (N'known_issue', N'muted') THEN 1 ELSE 0 END,
@@ -302,10 +308,11 @@ BEGIN
                 ApiApplication, ApiController, ApiAction, ApiEndpoint, HttpMethod, HttpStatusCode, DurationMs,
                 SqlErrorNumber, SqlErrorSeverity, SqlErrorState, SqlObjectName, SqlLineNumber,
                 SqlServerName, SqlDatabaseName, SqlSchemaName,
-                UserID, UserName, UserDisplayName, TenantID, SessionID, ClientIp,
+                UserProfileID, UserName, UserDisplayName, TenantID, SessionID, ClientIp,
                 CorrelationID, RequestID, ParentOccurrenceID,
                 Environment, AppVersion, MachineName,
-                BrowserName, BrowserVersion, OsName, DeviceType, ScreenResolution, Locale
+                BrowserName, BrowserVersion, OsName, DeviceType, ScreenResolution, Locale,
+                CreatedBy
             )
             SELECT
                 @ErrorReference, @ERM_ErrorFingerprintID, @OccurredUtc, e.OccurredLocal, e.ClientUtcOffsetMin,
@@ -314,10 +321,14 @@ BEGIN
                 e.ApiApplication, e.ApiController, e.ApiAction, e.ApiEndpoint, e.HttpMethod, e.HttpStatusCode, e.DurationMs,
                 e.SqlErrorNumber, e.SqlErrorSeverity, e.SqlErrorState, e.SqlObjectName, e.SqlLineNumber,
                 e.SqlServerName, e.SqlDatabaseName, e.SqlSchemaName,
-                e.UserID, e.UserName, e.UserDisplayName, e.TenantID, e.SessionID, e.ClientIp,
+                ISNULL(e.UserProfileID, ERM.fn_SystemUserID()),
+                e.UserName, e.UserDisplayName, e.TenantID, e.SessionID, e.ClientIp,
                 ISNULL(e.CorrelationID, NEWID()), e.RequestID, @ParentOccurrenceID,
                 ISNULL(e.Environment, N'unknown'), e.AppVersion, e.MachineName,
-                e.BrowserName, e.BrowserVersion, e.OsName, e.DeviceType, e.ScreenResolution, e.Locale
+                e.BrowserName, e.BrowserVersion, e.OsName, e.DeviceType, e.ScreenResolution, e.Locale,
+                /* CreatedBy IS the user who hit the error, which is exactly what
+                   the standard means by it. -1 on a public page. */
+                ISNULL(e.UserProfileID, ERM.fn_SystemUserID())
             FROM @e e;
 
             SET @ERM_ErrorOccurrenceID = SCOPE_IDENTITY();
@@ -329,7 +340,8 @@ BEGIN
             INSERT ERM.ERM_ErrorOccurrenceDetail
             (
                 ERM_ErrorOccurrenceID, StackTrace, InnerExceptionChain, RequestPayloadJson,
-                ResponsePayloadJson, ValidationErrorsJson, BreadcrumbsJson, CustomDataJson, SqlStatementText
+                ResponsePayloadJson, ValidationErrorsJson, BreadcrumbsJson, CustomDataJson, SqlStatementText,
+                CreatedBy
             )
             SELECT
                 @ERM_ErrorOccurrenceID,
@@ -339,16 +351,23 @@ BEGIN
                 e.InnerExceptionChain,
                 CASE WHEN @StoreReq = 1 THEN e.RequestPayloadJson END,
                 CASE WHEN @StoreRes = 1 THEN e.ResponsePayloadJson END,
-                e.ValidationErrorsJson, e.BreadcrumbsJson, e.CustomDataJson, e.SqlStatementText
+                e.ValidationErrorsJson, e.BreadcrumbsJson, e.CustomDataJson, e.SqlStatementText,
+                ISNULL(e.UserProfileID, ERM.fn_SystemUserID())
             FROM @e e;
 
             /* Distinct-user count, maintained incrementally so the admin list
                does not have to COUNT(DISTINCT) over a 50-million-row table. */
-            IF EXISTS (SELECT 1 FROM @e WHERE UserName IS NOT NULL)
+            /* Counted on UserProfileID, not UserName: two people can share a
+               display name, one person can have theirs corrected, and either
+               would quietly corrupt "how many users does this affect" - which
+               is the number that decides whether a problem gets fixed.
+               -1 is excluded: every anonymous visitor would otherwise look
+               like the same one user. */
+            IF EXISTS (SELECT 1 FROM @e WHERE UserProfileID > 0)
                AND NOT EXISTS (
                     SELECT 1 FROM ERM.ERM_ErrorOccurrence o
                     WHERE o.ERM_ErrorFingerprintID = @ERM_ErrorFingerprintID
-                      AND o.UserName = (SELECT UserName FROM @e)
+                      AND o.UserProfileID = (SELECT UserProfileID FROM @e)
                       AND o.ERM_ErrorOccurrenceID <> @ERM_ErrorOccurrenceID)
                 UPDATE ERM.ERM_ErrorFingerprint
                    SET DistinctUserCount = DistinctUserCount + 1
@@ -359,8 +378,8 @@ BEGIN
 
             IF @OpenTicketID IS NOT NULL AND ERM.fn_SettingBit(N'ticket.attachRecurrenceToOpen', 1) = 1
             BEGIN
-                INSERT ERM.ERM_TicketOccurrenceLink (ERM_TicketID, ERM_ErrorOccurrenceID, LinkReason)
-                VALUES (@OpenTicketID, @ERM_ErrorOccurrenceID, N'deduplicated');
+                INSERT ERM.ERM_TicketOccurrenceLink (ERM_TicketID, ERM_ErrorOccurrenceID, LinkReason, CreatedBy)
+                VALUES (@OpenTicketID, @ERM_ErrorOccurrenceID, N'deduplicated', ERM.fn_SystemUserID());
 
                 UPDATE ERM.ERM_Ticket
                    SET LinkedOccurrenceCount = LinkedOccurrenceCount + 1
@@ -400,7 +419,8 @@ BEGIN
                      @ERM_ErrorOccurrenceID      = @ERM_ErrorOccurrenceID,
                      @CreatedVia        = N'auto_rule',
                      @UserDescription   = NULL,
-                     @ReportedByUserID  = NULL,
+                     /* Raised by a rule, not a person. */
+                     @ReportedByUserProfileID = NULL,
                      @ReportedByUserName= NULL,
                      @ERM_TicketQueueID           = @RuleQueueId,
                      @TicketNumber      = @AutoTicketNumber OUTPUT;
@@ -419,7 +439,7 @@ BEGIN
         IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
 
         BEGIN TRY
-            INSERT ERM.ERM_DeadLetter (Source, RawEnvelopeJson, FailureReason)
+            INSERT ERM.ERM_DeadLetter (Source, RawEnvelopeJson, FailureReason, CreatedBy)
             VALUES (@Source, @EnvelopeJson,
                     CONCAT(N'Msg ', ERROR_NUMBER(), N', Line ', ERROR_LINE(), N': ', ERROR_MESSAGE()));
         END TRY
@@ -448,7 +468,7 @@ CREATE OR ALTER PROCEDURE ERM.usp_Ticket_Create
     @ERM_ErrorOccurrenceID       BIGINT,
     @CreatedVia         NVARCHAR(20)   = N'user',
     @UserDescription    NVARCHAR(MAX)  = NULL,
-    @ReportedByUserID   NVARCHAR(128)  = NULL,
+    @ReportedByUserProfileID INT       = NULL,
     @ReportedByUserName NVARCHAR(200)  = NULL,
     @ERM_TicketQueueID            SMALLINT       = NULL,
     @TicketNumber       VARCHAR(30)    OUTPUT
@@ -489,8 +509,9 @@ BEGIN
             IF NOT EXISTS (SELECT 1 FROM ERM.ERM_TicketOccurrenceLink
                            WHERE ERM_TicketID = @ExistingTicketId AND ERM_ErrorOccurrenceID = @ERM_ErrorOccurrenceID)
             BEGIN
-                INSERT ERM.ERM_TicketOccurrenceLink (ERM_TicketID, ERM_ErrorOccurrenceID, LinkReason)
-                VALUES (@ExistingTicketId, @ERM_ErrorOccurrenceID, N'deduplicated');
+                INSERT ERM.ERM_TicketOccurrenceLink (ERM_TicketID, ERM_ErrorOccurrenceID, LinkReason, CreatedBy)
+                VALUES (@ExistingTicketId, @ERM_ErrorOccurrenceID, N'deduplicated',
+                        ISNULL(@ReportedByUserProfileID, ERM.fn_SystemUserID()));
 
                 UPDATE ERM.ERM_Ticket
                    SET LinkedOccurrenceCount = LinkedOccurrenceCount + 1
@@ -502,9 +523,11 @@ BEGIN
             /* The user's own words are still worth keeping - as a comment on
                the existing ticket, not as a duplicate ticket. */
             IF @UserDescription IS NOT NULL AND LEN(LTRIM(RTRIM(@UserDescription))) > 0
-                INSERT ERM.ERM_TicketComment (ERM_TicketID, AuthorUserID, AuthorUserName, AuthorRole, CommentText, IsCustomerVisible)
-                VALUES (@ExistingTicketId, @ReportedByUserID, @ReportedByUserName, N'reporter',
-                        CONCAT(N'Additional report (', @ERM_ErrorOccurrenceID, N'): ', @UserDescription), 1);
+                INSERT ERM.ERM_TicketComment (ERM_TicketID, AuthorUserProfileID, AuthorUserName, AuthorRole, CommentText, IsCustomerVisible, CreatedBy)
+                VALUES (@ExistingTicketId, ISNULL(@ReportedByUserProfileID, ERM.fn_SystemUserID()),
+                        @ReportedByUserName, N'reporter',
+                        CONCAT(N'Additional report (', @ERM_ErrorOccurrenceID, N'): ', @UserDescription), 1,
+                        ISNULL(@ReportedByUserProfileID, ERM.fn_SystemUserID()));
         COMMIT TRANSACTION;
 
         SET @TicketNumber = (SELECT TicketNumber FROM ERM.ERM_Ticket WHERE ERM_TicketID = @ExistingTicketId);
@@ -539,29 +562,37 @@ BEGIN
         INSERT ERM.ERM_Ticket
         (
             TicketNumber, ERM_ErrorOccurrenceID, ERM_ErrorFingerprintID, StatusID, SeverityID, ERM_TicketQueueID, ERM_SlaPolicyID,
-            Title, UserDescription, ReportedByUserID, ReportedByUserName, CreatedVia,
-            ErpModule, Environment, CreatedUtc, LastStatusChangeUtc, LinkedOccurrenceCount
+            Title, UserDescription, ReportedByUserProfileID, ReportedByUserName, CreatedVia,
+            ErpModule, Environment, CreatedUtc, LastStatusChangeUtc, LinkedOccurrenceCount,
+            CreatedBy
         )
         VALUES
         (
             @TicketNumber, @ERM_ErrorOccurrenceID, @ERM_ErrorFingerprintID, 1 /*new*/, @SeverityID, @ERM_TicketQueueID, @ERM_SlaPolicyID,
-            @Title, @UserDescription, @ReportedByUserID, @ReportedByUserName, @CreatedVia,
-            @ErpModule, @Environment, @Now, @Now, 1
+            @Title, @UserDescription,
+            /* An auto-rule ticket has no reporter; -1 says so rather than
+               attributing it to whoever happened to trigger the threshold. */
+            ISNULL(@ReportedByUserProfileID, ERM.fn_SystemUserID()), @ReportedByUserName, @CreatedVia,
+            @ErpModule, @Environment, @Now, @Now, 1,
+            ISNULL(@ReportedByUserProfileID, ERM.fn_SystemUserID())
         );
 
         SET @NewTicketId = SCOPE_IDENTITY();
 
         INSERT ERM.ERM_TicketStatusHistory
-            (ERM_TicketID, SequenceNo, FromStatusID, ToStatusID, ChangedByUserID, ChangedByUserName,
-             ChangedUtc, MinutesInFromStatus, Comments, IsCustomerVisible)
+            (ERM_TicketID, SequenceNo, FromStatusID, ToStatusID, ChangedByUserProfileID, ChangedByUserName,
+             ChangedUtc, MinutesInFromStatus, Comments, IsCustomerVisible, CreatedBy)
         VALUES
-            (@NewTicketId, 1, NULL, 1, @ReportedByUserID, @ReportedByUserName, @Now, NULL,
+            (@NewTicketId, 1, NULL, 1, ISNULL(@ReportedByUserProfileID, ERM.fn_SystemUserID()),
+             @ReportedByUserName, @Now, NULL,
              CASE WHEN @CreatedVia = N'auto_rule'
                   THEN N'Ticket raised automatically by an error-management rule.'
-                  ELSE N'Ticket raised by the user from the error dialog.' END, 1);
+                  ELSE N'Ticket raised by the user from the error dialog.' END, 1,
+             ISNULL(@ReportedByUserProfileID, ERM.fn_SystemUserID()));
 
-        INSERT ERM.ERM_TicketOccurrenceLink (ERM_TicketID, ERM_ErrorOccurrenceID, LinkReason)
-        VALUES (@NewTicketId, @ERM_ErrorOccurrenceID, N'primary');
+        INSERT ERM.ERM_TicketOccurrenceLink (ERM_TicketID, ERM_ErrorOccurrenceID, LinkReason, CreatedBy)
+        VALUES (@NewTicketId, @ERM_ErrorOccurrenceID, N'primary',
+                ISNULL(@ReportedByUserProfileID, ERM.fn_SystemUserID()));
 
         UPDATE ERM.ERM_ErrorOccurrence SET ERM_TicketID = @NewTicketId WHERE ERM_ErrorOccurrenceID = @ERM_ErrorOccurrenceID;
 
@@ -570,6 +601,23 @@ BEGIN
                TriageState  = CASE WHEN TriageState = N'new' THEN N'acknowledged' ELSE TriageState END
          WHERE ERM_ErrorFingerprintID = @ERM_ErrorFingerprintID;
     COMMIT TRANSACTION;
+
+    /* Guarded rather than assumed: 012 is part of the standard install, but a
+       missing notification script must not break ticket creation. Deferred name
+       resolution would let the EXEC compile and then fail at run time, which is
+       the worst of both. */
+    IF OBJECT_ID(N'ERM.usp_Notification_Enqueue', N'P') IS NOT NULL
+        EXEC ERM.usp_Notification_Enqueue
+             @RecipientUserProfileID = @ReportedByUserProfileID,
+             @EventKind    = N'created',
+             @ERM_TicketID = @NewTicketId,
+             @TicketNumber = @TicketNumber,
+             @Title        = N'Your issue has been logged',
+             @Body         = @Title,
+             /* NULL, not the reporter: this one IS about their own action, and
+                a confirmation that the issue was received is the single most
+                useful thing to tell them. */
+             @ActedByUserProfileID = NULL;
 
     SELECT @TicketNumber AS TicketNumber, @NewTicketId AS TicketId, CONVERT(BIT,0) AS WasDeduplicated;
 END
@@ -587,10 +635,10 @@ CREATE OR ALTER PROCEDURE ERM.usp_Ticket_ChangeStatus
 (
     @ERM_TicketID           BIGINT,
     @ToStatusID         TINYINT,
-    @ChangedByUserID    NVARCHAR(128) = NULL,
+    @ChangedByUserProfileID INT       = NULL,
     @ChangedByUserName  NVARCHAR(200) = NULL,
     @Comments           NVARCHAR(MAX) = NULL,
-    @AssignToUserID     NVARCHAR(128) = NULL,
+    @AssignToUserProfileID INT        = NULL,
     @AssignToUserName   NVARCHAR(200) = NULL,
     @IsCustomerVisible  BIT = 1,
     @ResolutionCode     NVARCHAR(60)  = NULL,
@@ -645,8 +693,8 @@ BEGIN
         RETURN;
     END
 
-    DECLARE @EffectiveAssigneeId NVARCHAR(128) =
-        COALESCE(@AssignToUserID, (SELECT AssignedToUserID FROM ERM.ERM_Ticket WHERE ERM_TicketID = @ERM_TicketID));
+    DECLARE @EffectiveAssigneeId INT =
+        COALESCE(@AssignToUserProfileID, (SELECT AssignedToUserProfileID FROM ERM.ERM_Ticket WHERE ERM_TicketID = @ERM_TicketID));
 
     IF @RequiresAssignee = 1 AND @EffectiveAssigneeId IS NULL
     BEGIN
@@ -666,11 +714,13 @@ BEGIN
         WHERE ERM_TicketID = @ERM_TicketID;
 
         INSERT ERM.ERM_TicketStatusHistory
-            (ERM_TicketID, SequenceNo, FromStatusID, ToStatusID, ChangedByUserID, ChangedByUserName,
-             ChangedUtc, MinutesInFromStatus, Comments, IsCustomerVisible)
+            (ERM_TicketID, SequenceNo, FromStatusID, ToStatusID, ChangedByUserProfileID, ChangedByUserName,
+             ChangedUtc, MinutesInFromStatus, Comments, IsCustomerVisible, CreatedBy)
         VALUES
-            (@ERM_TicketID, @SeqNo, @FromStatusID, @ToStatusID, @ChangedByUserID, @ChangedByUserName,
-             @Now, @MinutesInFrom, @Comments, @IsCustomerVisible);
+            (@ERM_TicketID, @SeqNo, @FromStatusID, @ToStatusID,
+             ISNULL(@ChangedByUserProfileID, ERM.fn_SystemUserID()), @ChangedByUserName,
+             @Now, @MinutesInFrom, @Comments, @IsCustomerVisible,
+             ISNULL(@ChangedByUserProfileID, ERM.fn_SystemUserID()));
 
         UPDATE t
            SET t.StatusID            = @ToStatusID,
@@ -678,9 +728,11 @@ BEGIN
 
                /* First response: the first time anybody who is not the reporter
                   acts on the ticket.  Set once, never overwritten. */
+               /* ReportedByUserProfileID is NOT NULL, so this no longer needs
+                  a sentinel to stop a NULL comparison swallowing the case. */
                t.FirstResponseUtc = COALESCE(t.FirstResponseUtc,
-                                        CASE WHEN @ChangedByUserID IS NULL
-                                               OR @ChangedByUserID <> ISNULL(t.ReportedByUserID, N'~')
+                                        CASE WHEN @ChangedByUserProfileID IS NULL
+                                               OR @ChangedByUserProfileID <> t.ReportedByUserProfileID
                                              THEN @Now END),
 
                t.AssignedUtc      = CASE WHEN @ToStatusID = 2 AND t.AssignedUtc IS NULL THEN @Now ELSE t.AssignedUtc END,
@@ -691,8 +743,10 @@ BEGIN
                                          WHEN @ToStatusID = 8 THEN NULL
                                          ELSE t.ClosedUtc END,
 
-               t.AssignedToUserID   = COALESCE(@AssignToUserID, t.AssignedToUserID),
+               t.AssignedToUserProfileID = COALESCE(@AssignToUserProfileID, t.AssignedToUserProfileID),
                t.AssignedToUserName = COALESCE(@AssignToUserName, t.AssignedToUserName),
+               t.UpdatedBy          = ISNULL(@ChangedByUserProfileID, ERM.fn_SystemUserID()),
+               t.UpdatedDate        = GETUTCDATE(),
 
                t.ReopenCount      = t.ReopenCount + CASE WHEN @ToStatusID = 8 THEN 1 ELSE 0 END,
 
@@ -745,6 +799,28 @@ BEGIN
 
     COMMIT TRANSACTION;
 
+    IF OBJECT_ID(N'ERM.usp_Notification_Enqueue', N'P') IS NOT NULL
+    BEGIN
+        DECLARE @NotifyReporter INT, @NotifyTicketNo VARCHAR(30), @NotifyStatus NVARCHAR(80);
+
+        SELECT @NotifyReporter = t.ReportedByUserProfileID, @NotifyTicketNo = t.TicketNumber
+        FROM ERM.ERM_Ticket t WHERE t.ERM_TicketID = @ERM_TicketID;
+
+        SELECT @NotifyStatus = DisplayName FROM ERM.ERM_TicketStatus WHERE StatusID = @ToStatusID;
+
+        EXEC ERM.usp_Notification_Enqueue
+             @RecipientUserProfileID = @NotifyReporter,
+             @EventKind    = N'status_changed',
+             @ERM_TicketID = @ERM_TicketID,
+             @TicketNumber = @NotifyTicketNo,
+             @Title        = N'Your issue has been updated',
+             /* The STATUS, never the comment. Internal comments exist and an
+                internal one reaching the reporter through a notification would
+                bypass the IsCustomerVisible flag that the panel respects. */
+             @Body         = @NotifyStatus,
+             @ActedByUserProfileID = @ChangedByUserProfileID;
+    END
+
     SELECT @ERM_TicketID AS TicketId, @FromStatusID AS FromStatusID, @ToStatusID AS ToStatusID,
            @SeqNo AS SequenceNo, @MinutesInFrom AS MinutesInPreviousStatus;
 END
@@ -756,7 +832,7 @@ GO
 CREATE OR ALTER PROCEDURE ERM.usp_Ticket_AddComment
 (
     @ERM_TicketID           BIGINT,
-    @AuthorUserID       NVARCHAR(128) = NULL,
+    @AuthorUserProfileID INT          = NULL,
     @AuthorUserName     NVARCHAR(200) = NULL,
     @AuthorRole         NVARCHAR(20)  = N'support',
     @CommentText        NVARCHAR(MAX),
@@ -772,8 +848,12 @@ BEGIN
         RETURN;
     END
 
-    INSERT ERM.ERM_TicketComment (ERM_TicketID, AuthorUserID, AuthorUserName, AuthorRole, CommentText, IsCustomerVisible)
-    VALUES (@ERM_TicketID, @AuthorUserID, @AuthorUserName, @AuthorRole, @CommentText, @IsCustomerVisible);
+    INSERT ERM.ERM_TicketComment (ERM_TicketID, AuthorUserProfileID, AuthorUserName, AuthorRole, CommentText, IsCustomerVisible, CreatedBy)
+    VALUES (@ERM_TicketID, ISNULL(@AuthorUserProfileID, ERM.fn_SystemUserID()), @AuthorUserName,
+            @AuthorRole, @CommentText, @IsCustomerVisible,
+            ISNULL(@AuthorUserProfileID, ERM.fn_SystemUserID()));
+
+    DECLARE @CommentId BIGINT = SCOPE_IDENTITY();
 
     /* A support reply counts as the first response even without a status move. */
     IF @AuthorRole = N'support'
@@ -781,7 +861,27 @@ BEGIN
            SET FirstResponseUtc = ISNULL(FirstResponseUtc, SYSUTCDATETIME())
          WHERE ERM_TicketID = @ERM_TicketID;
 
-    SELECT SCOPE_IDENTITY() AS CommentId;
+    /* Only a CUSTOMER-VISIBLE support reply is announced. An internal note is
+       internal; notifying the reporter about one would leak it in the one place
+       the IsCustomerVisible flag does not reach. */
+    IF @AuthorRole = N'support' AND @IsCustomerVisible = 1
+       AND OBJECT_ID(N'ERM.usp_Notification_Enqueue', N'P') IS NOT NULL
+    BEGIN
+        DECLARE @CmtReporter INT, @CmtTicketNo VARCHAR(30);
+        SELECT @CmtReporter = t.ReportedByUserProfileID, @CmtTicketNo = t.TicketNumber
+        FROM ERM.ERM_Ticket t WHERE t.ERM_TicketID = @ERM_TicketID;
+
+        EXEC ERM.usp_Notification_Enqueue
+             @RecipientUserProfileID = @CmtReporter,
+             @EventKind    = N'support_comment',
+             @ERM_TicketID = @ERM_TicketID,
+             @TicketNumber = @CmtTicketNo,
+             @Title        = N'Support has replied to your issue',
+             @Body         = N'Open the issue to read the reply.',
+             @ActedByUserProfileID = @AuthorUserProfileID;
+    END
+
+    SELECT @CommentId AS CommentId;
 END
 GO
 
@@ -1213,51 +1313,30 @@ BEGIN
            Notes         = COALESCE(@Notes, Notes)
      WHERE ERM_ErrorFingerprintID = @ERM_ErrorFingerprintID;
 
-    INSERT ERM.ERM_ConfigAudit (TableName, KeyValue, Operation, OldValuesJson, NewValuesJson, ChangedByUserName)
+    INSERT ERM.ERM_ConfigAudit (TableName, KeyValue, Operation, OldValuesJson, NewValuesJson,
+                                ChangedByUserProfileID, ChangedByUserName, CreatedBy)
     SELECT N'ErrorFingerprint', CONVERT(NVARCHAR(200), @ERM_ErrorFingerprintID), 'UPDATE', @OldJson,
            (SELECT TriageState, MutedUntilUtc, Notes FROM ERM.ERM_ErrorFingerprint
             WHERE ERM_ErrorFingerprintID = @ERM_ErrorFingerprintID FOR JSON PATH, WITHOUT_ARRAY_WRAPPER),
-           @ChangedByUserName;
+           ISNULL(@ChangedByUserProfileID, ERM.fn_SystemUserID()), @ChangedByUserName,
+           ISNULL(@ChangedByUserProfileID, ERM.fn_SystemUserID());
 END
 GO
 
-/* What a given user is allowed to see about their own tickets. */
-CREATE OR ALTER PROCEDURE ERM.usp_Ticket_ListForUser
-(
-    @UserID     NVARCHAR(128) = NULL,
-    @UserName   NVARCHAR(200) = NULL,
-    @OnlyOpen   BIT = 0,
-    @PageNumber INT = 1,
-    @PageSize   INT = 25
-)
-AS
-BEGIN
-    SET NOCOUNT ON;
-    IF @PageSize IS NULL OR @PageSize < 1 SET @PageSize = 25;
-    IF @PageSize > 200 SET @PageSize = 200;
-    IF @PageNumber IS NULL OR @PageNumber < 1 SET @PageNumber = 1;
+/* usp_Ticket_ListForUser DELIBERATELY LIVES IN 007, NOT HERE.
 
-    IF @UserID IS NULL AND @UserName IS NULL RETURN;
+   An earlier version of this file defined it, and 007 redefined it with the
+   AwaitingYourReply column. Two CREATE OR ALTER statements for one procedure,
+   in two scripts, means whichever ran last wins - and re-running 004 on its own
+   to pick up an unrelated change would silently revert the end-user panel to
+   the older definition.
 
-    SELECT t.TicketNumber, t.Title,
-           st.Code AS StatusCode, st.DisplayName AS StatusName, st.IsOpen,
-           sv.DisplayName AS SeverityName,
-           t.CreatedUtc, t.ResolvedUtc, t.ClosedUtc,
-           t.ErpModule,
-           (SELECT TOP 1 h.Comments FROM ERM.ERM_TicketStatusHistory h
-            WHERE h.ERM_TicketID = t.ERM_TicketID AND h.IsCustomerVisible = 1
-            ORDER BY h.SequenceNo DESC) AS LatestUpdate,
-           COUNT(*) OVER () AS TotalRowCount
-    FROM ERM.ERM_Ticket t
-    JOIN ERM.ERM_TicketStatus st ON st.StatusID = t.StatusID
-    JOIN ERM.ERM_Severity     sv ON sv.SeverityID = t.SeverityID
-    WHERE ((@UserID   IS NOT NULL AND t.ReportedByUserID   = @UserID)
-        OR (@UserName IS NOT NULL AND t.ReportedByUserName = @UserName))
-      AND (@OnlyOpen = 0 OR st.IsOpen = 1)
-    ORDER BY t.CreatedUtc DESC
-    OFFSET (@PageNumber - 1) * @PageSize ROWS FETCH NEXT @PageSize ROWS ONLY;
-END
-GO
+   Worse, this copy still matched ownership on a text user id and a user NAME.
+   After the move to UserProfileID it referenced a column that no longer exists,
+   so it would have failed at run time - on "My Tickets", for every user.
+
+   One definition, in the script that owns the end-user surface. See
+   007_end_user_ticket_access.sql. */
 
 /* Configuration read by the API at startup / on cache expiry. */
 CREATE OR ALTER PROCEDURE ERM.usp_Config_Get
@@ -1281,5 +1360,6 @@ MERGE ERM.ERM_SchemaVersion AS t
 USING (SELECT N'004_programmability.sql' AS ScriptName) AS s
     ON t.ScriptName = s.ScriptName
 WHEN NOT MATCHED THEN
-    INSERT (ScriptName, FrameworkVersion) VALUES (s.ScriptName, N'1.0.0');
+    INSERT (ScriptName, FrameworkVersion, CreatedBy)
+    VALUES (s.ScriptName, N'1.0.0', ERM.fn_SystemUserID());
 GO

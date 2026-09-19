@@ -200,7 +200,7 @@ namespace Erp.ErrorManagement.WebApi2
             var result = await _store.CreateTicketAsync(
                 request.ErrorReference,
                 request.UserDescription,
-                ctx?.UserId,
+                UserProfileId(ctx),
                 ctx?.UserName,
                 cancellationToken).ConfigureAwait(false);
 
@@ -224,11 +224,11 @@ namespace Erp.ErrorManagement.WebApi2
             CancellationToken cancellationToken = default(CancellationToken))
         {
             var ctx = ErrorContext.Values;
-            if (!IsAuthenticated() || (ctx?.UserId == null && ctx?.UserName == null))
+            if (!IsAuthenticated() || !ErpUser.IsReal(UserProfileId(ctx)))
                 return Ok(new { items = new object[0], total = 0 });
 
             var items = await _store.ListTicketsForUserAsync(
-                ctx.UserId, ctx.UserName, onlyOpen, pageNumber, pageSize, cancellationToken)
+                UserProfileId(ctx), onlyOpen, pageNumber, pageSize, cancellationToken)
                 .ConfigureAwait(false);
 
             return Ok(new { items, total = items.Count });
@@ -252,7 +252,7 @@ namespace Erp.ErrorManagement.WebApi2
             if (!IsAuthenticated()) return StatusCode(HttpStatusCode.Unauthorized);
 
             var detail = await _store.GetTicketForUserAsync(
-                ticketNumber, ctx?.UserId, ctx?.UserName, cancellationToken).ConfigureAwait(false);
+                ticketNumber, UserProfileId(ctx), cancellationToken).ConfigureAwait(false);
 
             // 404, not 403, when the ticket exists but belongs to someone else.
             // A 403 confirms the number is real, which turns sequential ticket
@@ -286,7 +286,7 @@ namespace Erp.ErrorManagement.WebApi2
             var ctx = ErrorContext.Values;
 
             var ok = await _store.AddUserCommentAsync(
-                ticketNumber, ctx?.UserId, ctx?.UserName,
+                ticketNumber, UserProfileId(ctx), ctx?.UserName,
                 request.CommentText, cancellationToken).ConfigureAwait(false);
 
             if (!ok) return NotFound();
@@ -322,13 +322,13 @@ namespace Erp.ErrorManagement.WebApi2
             // Ownership comes from the token. The [JsonIgnore] on these
             // properties means a client cannot set them even by sending them,
             // so nobody can raise a ticket in someone else's name.
-            request.ReportedByUserId = ctx?.UserId;
+            request.ReportedByUserProfileId = UserProfileId(ctx);
             request.ReportedByUserName = ctx?.UserName;
             request.ErpModule = request.ErpModule ?? ctx?.ErpModule;
             request.ReportedScreen = request.ReportedScreen ?? ctx?.Screen;
             request.CreatedVia = "user";
 
-            if (request.ReportedByUserId == null && request.ReportedByUserName == null)
+            if (!ErpUser.IsReal(request.ReportedByUserProfileId))
             {
                 // Authenticated but we could not resolve who they are - so the
                 // ticket would have no owner, appear in nobody's My Tickets,
@@ -368,6 +368,17 @@ namespace Erp.ErrorManagement.WebApi2
         /// and issuer checks wrong, and it could disagree with the ERP's, which
         /// is worse than not checking at all.
         /// </summary>
+        /// <summary>
+        /// The caller's ERP UserProfileID, or -1.
+        ///
+        /// Read from the request context the correlation handler established -
+        /// never from a route, query string or body. A user id that the client
+        /// can set is not an identity, it is a suggestion, and every "my
+        /// tickets" endpoint here is only as safe as this one value.
+        /// </summary>
+        private static int UserProfileId(ErrorContext.ErrorContextValues ctx) =>
+            ErpUser.Normalize(ctx?.UserProfileId ?? ErpUser.None);
+
         private bool IsAuthenticated()
         {
             try

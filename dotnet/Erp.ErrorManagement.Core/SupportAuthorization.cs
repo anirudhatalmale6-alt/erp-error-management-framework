@@ -20,7 +20,7 @@ namespace Erp.ErrorManagement
     {
         [JsonProperty("isSupportUser")]      public bool IsSupportUser { get; set; }
         [JsonProperty("displayName")]        public string DisplayName { get; set; }
-        [JsonProperty("userId")]             public string UserId { get; set; }
+        [JsonProperty("userProfileId")]      public int UserProfileId { get; set; } = ErpUser.None;
         [JsonProperty("userName")]           public string UserName { get; set; }
         [JsonProperty("roleCode")]           public string RoleCode { get; set; }
         [JsonProperty("roleName")]           public string RoleName { get; set; }
@@ -69,7 +69,7 @@ namespace Erp.ErrorManagement
         /// SupportIdentity.Anonymous when they are not support staff - the
         /// absence of a roster row IS the answer, not an error.
         /// </summary>
-        Task<SupportIdentity> ResolveAsync(string userId, string userName, CancellationToken ct = default);
+        Task<SupportIdentity> ResolveAsync(int userProfileId, CancellationToken ct = default);
 
         Task<List<AssignableUser>> ListAssignableAsync(short? queueId, bool includeUnavailable,
             CancellationToken ct = default);
@@ -77,7 +77,7 @@ namespace Erp.ErrorManagement
 
     public class AssignableUser
     {
-        [JsonProperty("userId")]          public string UserId { get; set; }
+        [JsonProperty("userProfileId")]   public int UserProfileId { get; set; } = ErpUser.None;
         [JsonProperty("userName")]        public string UserName { get; set; }
         [JsonProperty("displayName")]     public string DisplayName { get; set; }
         [JsonProperty("roleCode")]        public string RoleCode { get; set; }
@@ -119,10 +119,13 @@ namespace Erp.ErrorManagement
             _options.Validate();
         }
 
-        public async Task<SupportIdentity> ResolveAsync(string userId, string userName,
+        public async Task<SupportIdentity> ResolveAsync(int userProfileId,
             CancellationToken ct = default)
         {
-            if (userId == null && userName == null) return SupportIdentity.Anonymous;
+            // Anything that is not a real ERP user is anonymous here, and that
+            // includes -1. The SQL refuses it too; this is the cheap check that
+            // saves the round trip, not the one the security rests on.
+            if (!ErpUser.IsReal(userProfileId)) return SupportIdentity.Anonymous;
 
             try
             {
@@ -131,8 +134,7 @@ namespace Erp.ErrorManagement
                 {
                     command.CommandType = CommandType.StoredProcedure;
                     command.CommandTimeout = _options.CommandTimeoutSeconds;
-                    command.Parameters.Add("@UserId", SqlDbType.NVarChar, 128).Value = (object)userId ?? DBNull.Value;
-                    command.Parameters.Add("@UserName", SqlDbType.NVarChar, 200).Value = (object)userName ?? DBNull.Value;
+                    command.Parameters.Add("@UserProfileID", SqlDbType.Int).Value = userProfileId;
 
                     await connection.OpenAsync(ct).ConfigureAwait(false);
                     using (var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false))
@@ -144,7 +146,7 @@ namespace Erp.ErrorManagement
                         {
                             IsSupportUser = true,
                             DisplayName = Str(reader, "DisplayName"),
-                            UserId = Str(reader, "UserId"),
+                            UserProfileId = Int32Of(reader, "UserProfileID"),
                             UserName = Str(reader, "UserName"),
                             RoleCode = Str(reader, "RoleCode"),
                             RoleName = Str(reader, "RoleName"),
@@ -205,7 +207,7 @@ namespace Erp.ErrorManagement
                         {
                             result.Add(new AssignableUser
                             {
-                                UserId = Str(reader, "UserId"),
+                                UserProfileId = Int32Of(reader, "UserProfileID"),
                                 UserName = Str(reader, "UserName"),
                                 DisplayName = Str(reader, "DisplayName"),
                                 RoleCode = Str(reader, "RoleCode"),
@@ -244,6 +246,18 @@ namespace Erp.ErrorManagement
         {
             var i = r.GetOrdinal(name);
             return !r.IsDBNull(i) && Convert.ToBoolean(r.GetValue(i));
+        }
+
+        /// <summary>
+        /// A NULL user id reads as the non-user value, never as 0 - because 0 is
+        /// not a spelling of "nobody" anywhere in this system, and letting it
+        /// become one would create a second non-user value that the CHECK
+        /// constraints and predicates do not know about.
+        /// </summary>
+        private static int Int32Of(IDataRecord r, string name)
+        {
+            var i = r.GetOrdinal(name);
+            return r.IsDBNull(i) ? ErpUser.None : Convert.ToInt32(r.GetValue(i));
         }
     }
 }

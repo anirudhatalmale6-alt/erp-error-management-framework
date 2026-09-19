@@ -261,5 +261,6 @@ MERGE ERM.ERM_SchemaVersion AS t
 USING (SELECT N'009_optional_catch_block_helper.sql' AS ScriptName) AS s
     ON t.ScriptName = s.ScriptName
 WHEN NOT MATCHED THEN
-    INSERT (ScriptName, FrameworkVersion) VALUES (s.ScriptName, N'1.1.0-optional');
+    INSERT (ScriptName, FrameworkVersion, CreatedBy)
+    VALUES (s.ScriptName, N'1.1.0-optional', ERM.fn_SystemUserID());
 GO

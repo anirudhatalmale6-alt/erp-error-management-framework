@@ -84,6 +84,44 @@ namespace Erp.ErrorManagement
         public Func<UserContext> UserProvider { get; set; }
 
         /// <summary>
+        /// THE hook for ATC's user context. Point this at whatever your API
+        /// already uses to know who the caller is - the per-request context
+        /// object your controllers read CreatedBy / UpdatedBy / UserProfileID
+        /// from - and the framework will use exactly the same value your own
+        /// inserts do.
+        ///
+        /// Return <see cref="ErpUser.None"/> (-1) when there is no user.
+        ///
+        /// This is checked FIRST, before the header and claim fallbacks below,
+        /// because it is the only one that cannot disagree with your own code.
+        /// </summary>
+        public Func<int> UserProfileIdProvider { get; set; }
+
+        /// <summary>
+        /// Request headers to read the ERP UserProfileID from, in order, when
+        /// <see cref="UserProfileIdProvider"/> is not set. Matched
+        /// case-insensitively. A value that is not a positive integer is
+        /// ignored rather than trusted.
+        /// </summary>
+        public List<string> UserProfileIdHeaderNames { get; set; } = new List<string>
+        {
+            "UserProfileID", "X-UserProfileID", "X-Erp-UserProfileID"
+        };
+
+        /// <summary>
+        /// Claim types to read the ERP UserProfileID from, in order, when
+        /// neither the provider nor a header supplied one.
+        ///
+        /// Last resort on purpose. A claim is whatever the token happened to
+        /// carry when it was issued; the request value is what your own code is
+        /// using right now, and those two can drift.
+        /// </summary>
+        public List<string> UserProfileIdClaimTypes { get; set; } = new List<string>
+        {
+            "UserProfileID", "userProfileId", "uid", "sub"
+        };
+
+        /// <summary>
         /// Accept capture from unauthenticated callers.
         ///
         /// Required when any ERP page is public: an error on a public login or

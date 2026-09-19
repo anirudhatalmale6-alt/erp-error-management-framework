@@ -31,10 +31,17 @@ namespace Erp.ErrorManagement.WebApi2
         public const string AppVersionHeader = "X-App-Version";
 
         private readonly string _defaultModule;
+        private readonly ErrorCaptureOptions _options;
 
-        public ErpErrorCorrelationHandler(string defaultModule = null)
+        /// <param name="options">
+        /// Supplies the UserProfileID resolution rules. Optional: with no
+        /// options the built-in header and claim defaults still apply, so the
+        /// handler works standalone. The bootstrapper passes the real ones.
+        /// </param>
+        public ErpErrorCorrelationHandler(string defaultModule = null, ErrorCaptureOptions options = null)
         {
             _defaultModule = defaultModule;
+            _options = options ?? new ErrorCaptureOptions();
         }
 
         protected override async Task<HttpResponseMessage> SendAsync(
@@ -53,7 +60,7 @@ namespace Erp.ErrorManagement.WebApi2
                 StartedUtc = DateTime.UtcNow
             };
 
-            ApplyIdentity(values);
+            ApplyIdentity(values, request);
 
             ErrorContext.Begin(values);
 
@@ -90,10 +97,18 @@ namespace Erp.ErrorManagement.WebApi2
         /// the host supplies; this is the fallback that makes the framework
         /// useful on day one without any wiring.
         /// </summary>
-        private static void ApplyIdentity(ErrorContext.ErrorContextValues values)
+        private void ApplyIdentity(ErrorContext.ErrorContextValues values, HttpRequestMessage request)
         {
             try
             {
+                // The ERP UserProfileID comes from the request context first -
+                // the same value the controller is about to write into its own
+                // CreatedBy. Doing it the other way round, deriving it from a
+                // token claim, would mean the framework and the ERP could
+                // disagree about who did something, and the framework would be
+                // the one that was wrong.
+                values.UserProfileId = ResolveUserProfileId(request);
+
                 var principal = HttpContext.Current?.User ?? Thread.CurrentPrincipal;
                 var identity = principal?.Identity;
                 if (identity == null || !identity.IsAuthenticated) return;
@@ -102,12 +117,6 @@ namespace Erp.ErrorManagement.WebApi2
 
                 if (identity is ClaimsIdentity claims)
                 {
-                    values.UserId =
-                        FirstClaim(claims, ClaimTypes.NameIdentifier) ??
-                        FirstClaim(claims, "sub") ??
-                        FirstClaim(claims, "uid") ??
-                        FirstClaim(claims, "userId");
-
                     values.UserDisplayName =
                         FirstClaim(claims, "name") ??
                         FirstClaim(claims, ClaimTypes.GivenName) ??
@@ -128,6 +137,56 @@ namespace Erp.ErrorManagement.WebApi2
                 // is still a useful error record; a handler that throws here
                 // takes down every request in the API.
             }
+        }
+
+        /// <summary>
+        /// Provider, then header, then claim - and -1 if none of them produced
+        /// a real ERP user.
+        ///
+        /// Anything that is not a positive integer is discarded rather than
+        /// coerced. "0", "", "null" and "abc" all mean the caller did not tell
+        /// us, and quietly turning any of them into a user id would attribute
+        /// somebody's error to whoever owns that id.
+        /// </summary>
+        private int ResolveUserProfileId(HttpRequestMessage request)
+        {
+            if (_options.UserProfileIdProvider != null)
+            {
+                try
+                {
+                    var supplied = ErpUser.Normalize(_options.UserProfileIdProvider());
+                    if (ErpUser.IsReal(supplied)) return supplied;
+                }
+                catch
+                {
+                    // The host's own resolver threw. Fall through - capturing
+                    // the error anonymously beats not capturing it.
+                }
+            }
+
+            if (_options.UserProfileIdHeaderNames != null && request != null)
+            {
+                foreach (var header in _options.UserProfileIdHeaderNames)
+                {
+                    var raw = ReadHeader(request, header);
+                    if (int.TryParse(raw, out var parsed) && ErpUser.IsReal(parsed)) return parsed;
+                }
+            }
+
+            if (_options.UserProfileIdClaimTypes != null)
+            {
+                var principal = HttpContext.Current?.User ?? Thread.CurrentPrincipal;
+                if (principal?.Identity is ClaimsIdentity claims)
+                {
+                    foreach (var claimType in _options.UserProfileIdClaimTypes)
+                    {
+                        var raw = FirstClaim(claims, claimType);
+                        if (int.TryParse(raw, out var parsed) && ErpUser.IsReal(parsed)) return parsed;
+                    }
+                }
+            }
+
+            return ErpUser.None;
         }
 
         private static string FirstClaim(ClaimsIdentity identity, string type)

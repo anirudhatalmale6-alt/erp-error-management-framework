@@ -19,3 +19,6 @@ demo-error-store.db-wal
 Thumbs.db
 .vscode/
 .idea/
+
+# build artefact of tools/verify-fingerprint.mjs
+tools/.compiled/

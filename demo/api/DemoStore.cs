@@ -94,7 +94,7 @@ public class DemoStore
               HttpMethod TEXT, HttpStatusCode INTEGER,
               SqlErrorNumber INTEGER, SqlObjectName TEXT, SqlLineNumber INTEGER,
               SqlServerName TEXT, SqlDatabaseName TEXT, SqlSchemaName TEXT,
-              UserName TEXT, UserDisplayName TEXT,
+              UserProfileId INTEGER NOT NULL DEFAULT -1, UserName TEXT, UserDisplayName TEXT,
               CorrelationId TEXT, RequestId TEXT,
               Environment TEXT, AppVersion TEXT,
               BrowserName TEXT, BrowserVersion TEXT, OsName TEXT,
@@ -109,7 +109,8 @@ public class DemoStore
               OccurrenceId INTEGER, FingerprintId INTEGER,
               Status TEXT NOT NULL, Severity TEXT, Queue TEXT,
               Title TEXT, UserDescription TEXT,
-              ReportedByUserName TEXT, AssignedToUserName TEXT, CreatedVia TEXT,
+              ReportedByUserProfileId INTEGER NOT NULL DEFAULT -1, ReportedByUserName TEXT,
+              AssignedToUserProfileId INTEGER, AssignedToUserName TEXT, CreatedVia TEXT,
               ErpModule TEXT, Environment TEXT,
               CreatedUtc TEXT, FirstResponseUtc TEXT, AssignedUtc TEXT,
               ResolvedUtc TEXT, ClosedUtc TEXT, LastStatusChangeUtc TEXT,
@@ -128,9 +129,11 @@ public class DemoStore
               HistoryId INTEGER PRIMARY KEY AUTOINCREMENT,
               TicketId INTEGER NOT NULL, SequenceNo INTEGER NOT NULL,
               FromStatus TEXT, ToStatus TEXT NOT NULL,
-              ChangedByUserName TEXT, ChangedUtc TEXT NOT NULL,
+              ChangedByUserProfileId INTEGER NOT NULL DEFAULT -1, ChangedByUserName TEXT,
+              ChangedUtc TEXT NOT NULL,
               MinutesInFromStatus INTEGER, Comments TEXT,
-              AssignedToUserName TEXT, PreviousAssignedToUserName TEXT,
+              AssignedToUserProfileId INTEGER, AssignedToUserName TEXT,
+              PreviousAssignedToUserName TEXT,
               ChangeKind TEXT NOT NULL DEFAULT 'status',
               IsCustomerVisible INTEGER NOT NULL DEFAULT 1
             );
@@ -138,7 +141,7 @@ public class DemoStore
             CREATE TABLE IF NOT EXISTS TicketComment (
               CommentId INTEGER PRIMARY KEY AUTOINCREMENT,
               TicketId INTEGER NOT NULL,
-              AuthorUserId TEXT, AuthorUserName TEXT,
+              AuthorUserProfileId INTEGER NOT NULL DEFAULT -1, AuthorUserName TEXT,
               AuthorRole TEXT NOT NULL DEFAULT 'support',
               CommentText TEXT NOT NULL,
               IsCustomerVisible INTEGER NOT NULL DEFAULT 1,
@@ -152,7 +155,8 @@ public class DemoStore
             );
 
             CREATE TABLE IF NOT EXISTS SupportUser (
-              UserName TEXT PRIMARY KEY,
+              UserProfileId INTEGER PRIMARY KEY,
+              UserName TEXT,
               DisplayName TEXT NOT NULL,
               RoleCode TEXT NOT NULL,
               IsAvailable INTEGER NOT NULL DEFAULT 1,
@@ -220,22 +224,59 @@ public class DemoStore
     };
 
     /// <summary>
-    /// Mirrors ERM.fn_SupportCapability. FAILS CLOSED - no roster row means
-    /// no capability, and an unknown capability name grants nothing.
+    /// The demo's stand-in for the ERP's user directory.
+    ///
+    /// Production never needs this: the UserProfileID arrives on the request,
+    /// already resolved, from generic_service.GetUserProfileKey() on the way in.
+    /// The demo has a name in a header because a name is easier to type into
+    /// curl, so it resolves that name to an id ONCE, at the edge, and everything
+    /// below this line is keyed on the integer - exactly as the real schema is.
     /// </summary>
-    public object WhoAmI(string userName)
+    public static readonly Dictionary<string, int> DemoUserProfileIds =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["fatima.saeed"] = 10427,
+            ["omar.khan"]    = 10428,
+            ["lisa.chen"]    = 10429,
+            ["raj.patel"]    = 10430,
+            ["sam.ops"]      = 20001,
+            ["dev.patel"]    = 20002,
+            ["ana.silva"]    = 20003,
+            ["mgr.khoury"]   = 20004,
+        };
+
+    public const int NoUser = -1;
+
+    public static int ProfileIdOf(string? userName) =>
+        userName is not null && DemoUserProfileIds.TryGetValue(userName, out var id) ? id : NoUser;
+
+    public static string? NameOf(int userProfileId) =>
+        DemoUserProfileIds.FirstOrDefault(kv => kv.Value == userProfileId).Key;
+
+    /// <summary>
+    /// Mirrors ERM.fn_SupportCapability. FAILS CLOSED - no roster row means
+    /// no capability, and an unknown capability name grants nothing. -1 is
+    /// refused outright, so an anonymous caller can never be support.
+    /// </summary>
+    public object WhoAmI(int userProfileId)
     {
         using var c = Open();
-        var row = QueryOne(c, null,
-            "SELECT * FROM SupportUser WHERE UserName = $u AND IsActive = 1", ("$u", userName));
+        var row = userProfileId > 0
+            ? QueryOne(c, null,
+                "SELECT * FROM SupportUser WHERE UserProfileId = $u AND IsActive = 1", ("$u", userProfileId))
+            : null;
 
+        // The name is returned even when access is refused: the console shows
+        // "Signed in as <name>" on the denial screen, so leaving it out turns a
+        // clear message into "Signed in as ." with a gap where the name was.
         if (row is null || !Roles.TryGetValue((string)row["RoleCode"]!, out var r))
-            return new { isSupportUser = false, userName };
+            return new { isSupportUser = false, userProfileId, userName = NameOf(userProfileId) };
 
         return new
         {
             isSupportUser = true,
-            userName,
+            userProfileId,
+            userName = row["UserName"],
             displayName = row["DisplayName"],
             roleCode = row["RoleCode"],
             roleName = r.Name,
@@ -249,13 +290,14 @@ public class DemoStore
         };
     }
 
-    public bool HasCapability(string? userName, string capability)
+    public bool HasCapability(int userProfileId, string capability)
     {
-        if (string.IsNullOrWhiteSpace(userName)) return false;
+        // Mirrors the SQL predicate: NULL and -1 are both "not a user".
+        if (userProfileId <= 0) return false;
 
         using var c = Open();
         var row = QueryOne(c, null,
-            "SELECT RoleCode FROM SupportUser WHERE UserName = $u AND IsActive = 1", ("$u", userName));
+            "SELECT RoleCode FROM SupportUser WHERE UserProfileId = $u AND IsActive = 1", ("$u", userProfileId));
         if (row is null || !Roles.TryGetValue((string)row["RoleCode"]!, out var r)) return false;
 
         return capability switch
@@ -278,15 +320,16 @@ public class DemoStore
             .Where(r => Roles.TryGetValue((string)r["RoleCode"]!, out var x) && x.Assignable)
             .Select(r => new
             {
+                userProfileId = Convert.ToInt32(r["UserProfileId"]),
                 userName = r["UserName"],
                 displayName = r["DisplayName"],
                 roleCode = r["RoleCode"],
                 roleName = Roles[(string)r["RoleCode"]!].Name,
                 isAvailable = true,
                 openTicketCount = ExecScalarLong(c, null,
-                    "SELECT COUNT(*) FROM Ticket WHERE AssignedToUserName = $u AND Status IN "
+                    "SELECT COUNT(*) FROM Ticket WHERE AssignedToUserProfileId = $u AND Status IN "
                     + "('new','assigned','in_progress','waiting_info','resolved','reopened')",
-                    ("$u", r["UserName"])),
+                    ("$u", r["UserProfileId"])),
             })
             // Least-loaded first, so a lead is not assigning alphabetically.
             .OrderBy(x => x.openTicketCount).ThenBy(x => x.displayName)
@@ -300,16 +343,17 @@ public class DemoStore
     /// time, and works WITHOUT a status change - so a reassignment leaves a
     /// trace too, which it previously did not, because it is not a transition.
     /// </summary>
-    public object? AssignTicket(string ticketNumber, string? assignTo, string changedBy, string? comments)
+    public object? AssignTicket(string ticketNumber, int? assignToProfileId, int changedByProfileId,
+        string? comments)
     {
         lock (_writeLock)
         {
             using var c = Open();
 
-            if (!HasCapability(changedBy, "manage")) return null;
+            if (!HasCapability(changedByProfileId, "manage")) return null;
 
             var t = QueryOne(c, null,
-                "SELECT TicketId, Status, AssignedToUserName FROM Ticket WHERE TicketNumber = $n",
+                "SELECT TicketId, Status, AssignedToUserProfileId, AssignedToUserName FROM Ticket WHERE TicketNumber = $n",
                 ("$n", ticketNumber));
             if (t is null) return null;
 
@@ -318,55 +362,67 @@ public class DemoStore
             var previous = t["AssignedToUserName"] as string;
 
             string? targetDisplay = null;
-            if (!string.IsNullOrWhiteSpace(assignTo))
+            string? targetName = null;
+            if (assignToProfileId is > 0)
             {
                 var su = QueryOne(c, null,
-                    "SELECT DisplayName, RoleCode FROM SupportUser WHERE UserName = $u AND IsActive = 1",
-                    ("$u", assignTo));
-                // A free-text assignee looks harmless until the first typo,
-                // after which the ticket belongs to nobody and shows in no queue.
+                    "SELECT UserName, DisplayName, RoleCode FROM SupportUser WHERE UserProfileId = $u AND IsActive = 1",
+                    ("$u", assignToProfileId.Value));
+                // An unvalidated assignee looks harmless until the first wrong
+                // id, after which the ticket belongs to nobody and shows in no
+                // queue.
                 if (su is null) return null;
                 if (!Roles.TryGetValue((string)su["RoleCode"]!, out var role) || !role.Assignable) return null;
                 targetDisplay = (string)su["DisplayName"]!;
+                targetName = su["UserName"] as string;
             }
 
             var now = DateTime.UtcNow;
 
             Exec(c, null,
-                "UPDATE Ticket SET AssignedToUserName = $to, "
-                + "AssignedUtc = CASE WHEN $to IS NULL THEN NULL ELSE COALESCE(AssignedUtc, $now) END, "
-                + "FirstResponseUtc = CASE WHEN $to IS NULL THEN FirstResponseUtc "
+                "UPDATE Ticket SET AssignedToUserProfileId = $toid, AssignedToUserName = $to, "
+                + "AssignedUtc = CASE WHEN $toid IS NULL THEN NULL ELSE COALESCE(AssignedUtc, $now) END, "
+                + "FirstResponseUtc = CASE WHEN $toid IS NULL THEN FirstResponseUtc "
                 + "ELSE COALESCE(FirstResponseUtc, $now) END WHERE TicketId = $t",
-                ("$to", assignTo), ("$now", Iso(now)), ("$t", ticketId));
+                ("$toid", assignToProfileId is > 0 ? assignToProfileId.Value : (object?)null),
+                ("$to", targetName), ("$now", Iso(now)), ("$t", ticketId));
 
             var seq = ExecScalarLong(c, null,
                 "SELECT COALESCE(MAX(SequenceNo),0) + 1 FROM TicketHistory WHERE TicketId = $t",
                 ("$t", ticketId));
 
-            var note = comments ?? (assignTo is null ? "Ticket unassigned."
+            var note = comments ?? (targetDisplay is null ? "Ticket unassigned."
                 : previous is null ? $"Assigned to {targetDisplay}."
                 : $"Reassigned from {previous} to {targetDisplay}.");
 
             Exec(c, null,
                 "INSERT INTO TicketHistory (TicketId, SequenceNo, FromStatus, ToStatus, "
-                + "ChangedByUserName, ChangedUtc, MinutesInFromStatus, Comments, "
-                + "AssignedToUserName, PreviousAssignedToUserName, ChangeKind, IsCustomerVisible) "
-                + "VALUES ($t,$seq,$st,$st,$by,$now,NULL,$c,$to,$prev,'assignment',0)",
-                ("$t", ticketId), ("$seq", seq), ("$st", status), ("$by", changedBy),
-                ("$now", Iso(now)), ("$c", note), ("$to", assignTo), ("$prev", previous));
+                + "ChangedByUserProfileId, ChangedByUserName, ChangedUtc, MinutesInFromStatus, Comments, "
+                + "AssignedToUserProfileId, AssignedToUserName, PreviousAssignedToUserName, ChangeKind, IsCustomerVisible) "
+                + "VALUES ($t,$seq,$st,$st,$byid,$by,$now,NULL,$c,$toid,$to,$prev,'assignment',0)",
+                ("$t", ticketId), ("$seq", seq), ("$st", status),
+                ("$byid", changedByProfileId), ("$by", NameOf(changedByProfileId)),
+                ("$now", Iso(now)), ("$c", note),
+                ("$toid", assignToProfileId is > 0 ? assignToProfileId.Value : (object?)null),
+                ("$to", targetName), ("$prev", previous));
 
             // Advance New -> Assigned as its own validated transition, so the
             // status history and minutes-in-status accounting stay correct.
-            if (assignTo is not null && status.Equals("new", StringComparison.OrdinalIgnoreCase)
+            if (assignToProfileId is > 0 && status.Equals("new", StringComparison.OrdinalIgnoreCase)
                 && Transitions.ContainsKey(("new", "assigned")))
             {
-                try { ChangeStatus(ticketNumber, "assigned", changedBy, "Assigned.", assignTo); }
+                try
+                {
+                    ChangeStatus(ticketNumber, "assigned", changedByProfileId, "Assigned.",
+                        assignToProfileId);
+                }
                 catch (InvalidOperationException) { /* the workflow is the authority */ }
             }
 
             return new
             {
-                ticketNumber, assignedTo = assignTo, assignedToName = targetDisplay,
+                ticketNumber, assignedTo = targetName, assignedToProfileId = assignToProfileId,
+                assignedToName = targetDisplay,
                 previousAssignedTo = previous, sequenceNo = seq
             };
         }
@@ -401,9 +457,11 @@ public class DemoStore
     /// marks their request critical and the SLA queue means nothing.
     /// </summary>
     public object? CreateManualTicket(string title, string? description, string? category,
-        string? erpModule, string? screen, string reportedBy)
+        string? erpModule, string? screen, int reportedByProfileId)
     {
-        if (string.IsNullOrWhiteSpace(title) || string.IsNullOrWhiteSpace(reportedBy)) return null;
+        // -1 counts as unowned: the non-user value is not somebody who can be
+        // asked for more information, so the ticket would be a dead record.
+        if (string.IsNullOrWhiteSpace(title) || reportedByProfileId <= 0) return null;
 
         lock (_writeLock)
         {
@@ -416,23 +474,25 @@ public class DemoStore
 
             var ticketId = ExecScalarLong(c, null,
                 "INSERT INTO Ticket (TicketNumber, OccurrenceId, FingerprintId, Status, Severity, Queue, "
-                + "Title, UserDescription, ReportedByUserName, CreatedVia, ErpModule, Environment, "
+                + "Title, UserDescription, ReportedByUserProfileId, ReportedByUserName, CreatedVia, ErpModule, Environment, "
                 + "CreatedUtc, LastStatusChangeUtc, SlaFirstResponseMinutes, SlaResolutionMinutes, "
                 + "LinkedOccurrenceCount, TicketSource, RequestCategory, ReportedScreen) "
-                + "VALUES ($num,NULL,NULL,'new',$sev,'general',$title,$desc,$by,'user',$mod,'Demo',"
+                + "VALUES ($num,NULL,NULL,'new',$sev,'general',$title,$desc,$byid,$by,'user',$mod,'Demo',"
                 + "$now,$now,$fr,$res,0,'manual',$cat,$screen); SELECT last_insert_rowid();",
                 ("$num", ticketNumber), ("$sev", severity),
                 ("$title", Redactor.ScrubText(title, 400)),
                 ("$desc", Redactor.ScrubText(description, 8000)),
-                ("$by", reportedBy), ("$mod", erpModule), ("$now", Iso(now)),
+                ("$byid", reportedByProfileId), ("$by", NameOf(reportedByProfileId)),
+                ("$mod", erpModule), ("$now", Iso(now)),
                 ("$fr", sla.FirstResponse), ("$res", sla.Resolution),
                 ("$cat", cat), ("$screen", screen));
 
             Exec(c, null,
                 "INSERT INTO TicketHistory (TicketId, SequenceNo, FromStatus, ToStatus, "
-                + "ChangedByUserName, ChangedUtc, MinutesInFromStatus, Comments, ChangeKind, IsCustomerVisible) "
-                + "VALUES ($t,1,NULL,'new',$by,$now,NULL,'Ticket raised manually by the user.','status',1)",
-                ("$t", ticketId), ("$by", reportedBy), ("$now", Iso(now)));
+                + "ChangedByUserProfileId, ChangedByUserName, ChangedUtc, MinutesInFromStatus, Comments, ChangeKind, IsCustomerVisible) "
+                + "VALUES ($t,1,NULL,'new',$byid,$by,$now,NULL,'Ticket raised manually by the user.','status',1)",
+                ("$t", ticketId), ("$byid", reportedByProfileId),
+                ("$by", NameOf(reportedByProfileId)), ("$now", Iso(now)));
 
             return new { ticketNumber, ticketId, wasDeduplicated = false };
         }
@@ -524,13 +584,13 @@ public class DemoStore
                   Severity, ExceptionType, Message, ErpModule, Screen, RouteUrl, Component,
                   ActionName, FormName, LovName, ApiController, ApiAction, ApiEndpoint,
                   HttpMethod, HttpStatusCode, SqlErrorNumber, SqlObjectName, SqlLineNumber,
-                  SqlServerName, SqlDatabaseName, SqlSchemaName, UserName, UserDisplayName,
+                  SqlServerName, SqlDatabaseName, SqlSchemaName, UserProfileId, UserName, UserDisplayName,
                   CorrelationId, RequestId, Environment, AppVersion,
                   BrowserName, BrowserVersion, OsName,
                   StackTrace, InnerExceptionChain, RequestPayloadJson, ValidationErrorsJson, BreadcrumbsJson)
                 VALUES ($ref,$fp,$occ,$layer,$cat,$sev,$type,$msg,$mod,$scr,$route,$cmp,
                   $act,$form,$lov,$ctrl,$action,$ep,$method,$status,$sqlnum,$sqlobj,$sqlline,
-                  $sqlsrv,$sqldb,$sqlschema,$user,$display,$corr,$req,$env,$ver,
+                  $sqlsrv,$sqldb,$sqlschema,$userid,$user,$display,$corr,$req,$env,$ver,
                   $browser,$bver,$os,$stack,$inner,$payload,$val,$crumbs);
                 SELECT last_insert_rowid();
                 """,
@@ -546,6 +606,7 @@ public class DemoStore
                 ("$sqlnum", envelope.Sql?.Number), ("$sqlobj", envelope.Sql?.ObjectName),
                 ("$sqlline", envelope.Sql?.LineNumber), ("$sqlsrv", envelope.Sql?.ServerName),
                 ("$sqldb", envelope.Sql?.DatabaseName), ("$sqlschema", envelope.Sql?.SchemaName),
+                ("$userid", envelope.User?.ProfileId is int pid && pid > 0 ? pid : NoUser),
                 ("$user", envelope.User?.Name), ("$display", envelope.User?.DisplayName),
                 ("$corr", envelope.CorrelationId), ("$req", envelope.RequestId),
                 ("$env", envelope.Environment), ("$ver", envelope.AppVersion),
@@ -555,12 +616,17 @@ public class DemoStore
                 ("$payload", Json(envelope.RequestPayload)),
                 ("$val", Json(envelope.ValidationErrors)), ("$crumbs", Json(envelope.Breadcrumbs)));
 
-            // Incremental distinct-user count.
-            if (!string.IsNullOrEmpty(envelope.User?.Name))
+            // Incremental distinct-user count, on the UserProfileID rather than
+            // the name. Two people can share a display name and one person can
+            // have theirs corrected; either would quietly corrupt "how many
+            // users does this affect", which is the number that decides whether
+            // a problem gets fixed. -1 is excluded, or every anonymous visitor
+            // would look like the same one user.
+            if (envelope.User?.ProfileId is int userPid && userPid > 0)
             {
                 var seenBefore = ExecScalarLong(c, tx,
-                    "SELECT COUNT(*) FROM Occurrence WHERE FingerprintId = $fp AND UserName = $u AND OccurrenceId <> $id",
-                    ("$fp", fingerprintId), ("$u", envelope.User.Name), ("$id", occurrenceId));
+                    "SELECT COUNT(*) FROM Occurrence WHERE FingerprintId = $fp AND UserProfileId = $u AND OccurrenceId <> $id",
+                    ("$fp", fingerprintId), ("$u", userPid), ("$id", occurrenceId));
                 if (seenBefore == 0)
                     Exec(c, tx, "UPDATE Fingerprint SET DistinctUserCount = DistinctUserCount + 1 WHERE FingerprintId = $fp",
                         ("$fp", fingerprintId));
@@ -592,7 +658,9 @@ public class DemoStore
                 var recent = CountRecent(fingerprintId, now.AddMinutes(-60));
                 if (recent >= 3)
                 {
-                    var created = CreateTicket(reference, null, "system", "auto_rule");
+                    // No person behind an automatic rule: -1, not a made-up
+                    // "system" user who would then appear to own the ticket.
+                    var created = CreateTicket(reference, null, NoUser, "auto_rule");
                     autoTicketNumber = created?.TicketNumber;
                 }
             }
@@ -622,7 +690,7 @@ public class DemoStore
     /* ==================================================================== */
 
     public TicketCreateResult? CreateTicket(string errorReference, string? description,
-        string reportedBy, string createdVia)
+        int reportedByProfileId, string createdVia)
     {
         lock (_writeLock)
         {
@@ -674,24 +742,27 @@ public class DemoStore
 
             var ticketId = ExecScalarLong(c, tx, """
                 INSERT INTO Ticket (TicketNumber, OccurrenceId, FingerprintId, Status, Severity, Queue,
-                  Title, UserDescription, ReportedByUserName, CreatedVia, ErpModule, Environment,
+                  Title, UserDescription, ReportedByUserProfileId, ReportedByUserName, CreatedVia,
+                  ErpModule, Environment,
                   CreatedUtc, LastStatusChangeUtc, SlaFirstResponseMinutes, SlaResolutionMinutes,
                   LinkedOccurrenceCount)
-                VALUES ($num,$occ,$fp,'new',$sev,$queue,$title,$desc,$by,$via,$mod,$env,$now,$now,$fr,$res,1);
+                VALUES ($num,$occ,$fp,'new',$sev,$queue,$title,$desc,$byid,$by,$via,$mod,$env,$now,$now,$fr,$res,1);
                 SELECT last_insert_rowid();
                 """,
                 ("$num", ticketNumber), ("$occ", occurrenceId), ("$fp", fingerprintId),
                 ("$sev", severity), ("$queue", severity == "critical" ? "application" : "general"),
-                ("$title", title), ("$desc", description), ("$by", reportedBy), ("$via", createdVia),
+                ("$title", title), ("$desc", description),
+                ("$byid", reportedByProfileId), ("$by", NameOf(reportedByProfileId)), ("$via", createdVia),
                 ("$mod", occ["ErpModule"]), ("$env", occ["Environment"]),
                 ("$now", Iso(now)), ("$fr", sla.FirstResponse), ("$res", sla.Resolution));
 
             Exec(c, tx, """
                 INSERT INTO TicketHistory (TicketId, SequenceNo, FromStatus, ToStatus,
-                  ChangedByUserName, ChangedUtc, MinutesInFromStatus, Comments)
-                VALUES ($t, 1, NULL, 'new', $by, $now, NULL, $c)
+                  ChangedByUserProfileId, ChangedByUserName, ChangedUtc, MinutesInFromStatus, Comments)
+                VALUES ($t, 1, NULL, 'new', $byid, $by, $now, NULL, $c)
                 """,
-                ("$t", ticketId), ("$by", reportedBy), ("$now", Iso(now)),
+                ("$t", ticketId), ("$byid", reportedByProfileId),
+                ("$by", NameOf(reportedByProfileId)), ("$now", Iso(now)),
                 ("$c", createdVia == "auto_rule"
                     ? "Ticket raised automatically by an error-management rule."
                     : "Ticket raised by the user from the error dialog."));
@@ -721,8 +792,8 @@ public class DemoStore
     /*  usp_Ticket_ChangeStatus                                             */
     /* ==================================================================== */
 
-    public object ChangeStatus(string ticketNumber, string toStatus, string changedBy,
-        string? comments, string? assignTo)
+    public object ChangeStatus(string ticketNumber, string toStatus, int changedByProfileId,
+        string? comments, int? assignToProfileId)
     {
         lock (_writeLock)
         {
@@ -731,7 +802,8 @@ public class DemoStore
 
             var t = QueryOne(c, tx, """
                 SELECT TicketId, Status, CreatedUtc, LastStatusChangeUtc, FirstResponseUtc,
-                       AssignedUtc, FingerprintId, ReportedByUserName, AssignedToUserName,
+                       AssignedUtc, FingerprintId, ReportedByUserProfileId, ReportedByUserName,
+                       AssignedToUserProfileId, AssignedToUserName,
                        SlaFirstResponseMinutes, SlaResolutionMinutes, SlaFirstResponseBreached,
                        SlaResolutionBreached, ReopenCount
                 FROM Ticket WHERE TicketNumber = $n
@@ -768,11 +840,12 @@ public class DemoStore
 
             Exec(c, tx, """
                 INSERT INTO TicketHistory (TicketId, SequenceNo, FromStatus, ToStatus,
-                  ChangedByUserName, ChangedUtc, MinutesInFromStatus, Comments)
-                VALUES ($t,$seq,$from,$to,$by,$now,$mins,$c)
+                  ChangedByUserProfileId, ChangedByUserName, ChangedUtc, MinutesInFromStatus, Comments)
+                VALUES ($t,$seq,$from,$to,$byid,$by,$now,$mins,$c)
                 """,
                 ("$t", ticketId), ("$seq", seq), ("$from", fromStatus), ("$to", toStatus),
-                ("$by", changedBy), ("$now", Iso(now)), ("$mins", minutesInFrom), ("$c", comments));
+                ("$byid", changedByProfileId), ("$by", NameOf(changedByProfileId)),
+                ("$now", Iso(now)), ("$mins", minutesInFrom), ("$c", comments));
 
             // Paused minutes, banked across every previous pause plus this one.
             var pausedMinutes = 0L;
@@ -791,7 +864,7 @@ public class DemoStore
             var firstResponseUtc = Val(t, "FirstResponseUtc") as string;
             // First response = the first time someone other than the reporter acts.
             if (firstResponseUtc is null &&
-                !string.Equals(changedBy, t["ReportedByUserName"] as string, StringComparison.OrdinalIgnoreCase))
+                changedByProfileId != Convert.ToInt32(t["ReportedByUserProfileId"]))
                 firstResponseUtc = Iso(now);
 
             var assignedUtc = t["AssignedUtc"] as string
@@ -822,6 +895,7 @@ public class DemoStore
             Exec(c, tx, """
                 UPDATE Ticket SET Status=$to, LastStatusChangeUtc=$now,
                   FirstResponseUtc=$fr, AssignedUtc=$assigned, ResolvedUtc=$resolved, ClosedUtc=$closed,
+                  AssignedToUserProfileId=COALESCE($assignToId, AssignedToUserProfileId),
                   AssignedToUserName=COALESCE($assignTo, AssignedToUserName),
                   TotalElapsedMinutes=$total, ActiveProcessingMinutes=$active,
                   SlaFirstResponseBreached=$frb, SlaResolutionBreached=$resb, ReopenCount=$reopen,
@@ -830,7 +904,9 @@ public class DemoStore
                 """,
                 ("$to", toStatus), ("$now", Iso(now)), ("$fr", firstResponseUtc),
                 ("$assigned", assignedUtc), ("$resolved", resolvedUtc), ("$closed", closedUtc),
-                ("$assignTo", assignTo), ("$total", totalElapsed), ("$active", activeMinutes),
+                ("$assignToId", assignToProfileId is > 0 ? assignToProfileId.Value : (object?)null),
+                ("$assignTo", assignToProfileId is > 0 ? NameOf(assignToProfileId.Value) : null),
+                ("$total", totalElapsed), ("$active", activeMinutes),
                 ("$frb", frBreached ? 1 : 0), ("$resb", resBreached ? 1 : 0),
                 ("$reopen", reopenCount),
                 // Only on the transition INTO resolved: a note attached to any
@@ -838,6 +914,19 @@ public class DemoStore
                 ("$resolutionNotes", toStatus.Equals("resolved", StringComparison.OrdinalIgnoreCase)
                     ? comments : null),
                 ("$t", ticketId));
+
+            // Mirrors usp_Ticket_RecordAssigneeOnHistory: stamp the history row
+            // with who holds the ticket AFTER the change. Without it a status
+            // row answers "who moved it" but not "to whom", and the assignment
+            // rows alone cannot reconstruct that - which is exactly the gap this
+            // audit trail exists to close.
+            Exec(c, tx, """
+                UPDATE TicketHistory
+                   SET AssignedToUserProfileId = (SELECT AssignedToUserProfileId FROM Ticket WHERE TicketId = $t),
+                       AssignedToUserName      = (SELECT AssignedToUserName FROM Ticket WHERE TicketId = $t)
+                 WHERE TicketId = $t AND SequenceNo = $seq
+                """,
+                ("$t", ticketId), ("$seq", seq));
 
             var fingerprintId = Convert.ToInt64(t["FingerprintId"]);
             if (to.IsTerminal)
@@ -1010,6 +1099,7 @@ public class DemoStore
             severityCode = t["Severity"], queue = t["Queue"], createdVia = t["CreatedVia"],
             reportedBy = t["ReportedByUserName"],
             assignedTo = t["AssignedToUserName"],
+            assignedToProfileId = Val(t, "AssignedToUserProfileId"),
             // 'error' or 'manual'. Without this the console cannot tell a
             // captured fault from a request somebody typed, and the badge
             // showed "captured error" for everything.
@@ -1386,16 +1476,16 @@ public class DemoStore
     /*  missing one, so sequential ticket numbers cannot be enumerated.      */
     /* ==================================================================== */
 
-    public object ListTicketsForUser(string userName, bool onlyOpen)
+    public object ListTicketsForUser(int userProfileId, bool onlyOpen)
     {
-        if (string.IsNullOrWhiteSpace(userName)) return new { items = Array.Empty<object>(), total = 0 };
+        if (userProfileId <= 0) return new { items = Array.Empty<object>(), total = 0 };
 
         using var c = Open();
         var rows = Query(c, null, """
             SELECT * FROM Ticket
-            WHERE ReportedByUserName = $u
+            WHERE ReportedByUserProfileId = $u
             ORDER BY CreatedUtc DESC
-            """, ("$u", userName));
+            """, ("$u", userProfileId));
 
         var items = rows
             .Where(r => !onlyOpen || Statuses[(string)r["Status"]!].IsOpen)
@@ -1431,18 +1521,18 @@ public class DemoStore
         var rows = Query(c, null, """
             SELECT Note, At FROM (
               SELECT Comments AS Note, ChangedUtc AS At FROM TicketHistory
-                WHERE TicketId = $t AND Comments IS NOT NULL
+                WHERE TicketId = $t AND Comments IS NOT NULL AND IsCustomerVisible = 1
               UNION ALL
               SELECT CommentText, CreatedUtc FROM TicketComment
-                WHERE TicketId = $t AND AuthorRole <> 'reporter'
+                WHERE TicketId = $t AND AuthorRole <> 'reporter' AND IsCustomerVisible = 1
             ) ORDER BY At DESC LIMIT 1
             """, ("$t", ticketId));
         return rows.Count == 0 ? null : rows[0]["Note"] as string;
     }
 
-    public object? GetTicketForUser(string ticketNumber, string userName)
+    public object? GetTicketForUser(string ticketNumber, int userProfileId)
     {
-        if (string.IsNullOrWhiteSpace(userName)) return null;
+        if (userProfileId <= 0) return null;
 
         using var c = Open();
         var t = QueryOne(c, null, """
@@ -1453,14 +1543,23 @@ public class DemoStore
 
         // Not found and not yours return the same thing.
         if (t is null) return null;
-        if (!string.Equals(t["ReportedByUserName"] as string, userName, StringComparison.OrdinalIgnoreCase))
-            return null;
+        // On the id, not on a case-insensitive name match. A display name is
+        // not unique and is editable, so matching on it is a second and weaker
+        // door into somebody else's ticket.
+        if (Convert.ToInt32(t["ReportedByUserProfileId"]) != userProfileId) return null;
 
         var ticketId = Convert.ToInt64(t["TicketId"]);
         var st = Statuses[(string)t["Status"]!];
 
+        // IsCustomerVisible = 1, exactly as usp_Ticket_GetForUser does it.
+        // Omitting the changed-by NAME is not enough on its own: the assignment
+        // row's own comment reads "Assigned to Ana Silva", so without this
+        // filter the end user is told which engineer holds their ticket - which
+        // invites them to chase that person directly, and is the reason the
+        // assignment row is written with IsCustomerVisible = 0 at all.
         var history = Query(c, null,
-            "SELECT * FROM TicketHistory WHERE TicketId = $t ORDER BY SequenceNo", ("$t", ticketId))
+            "SELECT * FROM TicketHistory WHERE TicketId = $t AND IsCustomerVisible = 1 ORDER BY SequenceNo",
+            ("$t", ticketId))
             .Select(h => new
             {
                 sequenceNo = h["SequenceNo"],
@@ -1471,8 +1570,10 @@ public class DemoStore
                 // touched the ticket is internal.
             }).ToList();
 
+        // Same rule for comments: an internal note is internal.
         var comments = Query(c, null,
-            "SELECT * FROM TicketComment WHERE TicketId = $t ORDER BY CreatedUtc", ("$t", ticketId))
+            "SELECT * FROM TicketComment WHERE TicketId = $t AND IsCustomerVisible = 1 ORDER BY CreatedUtc",
+            ("$t", ticketId))
             .Select(cm => new
             {
                 authorRole = cm["AuthorRole"],
@@ -1509,20 +1610,19 @@ public class DemoStore
         };
     }
 
-    public bool AddUserComment(string ticketNumber, string userName, string commentText)
+    public bool AddUserComment(string ticketNumber, int userProfileId, string commentText)
     {
-        if (string.IsNullOrWhiteSpace(userName) || string.IsNullOrWhiteSpace(commentText)) return false;
+        if (userProfileId <= 0 || string.IsNullOrWhiteSpace(commentText)) return false;
 
         lock (_writeLock)
         {
             using var c = Open();
 
             var t = QueryOne(c, null,
-                "SELECT TicketId, Status, ReportedByUserName FROM Ticket WHERE TicketNumber = $n",
+                "SELECT TicketId, Status, ReportedByUserProfileId FROM Ticket WHERE TicketNumber = $n",
                 ("$n", ticketNumber));
             if (t is null) return false;
-            if (!string.Equals(t["ReportedByUserName"] as string, userName, StringComparison.OrdinalIgnoreCase))
-                return false;
+            if (Convert.ToInt32(t["ReportedByUserProfileId"]) != userProfileId) return false;
 
             var status = (string)t["Status"]!;
             if (Statuses[status].IsTerminal) return false;
@@ -1530,11 +1630,11 @@ public class DemoStore
             var ticketId = Convert.ToInt64(t["TicketId"]);
 
             Exec(c, null, """
-                INSERT INTO TicketComment (TicketId, AuthorUserId, AuthorUserName, AuthorRole,
+                INSERT INTO TicketComment (TicketId, AuthorUserProfileId, AuthorUserName, AuthorRole,
                                            CommentText, IsCustomerVisible, CreatedUtc)
-                VALUES ($t, NULL, $u, 'reporter', $c, 1, $at)
+                VALUES ($t, $uid, $u, 'reporter', $c, 1, $at)
                 """,
-                ("$t", ticketId), ("$u", userName),
+                ("$t", ticketId), ("$uid", userProfileId), ("$u", NameOf(userProfileId)),
                 // Scrubbed: the user is typing into a field support will read
                 // and that may be exported. They will paste a token eventually.
                 ("$c", Redactor.ScrubText(commentText, 4000)), ("$at", Iso(DateTime.UtcNow)));
@@ -1547,7 +1647,7 @@ public class DemoStore
             {
                 try
                 {
-                    ChangeStatus(ticketNumber, "in_progress", userName,
+                    ChangeStatus(ticketNumber, "in_progress", userProfileId,
                         "Reporter replied with the requested information.", null);
                 }
                 catch (InvalidOperationException)
@@ -1596,7 +1696,7 @@ public class DemoStore
             ApiApplication = "ERP.Api", ApiController = controller, ApiAction = action,
             ApiEndpoint = ctx.Request.Path.Value, HttpMethod = ctx.Request.Method,
             Sql = sql,
-            User = new UserContext { Name = "fatima.saeed", DisplayName = "Fatima Saeed" },
+            User = new UserContext { ProfileId = ProfileIdOf("fatima.saeed"), Name = "fatima.saeed", DisplayName = "Fatima Saeed" },
             CorrelationId = correlationId,
             RequestId = ctx.Request.Headers["X-Request-Id"].FirstOrDefault(),
             Environment = "Demo", AppVersion = "2026.3.1",
@@ -1622,8 +1722,9 @@ public class DemoStore
             })
             {
                 Exec(rc, null,
-                    "INSERT OR IGNORE INTO SupportUser (UserName, DisplayName, RoleCode) VALUES ($u,$d,$r)",
-                    ("$u", u), ("$d", d), ("$r", r));
+                    "INSERT OR IGNORE INTO SupportUser (UserProfileId, UserName, DisplayName, RoleCode) "
+                    + "VALUES ($id,$u,$d,$r)",
+                    ("$id", ProfileIdOf(u)), ("$u", u), ("$d", d), ("$r", r));
             }
         }
 
@@ -1659,7 +1760,7 @@ public class DemoStore
                     Number = 207, Severity = 16, State = 1, ObjectName = "usp_GetCostCentreLov",
                     LineNumber = 12, ServerName = "ERP-SQL01", DatabaseName = "ERP_PROD", SchemaName = "common"
                 },
-                User = new UserContext { Name = users[i % users.Length] },
+                User = new UserContext { ProfileId = ProfileIdOf(users[i % users.Length]), Name = users[i % users.Length] },
                 CorrelationId = Guid.NewGuid().ToString(),
                 Environment = "Demo", AppVersion = "2026.3.1",
                 StackTrace = "   at Erp.Common.LovRepository.Load(String lovCode) in C:\\build\\src\\LovRepository.cs:line 41"
@@ -1686,6 +1787,7 @@ public class DemoStore
 
         foreach (var o in oneOffs)
         {
+            var seedUser = users[rnd.Next(users.Length)];
             var fp = Fingerprint.Compute(new Fingerprint.Input
             {
                 Layer = o.Layer, Category = o.Category, ExceptionType = o.Type,
@@ -1698,7 +1800,7 @@ public class DemoStore
                 ExceptionType = o.Type, Message = o.Msg, NormalizedMessage = fp.NormalizedMessage,
                 OccurredUtc = DateTime.UtcNow.AddMinutes(-rnd.Next(5, 4000)).ToString("o"),
                 ErpModule = o.Module, Screen = o.Screen,
-                User = new UserContext { Name = users[rnd.Next(users.Length)] },
+                User = new UserContext { ProfileId = ProfileIdOf(seedUser), Name = seedUser },
                 CorrelationId = Guid.NewGuid().ToString(),
                 Environment = "Demo", AppVersion = "2026.3.1",
                 Client = new ClientInfo { BrowserName = "Chrome", BrowserVersion = "141", OsName = "Windows 10/11" }

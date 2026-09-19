@@ -100,7 +100,7 @@ BEGIN
         /* ---- standard LinkedScam audit / status columns ---- */
         [IsActive]    BIT      NOT NULL CONSTRAINT DF_SwallowedSqlError_IsActive  DEFAULT (1),
         [IsDeleted]   BIT      NOT NULL CONSTRAINT DF_SwallowedSqlError_IsDeleted DEFAULT (0),
-        [CreatedBy]   INT      NOT NULL CONSTRAINT DF_SwallowedSqlError_CreatedBy DEFAULT (ERM.fn_SystemUserID()),
+        [CreatedBy]   INT      NOT NULL,
         [CreatedDate] DATETIME NOT NULL CONSTRAINT DF_SwallowedSqlError_CreatedDate DEFAULT (GETUTCDATE()),
         [UpdatedBy]   INT      NULL,
         [UpdatedDate] DATETIME NULL,
@@ -219,8 +219,8 @@ BEGIN
         BEGIN
             /* Session not running: say so rather than silently collecting
                nothing for six months. */
-            INSERT ERM.ERM_DeadLetter (Source, FailureReason)
-            VALUES (N'xevents', N'Event session [ERM_swallowed] is not running.');
+            INSERT ERM.ERM_DeadLetter (Source, FailureReason, CreatedBy)
+            VALUES (N'xevents', N'Event session [ERM_swallowed] is not running.', ERM.fn_SystemUserID());
             RETURN;
         END
 
@@ -252,9 +252,12 @@ BEGIN
         )
         INSERT ERM.ERM_SwallowedSqlError
             (RaisedUtc, ErrorNumber, ErrorSeverity, ErrorState, Message,
-             DatabaseName, SessionID, ClientHostName, ClientAppName, SqlText)
+             DatabaseName, SessionID, ClientHostName, ClientAppName, SqlText, CreatedBy)
         SELECT e.RaisedUtc, e.ErrorNumber, e.ErrorSeverity, e.ErrorState, e.Message,
-               e.DatabaseName, e.SessionID, e.ClientHostName, e.ClientAppName, e.SqlText
+               e.DatabaseName, e.SessionID, e.ClientHostName, e.ClientAppName, e.SqlText,
+               /* Collected from the server's own event stream - there is no
+                  request behind it and therefore no user. */
+               ERM.fn_SystemUserID()
         FROM events e
         WHERE e.ErrorNumber IS NOT NULL
           /* The ring buffer is re-read on every run, so the same event is seen
@@ -385,9 +388,10 @@ BEGIN
         /* Same rule as everywhere else: a collector failure is recorded, never
            raised.  This runs on a schedule against a production instance. */
         BEGIN TRY
-            INSERT ERM.ERM_DeadLetter (Source, FailureReason)
+            INSERT ERM.ERM_DeadLetter (Source, FailureReason, CreatedBy)
             VALUES (N'xevents', CONCAT(N'usp_Swallowed_Collect failed: Msg ', ERROR_NUMBER(),
-                                       N', Line ', ERROR_LINE(), N': ', ERROR_MESSAGE()));
+                                       N', Line ', ERROR_LINE(), N': ', ERROR_MESSAGE()),
+                    ERM.fn_SystemUserID());
         END TRY
         BEGIN CATCH
         END CATCH
@@ -402,8 +406,8 @@ MERGE ERM.ERM_RetentionPolicy AS t
 USING (SELECT N'swallowed_sql' AS DataSet, 14 AS ArchiveAfterDays, 30 AS PurgeAfterDays, 5000 AS BatchSize) AS s
     ON t.DataSet = s.DataSet
 WHEN NOT MATCHED THEN
-    INSERT (DataSet, ArchiveAfterDays, PurgeAfterDays, BatchSize)
-    VALUES (s.DataSet, s.ArchiveAfterDays, s.PurgeAfterDays, s.BatchSize);
+    INSERT (DataSet, ArchiveAfterDays, PurgeAfterDays, BatchSize, CreatedBy)
+    VALUES (s.DataSet, s.ArchiveAfterDays, s.PurgeAfterDays, s.BatchSize, ERM.fn_SystemUserID());
 GO
 
 /* -----------------------------------------------------------------------------
@@ -438,5 +442,6 @@ MERGE ERM.ERM_SchemaVersion AS t
 USING (SELECT N'008_optional_swallowed_sql_errors.sql' AS ScriptName) AS s
     ON t.ScriptName = s.ScriptName
 WHEN NOT MATCHED THEN
-    INSERT (ScriptName, FrameworkVersion) VALUES (s.ScriptName, N'1.1.0-optional');
+    INSERT (ScriptName, FrameworkVersion, CreatedBy)
+    VALUES (s.ScriptName, N'1.1.0-optional', ERM.fn_SystemUserID());
 GO
