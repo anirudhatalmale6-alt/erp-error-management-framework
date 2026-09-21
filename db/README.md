@@ -32,6 +32,24 @@ new schema.
 | `008_optional_swallowed_sql_errors.sql` | Extended Events capture of errors swallowed inside procedures | **no** |
 | `009_optional_catch_block_helper.sql` | one-line capture from an existing `CATCH` block | **no** |
 
+### One paste, if you prefer
+
+| File | What it is |
+|---|---|
+| `RUN_ALL.sql` | the ten required scripts above, concatenated, in order |
+| `VERIFY.sql` | run it afterwards and send me the output |
+
+`RUN_ALL.sql` contains nothing unique to itself — running the ten scripts
+individually gives an identical result. It exists so the install is one paste
+into SSMS. It deliberately omits `008` and `009`. The verification suite asserts
+it still matches its sources verbatim, so it cannot silently go stale.
+
+`VERIFY.sql` is read-only except for one section that captures a test error,
+raises a ticket, moves it through a status change and then **deletes both rows**.
+It is the check I cannot run myself: parsing catches syntax, but it does not
+catch a wrong column name inside a valid statement, a type mismatch, or a
+constraint firing when it should not.
+
 `008` and `009` are optional and **should not** go into Test on day one. See
 `docs/ARCHITECTURE.md` §5.3 — `008` needs a server-level permission and is
 noisy; `009` is the one I would recommend, and only once you know you have a

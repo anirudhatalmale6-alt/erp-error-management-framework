@@ -49,6 +49,7 @@ namespace Erp.ErrorManagement.Tests
             RunSourceNamingChecks(repoRoot);
             RunAuditColumnChecks(Path.Combine(repoRoot, "db"));
             RunNotificationChecks(Path.Combine(repoRoot, "db"), repoRoot);
+            RunRunAllSyncChecks(Path.Combine(repoRoot, "db"));
             RunIdentityChecks(Path.Combine(repoRoot, "db"), repoRoot);
 
             Console.WriteLine();
@@ -639,6 +640,89 @@ namespace Erp.ErrorManagement.Tests
         /* ======================== support access / manual tickets ======= */
 
         /* ================== LinkedScam ERP standards compliance ========= */
+
+        /* ====================================== RUN_ALL.sql stays in sync == */
+
+        /// <summary>
+        /// RUN_ALL.sql is the ten required scripts concatenated, so somebody can
+        /// install the whole framework with one paste into SSMS.
+        ///
+        /// A concatenated copy is a stale copy waiting to happen: edit
+        /// 004_programmability.sql, forget to regenerate, and RUN_ALL installs
+        /// the OLD version - which is worse than not having it, because the file
+        /// runs clean and produces a subtly wrong database. Exactly the failure
+        /// I hit with tools/verify-fingerprint.mjs importing uncommitted build
+        /// artefacts.
+        ///
+        /// So this asserts that every source script's body is still present in
+        /// RUN_ALL verbatim, and that nothing else got in.
+        /// </summary>
+        private static void RunRunAllSyncChecks(string dbFolder)
+        {
+            Console.WriteLine("\n=== RUN_ALL.sql is in sync with its sources ===");
+
+            var runAllPath = Path.Combine(dbFolder, "RUN_ALL.sql");
+            Check("RUN_ALL.sql exists", File.Exists(runAllPath), true);
+            if (!File.Exists(runAllPath)) return;
+
+            var runAll = Normalise(File.ReadAllText(runAllPath));
+
+            // The install set, in order. 008 and 009 are OPTIONAL add-ons and
+            // must NOT be in here - see db/README.md.
+            var required = new[]
+            {
+                "001_schema_and_config.sql", "002_core_tables.sql", "003_seed_reference_data.sql",
+                "004_programmability.sql", "005_retention_and_archive.sql", "006_security.sql",
+                "007_end_user_ticket_access.sql", "010_search_performance.sql",
+                "011_support_access_and_manual_tickets.sql", "012_notifications.sql",
+            };
+
+            var stale = new List<string>();
+            var lastIndex = -1;
+            var outOfOrder = new List<string>();
+
+            foreach (var name in required)
+            {
+                var body = Normalise(File.ReadAllText(Path.Combine(dbFolder, name)).TrimEnd());
+                var at = runAll.IndexOf(body, StringComparison.Ordinal);
+
+                if (at < 0) stale.Add(name);
+                else
+                {
+                    if (at < lastIndex) outOfOrder.Add(name);
+                    lastIndex = at;
+                }
+            }
+
+            Check(stale.Count == 0
+                    ? $"all {required.Length} required scripts are present verbatim"
+                    : $"all required scripts are present verbatim (STALE or MISSING: {string.Join(", ", stale)} — regenerate RUN_ALL.sql)",
+                stale.Count, 0);
+
+            Check(outOfOrder.Count == 0
+                    ? "and in dependency order"
+                    : $"and in dependency order (out of order: {string.Join(", ", outOfOrder)})",
+                outOfOrder.Count, 0);
+
+            foreach (var optional in new[] { "008_optional_swallowed_sql_errors.sql", "009_optional_catch_block_helper.sql" })
+            {
+                var body = Normalise(File.ReadAllText(Path.Combine(dbFolder, optional)).TrimEnd());
+                Check($"the optional script {optional.Substring(0, 3)} is NOT in the one-paste install",
+                    runAll.Contains(body, StringComparison.Ordinal), false);
+            }
+
+            // POSITIVE CONTROL - the comparison must be able to see a difference.
+            Check("positive control: an edited script IS detected as stale",
+                runAll.Contains(Normalise("CREATE TABLE ERM.ERM_ThisDoesNotExist"), StringComparison.Ordinal),
+                false);
+        }
+
+        /// <summary>
+        /// Line endings only. Comparing raw text would fail on a checkout with
+        /// different git autocrlf settings, which would be a false alarm about
+        /// the one thing this check exists to make trustworthy.
+        /// </summary>
+        private static string Normalise(string s) => s.Replace("\r\n", "\n").Replace("\r", "\n");
 
         /* ============================================ notifications (012) == */
 
