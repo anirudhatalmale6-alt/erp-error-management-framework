@@ -29,6 +29,7 @@ new schema.
 | `010_search_performance.sql` | server-side sorting, keyset paging, supporting indexes | yes |
 | `011_support_access_and_manual_tickets.sql` | support roster/roles, audited assignment, manual tickets | yes |
 | `012_notifications.sql` | ticket-notification outbox + the adapter into your own notification system | yes |
+| `013_notification_dispatch_api.sql` | claim/complete API so the APPLICATION can deliver notifications (email) | yes |
 | `008_optional_swallowed_sql_errors.sql` | Extended Events capture of errors swallowed inside procedures | **no** |
 | `009_optional_catch_block_helper.sql` | one-line capture from an existing `CATCH` block | **no** |
 
@@ -36,7 +37,7 @@ new schema.
 
 | File | What it is |
 |---|---|
-| `RUN_ALL.sql` | the ten required scripts above, concatenated, in order |
+| `RUN_ALL.sql` | the eleven required scripts above, concatenated, in order |
 | `VERIFY.sql` | run it afterwards and send me the output |
 
 `RUN_ALL.sql` contains nothing unique to itself — running the ten scripts
@@ -96,9 +97,9 @@ every stack trace and SQL object name in the system.
 
 ## 3. Test deployment
 
-1. Run `001` … `007`, then `010`, `011`, `012`.
+1. Run `001` … `007`, then `010`, `011`, `012`, `013`.
 2. Confirm the ledger: `SELECT * FROM ERM.ERM_SchemaVersion ORDER BY ScriptName;`
-   — ten rows.
+   — eleven rows.
 3. Set `fn_SystemUserID` and run `006` with your real `@AppUser`.
 4. Add your support staff so the console is reachable:
 
@@ -172,7 +173,7 @@ yours, and it is the highest-value single check in Test.
 
 Not a date. Move when these are true:
 
-- [ ] All ten required scripts ran clean on Test, ledger complete.
+- [ ] All eleven required scripts ran clean on Test, ledger complete.
 - [ ] `ERM_DeadLetter` empty, or every row understood.
 - [ ] No duplicate or malformed reference codes after a period of real load.
 - [ ] The recurring-problems report is readable rather than a wall of noise — if

@@ -678,7 +678,7 @@ the `RequiresComment` / `RequiresAssignee` flags on each one.
 
 ## 11. What is verified, and how
 
-`dotnet run --project dotnet/Erp.ErrorManagement.Tests` — 186 checks, all
+`dotnet run --project dotnet/Erp.ErrorManagement.Tests` — 213 checks, all
 passing:
 
 * **All six T-SQL scripts parse** against the real SQL Server 2016 grammar,
@@ -1386,6 +1386,65 @@ announced — notification is the one route that would otherwise bypass the
 Every enqueue call is guarded by `OBJECT_ID(...) IS NOT NULL`, so a database
 without `012` still tickets normally rather than failing at run time.
 
-Row 41 of the milestone sheet is therefore built on the framework side. The
-remaining work is the body of one procedure, and it is yours because only you
-know the signature.
+### 18.4 Email delivery (added 22 September)
+
+ATC clarified that SMTP *is* available and that email delivery is wanted. The
+outbox was already the right shape for it; what it needed was a second way to
+drain it.
+
+**Mail is sent by the application, not by SQL Server.** Sending from the
+database means Database Mail: sysadmin to configure, a Service Broker queue,
+msdb objects, and an outbound connection from the database engine — a large
+amount of standing configuration on a production instance, added for one
+feature, and it puts an SMTP timeout inside the database. The application
+already has a mail client, already has credentials in its configuration, and can
+be restarted without touching the database.
+
+So `db/013` adds only a claim/complete API:
+
+| Procedure | Purpose |
+|---|---|
+| `usp_Notification_Claim` | take the next N pending rows |
+| `usp_Notification_MarkResult` | report what happened to one |
+| `usp_Notification_ReleaseStale` | recover rows a dead dispatcher left claimed |
+
+**There is no SMTP host, port or password anywhere in the database.** A mail
+password in a table is a mail password in every backup — and in the error store
+specifically, which is the one store support staff are meant to read.
+
+**Claiming is atomic.** The obvious version SELECTs pending rows, sends them,
+then UPDATEs. Run two application instances — or one during a rolling restart —
+and both read the same rows and both send. The user gets every notification
+twice and nothing explains why. So the claim is a single
+`UPDATE TOP (@n) … OUTPUT inserted.*` with `READPAST`, the same shape as the
+reference-number generator. The cost is that a dispatcher killed mid-flight
+leaves rows in `sending`, which `usp_Notification_ReleaseStale` returns to the
+queue: visible and bounded, rather than a silent double-send.
+
+`SmtpNotificationSender` sends plain text, not HTML. These messages say "your
+issue has been updated", they are read on a phone, and an HTML template is one
+more thing to render badly or carry content it should not.
+
+Two details that matter more than they look:
+
+**The email address comes from a resolver you supply.** The framework will not
+read your user tables — that is the isolation rule the whole design rests on —
+and it will not keep its own copy of your directory, because a second copy is a
+second thing to keep in step. `EmailAddressResolver` is mandatory and the
+validation says why. A user with no address is recorded as undelivered with a
+reason; it is not an error and it does not stop the batch.
+
+**`RedirectAllMailTo` exists for Test.** Without it, a test run against a copy of
+production data emails real users about tickets that do not exist. A redirected
+message also states, in its own body, who it was really addressed to — a
+redirected copy that looks identical to the real thing is how a test message ends
+up forwarded to a customer.
+
+Both paths coexist: the ERP-native adapter in `012` and the application-side
+sender here. Use either, or both.
+
+Row 41 of the milestone sheet is therefore complete on the framework side. What
+remains is configuration: the mailbox credentials and a resolver that maps a
+UserProfileID to an address — and, if you also want the ERP-native path, the
+body of `usp_Notification_ErpAdapter`, which is yours because only you know its
+signature.

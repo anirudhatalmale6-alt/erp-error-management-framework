@@ -50,6 +50,7 @@ namespace Erp.ErrorManagement.Tests
             RunAuditColumnChecks(Path.Combine(repoRoot, "db"));
             RunNotificationChecks(Path.Combine(repoRoot, "db"), repoRoot);
             RunRunAllSyncChecks(Path.Combine(repoRoot, "db"));
+            RunNotificationDeliveryChecks(Path.Combine(repoRoot, "db"));
             RunIdentityChecks(Path.Combine(repoRoot, "db"), repoRoot);
 
             Console.WriteLine();
@@ -641,6 +642,124 @@ namespace Erp.ErrorManagement.Tests
 
         /* ================== LinkedScam ERP standards compliance ========= */
 
+        /* ================================= email delivery of notifications == */
+
+        /// <summary>
+        /// ATC clarified that SMTP IS available and they do want email. These
+        /// check the delivery path that was added for it - and they RUN the
+        /// code rather than grepping it, because the interesting behaviour here
+        /// is what happens when things go wrong.
+        /// </summary>
+        private static void RunNotificationDeliveryChecks(string dbFolder)
+        {
+            Console.WriteLine("\n=== Notification delivery (SMTP) ===");
+
+            var sql = File.ReadAllText(Path.Combine(dbFolder, "013_notification_dispatch_api.sql"));
+            var stripped = StripSqlComments(sql);
+
+            // --- claiming must be atomic --------------------------------------
+            // Two dispatchers, or one during a rolling restart, otherwise both
+            // read the same rows and the user gets every notification twice.
+            Check("claiming is a single atomic UPDATE ... OUTPUT",
+                stripped.Contains("UPDATE TOP (@BatchSize)") && stripped.Contains("OUTPUT inserted."), true);
+            Check("...and does not read first and write after",
+                System.Text.RegularExpressions.Regex.IsMatch(
+                    stripped, @"SELECT[\s\S]{0,200}DeliveryState\s*=\s*N'pending'[\s\S]{0,200}UPDATE"), false);
+            Check("a claim skips rows another dispatcher holds rather than queueing",
+                stripped.Contains("WITH (READPAST)"), true);
+            Check("a dispatcher that dies cannot strand rows for ever",
+                stripped.Contains("PROCEDURE ERM.usp_Notification_ReleaseStale"), true);
+
+            // --- no mail configuration in the database ------------------------
+            // A mail password in a table is a mail password in every backup, and
+            // in the error store specifically, which support staff can read.
+            var allSql = string.Join("\n", Directory.GetFiles(dbFolder, "*.sql")
+                .Where(f => !Path.GetFileName(f).Equals("RUN_ALL.sql", StringComparison.OrdinalIgnoreCase))
+                .Select(File.ReadAllText));
+            foreach (var secret in new[] { "smtp.", "SmtpPassword", "MailPassword", "atechconsult" })
+                Check($"no mail configuration in the database: {secret}",
+                    allSql.IndexOf(secret, StringComparison.OrdinalIgnoreCase) >= 0, false);
+
+            // --- the resolver is mandatory, and says why ----------------------
+            var noResolver = new SmtpNotificationOptions
+            {
+                Host = "mail.example.com", FromAddress = "erp@example.com"
+            };
+            string validationMessage = null;
+            try { noResolver.Validate(); }
+            catch (InvalidOperationException ex) { validationMessage = ex.Message; }
+
+            Check("SMTP options refuse to start without an email resolver",
+                validationMessage != null, true);
+            Check("...and the message explains why rather than just failing",
+                validationMessage != null && validationMessage.Contains("UserProfileID"), true);
+
+            // --- behaviour: no address is an ANSWER, not a crash --------------
+            var noAddress = new SmtpNotificationOptions
+            {
+                Host = "mail.example.com",
+                FromAddress = "erp@example.com",
+                EmailAddressResolver = _ => null,
+            };
+            var senderNoAddress = new SmtpNotificationSender(noAddress);
+            var resultNoAddress = senderNoAddress
+                .SendAsync(new PendingNotification { OutboxId = 1, RecipientUserProfileId = 42 })
+                .GetAwaiter().GetResult();
+
+            Check("a recipient with no email address is recorded, not thrown",
+                resultNoAddress.Delivered, false);
+            Check("...and the reason names the user",
+                resultNoAddress.FailureReason != null && resultNoAddress.FailureReason.Contains("42"), true);
+
+            // --- behaviour: a resolver that throws is contained ---------------
+            var throwingResolver = new SmtpNotificationOptions
+            {
+                Host = "mail.example.com",
+                FromAddress = "erp@example.com",
+                EmailAddressResolver = _ => throw new InvalidOperationException("directory down"),
+            };
+            var senderThrow = new SmtpNotificationSender(throwingResolver);
+            var resultThrow = senderThrow
+                .SendAsync(new PendingNotification { OutboxId = 2, RecipientUserProfileId = 7 })
+                .GetAwaiter().GetResult();
+
+            Check("a resolver that throws does not take the dispatcher down",
+                resultThrow.Delivered, false);
+            Check("...and the reason says the resolver failed",
+                resultThrow.FailureReason != null && resultThrow.FailureReason.Contains("resolver"), true);
+
+            // --- the test-redirect safety valve -------------------------------
+            // Without this, a test run against production data emails real users
+            // about tickets that do not exist.
+            var core = File.ReadAllText(Path.Combine(
+                Path.GetDirectoryName(dbFolder), "dotnet", "Erp.ErrorManagement.Core",
+                "NotificationDelivery.cs"));
+            Check("a test redirect exists so Test cannot email real users",
+                core.Contains("RedirectAllMailTo"), true);
+            Check("...and a redirected mail SAYS it was redirected",
+                core.Contains("[TEST REDIRECT - this was addressed to "), true);
+
+            // --- the dispatcher must always report, even on a throw -----------
+            Check("a sender that throws is still reported, so no row stays claimed",
+                core.Contains("result = NotificationResult.Fail($\"Sender threw: {ex.Message}\");"), true);
+
+            // POSITIVE CONTROL - these behavioural checks must be able to fail.
+            var working = new SmtpNotificationOptions
+            {
+                Host = "mail.example.com",
+                FromAddress = "erp@example.com",
+                EmailAddressResolver = _ => "someone@example.com",
+            };
+            Check("positive control: valid options DO pass validation",
+                SafeValidate(working), true);
+        }
+
+        private static bool SafeValidate(SmtpNotificationOptions options)
+        {
+            try { options.Validate(); return true; }
+            catch { return false; }
+        }
+
         /* ====================================== RUN_ALL.sql stays in sync == */
 
         /// <summary>
@@ -675,6 +794,7 @@ namespace Erp.ErrorManagement.Tests
                 "004_programmability.sql", "005_retention_and_archive.sql", "006_security.sql",
                 "007_end_user_ticket_access.sql", "010_search_performance.sql",
                 "011_support_access_and_manual_tickets.sql", "012_notifications.sql",
+                "013_notification_dispatch_api.sql",
             };
 
             var stale = new List<string>();

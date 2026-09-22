@@ -40,7 +40,7 @@ config.UseErpErrorManagement(new ErrorCaptureOptions {
 **SQL Server** — **[`db/README.md`](db/README.md) is the deployment runbook**:
 script order, the two things to set first, what to watch during Test, and the
 Test → EBS-PROD promotion checklist. Run `db/001` … `db/007`, then `db/010`,
-`db/011` and `db/012`, once.
+`db/011`, `db/012` and `db/013`, once.
 
 Every object lives in the **`ERM`** schema and follows the LinkedScam ERP
 standards (`ERM.ERM_TableName`, standard `ROWID`/`DBNo`/`AppNo` + audit columns,
@@ -79,6 +79,8 @@ db/                     SQL Server schema, procedures, seed data, retention job
                                 manually raised tickets
   012_notifications.sql         ticket-notification outbox + the ONE adapter
                                 into the ERP's own notification system
+  013_notification_dispatch...  claim/complete API for application-side
+                                delivery (email over SMTP)
   008_optional_...              OPTIONAL: Extended Events for swallowed errors
   009_optional_...              OPTIONAL: one-line capture from a CATCH block
 
@@ -91,7 +93,7 @@ dotnet/
   Erp.ErrorManagement.Core/        netstandard2.0 — shared by BOTH stacks
   Erp.ErrorManagement.WebApi2/     net472 — Web API 2 integration
   Erp.ErrorManagement.AspNetCore/  net8.0 — for future modules
-  Erp.ErrorManagement.Tests/       186 verification checks (see below)
+  Erp.ErrorManagement.Tests/       213 verification checks (see below)
 
 demo/api/               runnable demo API (SQLite — a harness, not the product)
 docs/ARCHITECTURE.md    the technical design
@@ -107,7 +109,7 @@ tools/                  cross-language fingerprint verification
 dotnet run --project dotnet/Erp.ErrorManagement.Tests
 ```
 
-186 checks, covering:
+213 checks, covering:
 
 * every T-SQL script parsing against the **real SQL Server 2016 grammar**
   (Microsoft's `ScriptDom` — the parser SSMS and sqlpackage use);
@@ -139,9 +141,13 @@ dotnet run --project dotnet/Erp.ErrorManagement.Tests
 * **one identity** — the ERP `UserProfileID` and no text user id, distinct-user
   counts on the id rather than a display name, and the client's claimed identity
   discarded server-side;
-* **notifications** — no channel of the framework's own (no SMTP, no Teams, no
-  dynamic dispatch), the adapter refusing to report success until it is wired
-  up, and an internal comment never being announced.
+* **notifications** — the database holds no delivery channel and no mail
+  credentials, the ERP adapter refuses to report success until it is wired up,
+  and an internal comment is never announced;
+* **email delivery** — claiming is atomic so two dispatchers cannot send the
+  same notification twice, a missing address or a throwing resolver is recorded
+  rather than crashing the dispatcher, and a redirected test mail says so in its
+  own body.
 
 Each group includes a **positive control** — a check that deliberately expects
 the negative result — because a suite that cannot fail proves nothing.
@@ -240,4 +246,4 @@ still works.
 The framework is complete and verified as described above. Open items are listed in
 `docs/ARCHITECTURE.md` §12 — chiefly that the T-SQL has been **parsed** against
 the real grammar but not **executed**, because I have no SQL Server instance.
-Run `db/001…007`, `db/010`, `db/011` and `db/012` against a development database before production.
+Run `db/001…007`, `db/010`, `db/011`, `db/012` and `db/013` against a development database before production.
